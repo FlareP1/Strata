@@ -60,6 +60,16 @@ CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > co
 RATE_WINDOW_S = 2.0
 RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean so far, with the span floored here
 
+# Optional trailing fields on the engine's DONE line.  The first eleven fields are positional for compatibility;
+# these names are intentionally explicit and integer-valued so future fields can be ignored safely by old clients.
+DONE_COUNTER_FIELDS = frozenset({
+    "main_swaps", "main_fills", "main_dropped",
+    "gpu1_entries", "gpu1_experts", "gpu1_layers", "gpu1_cpu_skipped_layers",
+    "gpu1_swaps", "gpu1_fills", "gpu1_dropped", "gpu1_empty_slots",
+    "gpu1_prefetch_submitted", "gpu1_prefetch_copied", "gpu1_prefetch_used", "gpu1_prefetch_failed",
+    "deterministic_adapt",
+})
+
 
 # ------------------------------------------------------------------------------------------------ engines
 class Engine(Protocol):
@@ -276,14 +286,31 @@ class StrataEngine:
         self.__init__(*self.spawn)
         self.info = {**info, **self.info}
 
-    def _parse_done(self, line):
+    @staticmethod
+    def _parse_done_line(line):
         f = line.split()
-        self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
-                     "decode_ms": float(f[4]), "finish": f[5]}
+        last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
+                "decode_ms": float(f[4]), "finish": f[5]}
         if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
-            self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
+            last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate fields
-            self.last.update(hits=int(f[9]), lookups=int(f[10]))
+            last.update(hits=int(f[9]), lookups=int(f[10]))
+        adaptive = {}
+        for token in f[11:]:
+            key, sep, value = token.partition("=")
+            if not sep or key not in DONE_COUNTER_FIELDS:
+                continue
+            try:
+                adaptive[key] = int(value)
+            except (TypeError, ValueError):
+                # Optional telemetry must never turn an otherwise completed request into an engine error.
+                continue
+        if adaptive:
+            last["adaptive"] = adaptive
+        return last
+
+    def _parse_done(self, line):
+        self.last = self._parse_done_line(line)
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -1080,7 +1107,8 @@ class Service:
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                         if n and last.get("generated") and last.get("decode_ms") else None,
-                        "hit_rate": hit_rate})
+                        "hit_rate": hit_rate,
+                        **({"adaptive": dict(last["adaptive"])} if isinstance(last.get("adaptive"), dict) else {})})
                     t = self.totals
                     t["requests"] += 1
                     t["prompt_tokens"] += len(ids)
@@ -1128,7 +1156,8 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             "predicted_per_second": round(decoded / (decode_ms / 1000), 1) if decoded and decode_ms > 0 else None,
             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
-               if last.get("drafts_offered") is not None else {})}
+               if last.get("drafts_offered") is not None else {}),
+            **({"adaptive": dict(last["adaptive"])} if isinstance(last.get("adaptive"), dict) else {})}
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):

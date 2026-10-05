@@ -2642,6 +2642,23 @@ int main(int argc, char** argv) {
         bool mrope_identity = true;
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
+        // The first eleven DONE fields are a stable positional protocol.  These counters are cumulative engine
+        // counters sampled at each request boundary; only their per-request deltas are appended as key=value fields.
+        struct ServeCounters {
+            int64_t main_swaps, main_fills, main_dropped;
+            int64_t gpu1_entries, gpu1_experts, gpu1_layers, gpu1_cpu_skipped;
+            int64_t gpu1_swaps, gpu1_fills, gpu1_dropped, gpu1_empty_slots;
+            int64_t gpu1_prefetch_submitted, gpu1_prefetch_copied, gpu1_prefetch_used, gpu1_prefetch_failed;
+        };
+        const auto serve_counters = [&]() {
+            return ServeCounters{
+                tier.swaps, tier.fills, tier.dropped,
+                gpu2.entries_done, gpu2.experts, gpu2.layers, drive.d.gpu2_skipped,
+                tier2.swaps, tier2.fills, tier2.dropped, tier2.free_slots(),
+                gpu2.prefetch_submitted, gpu2.prefetch_copied, gpu2.prefetch_used, gpu2.prefetch_failed,
+            };
+        };
+        ServeCounters request_start{};
         while (next_line(line)) {
             if (line == "QUIT") break;
             stop_req.store(false);   // a STOP that arrived between requests is stale
@@ -2797,6 +2814,7 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
+            request_start = serve_counters();
             const Clock::time_point r0 = Clock::now();
             auto report = [&](const std::string& e) {   // a failed request: the engine exits after it
                 std::fprintf(stderr, "strata serve: %s\n", e.c_str());
@@ -3019,10 +3037,33 @@ int main(int argc, char** argv) {
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             const int64_t hits1 = drive.d.cache_hits + drive.d.gpu2_entries, look1 = hits1 + drive.d.cache_refused;
             // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused>
-            // <expert-cache hits> <lookups>
-            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld\n", (long long) produced_n, (long long) n,
-                        prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
-                        (long long) reuse, (long long) (hits1 - hits0), (long long) (look1 - look0));
+            // <expert-cache hits> <lookups> [stable key=value per-request counters]
+            const ServeCounters request_end = serve_counters();
+            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld",
+                        (long long) produced_n, (long long) n, prompt_ms, decode_ms, finish,
+                        (long long) draft_accepted, (long long) draft_offered, (long long) reuse,
+                        (long long) (hits1 - hits0), (long long) (look1 - look0));
+            std::printf(" main_swaps=%lld main_fills=%lld main_dropped=%lld"
+                        " gpu1_entries=%lld gpu1_experts=%lld gpu1_layers=%lld gpu1_cpu_skipped_layers=%lld"
+                        " gpu1_swaps=%lld gpu1_fills=%lld gpu1_dropped=%lld gpu1_empty_slots=%lld"
+                        " gpu1_prefetch_submitted=%lld gpu1_prefetch_copied=%lld gpu1_prefetch_used=%lld"
+                        " gpu1_prefetch_failed=%lld deterministic_adapt=%d\n",
+                        (long long) (request_end.main_swaps - request_start.main_swaps),
+                        (long long) (request_end.main_fills - request_start.main_fills),
+                        (long long) (request_end.main_dropped - request_start.main_dropped),
+                        (long long) (request_end.gpu1_entries - request_start.gpu1_entries),
+                        (long long) (request_end.gpu1_experts - request_start.gpu1_experts),
+                        (long long) (request_end.gpu1_layers - request_start.gpu1_layers),
+                        (long long) (request_end.gpu1_cpu_skipped - request_start.gpu1_cpu_skipped),
+                        (long long) (request_end.gpu1_swaps - request_start.gpu1_swaps),
+                        (long long) (request_end.gpu1_fills - request_start.gpu1_fills),
+                        (long long) (request_end.gpu1_dropped - request_start.gpu1_dropped),
+                        (long long) request_end.gpu1_empty_slots,
+                        (long long) (request_end.gpu1_prefetch_submitted - request_start.gpu1_prefetch_submitted),
+                        (long long) (request_end.gpu1_prefetch_copied - request_start.gpu1_prefetch_copied),
+                        (long long) (request_end.gpu1_prefetch_used - request_start.gpu1_prefetch_used),
+                        (long long) (request_end.gpu1_prefetch_failed - request_start.gpu1_prefetch_failed),
+                        o.deterministic_adapt ? 1 : 0);
             std::fflush(stdout);
             const int64_t fresh = n - reuse;
             std::fprintf(stderr, "strata serve: %lld prompt tokens (%lld cached) in %.0f ms (%.1f tok/s), %lld generated "

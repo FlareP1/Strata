@@ -65,7 +65,10 @@ public:
     cudaEvent_t done_event() const { return ev_; }
 
     int64_t layers = 0, experts = 0, entries_done = 0;
-    int64_t prefetch_copied = 0, prefetch_used = 0;   ///< experts copied ahead / of those, computed here
+    // Cumulative counters for server request-delta reporting.  submitted is the number of expert blobs attempted,
+    // copied is the number whose asynchronous copies were successfully queued, and failed counts attempts rejected
+    // before a copy could be queued.  None of these counters affects scheduling or execution.
+    int64_t prefetch_submitted = 0, prefetch_copied = 0, prefetch_used = 0, prefetch_failed = 0;
 
 private:
     bool graph_for(int gu_type, int d_type, int groups, int part, bool prep, cudaGraphExec_t& exec, std::string& err);

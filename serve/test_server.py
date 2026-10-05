@@ -30,6 +30,51 @@ class RecordingEngine(MockEngine):
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
+class DoneEngine(MockEngine):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.last = {"generated": 1, "prompt_tokens": len(ids), "prompt_ms": 1.0, "decode_ms": 1.0,
+                     "reused": 0, "hits": 0, "lookups": 0,
+                     "adaptive": {"main_swaps": 3, "gpu1_entries": 4, "gpu1_empty_slots": 5,
+                                  "deterministic_adapt": 1}}
+        yield self.tok.encode("x")[0]
+
+
+class DoneProtocol(unittest.TestCase):
+    def test_legacy_done_fields_are_unchanged(self):
+        self.assertEqual(
+            StrataEngine._parse_done_line("DONE 3 24 12.5 7.5 stop 1 2 4 8 9"),
+            {"generated": 3, "prompt_tokens": 24, "prompt_ms": 12.5, "decode_ms": 7.5, "finish": "stop",
+             "drafts_accepted": 1, "drafts_offered": 2, "reused": 4, "hits": 8, "lookups": 9})
+
+    def test_extended_done_fields_are_typed_and_exposed_in_timings(self):
+        line = ("DONE 3 24 12.5 7.5 length 1 2 4 8 9"
+                " main_swaps=11 main_fills=12 main_dropped=0"
+                " gpu1_entries=13 gpu1_experts=14 gpu1_layers=15 gpu1_cpu_skipped_layers=1"
+                " gpu1_swaps=16 gpu1_fills=17 gpu1_dropped=0 gpu1_empty_slots=18"
+                " gpu1_prefetch_submitted=19 gpu1_prefetch_copied=20 gpu1_prefetch_used=21"
+                " gpu1_prefetch_failed=0 deterministic_adapt=1")
+        engine = StrataEngine.__new__(StrataEngine)
+        engine._parse_done(line)
+        last = engine.last
+        self.assertEqual(last["adaptive"]["gpu1_prefetch_used"], 21)
+        self.assertEqual(last["adaptive"]["deterministic_adapt"], 1)
+        self.assertEqual(request_timings(24, 3, last)["adaptive"], last["adaptive"])
+
+    def test_unknown_and_malformed_optional_fields_are_ignored(self):
+        last = StrataEngine._parse_done_line(
+            "DONE 3 24 12.5 7.5 stop 0 0 0 1 2 gpu1_entries=bad future_counter=99 gpu1_layers=7")
+        self.assertEqual(last["adaptive"], {"gpu1_layers": 7})
+
+    def test_service_history_metrics_and_last_timings_include_adaptive(self):
+        tok = ByteTokenizer()
+        svc = Service(DoneEngine(tok, "x"), tok, object())
+        list(svc.run([120], False, [], 1, {}, threading.Event()))
+        want = {"main_swaps": 3, "gpu1_entries": 4, "gpu1_empty_slots": 5, "deterministic_adapt": 1}
+        self.assertEqual(svc.history[-1]["adaptive"], want)
+        self.assertEqual(svc.last_timings["adaptive"], want)
+        self.assertEqual(svc.metrics(all_requests=True)["requests"][0]["adaptive"], want)
+
+
 class MaxTokens(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

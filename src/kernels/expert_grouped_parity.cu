@@ -403,9 +403,11 @@ void upload(const Plan& p, const Dev& d) {
 void run(bool reference, const strata::kernels::NativeExpertLayout& L, const Dev& d, int64_t cap, cudaStream_t s) {
     if (reference)
         strata::kernels::ref::grouped(L, d.ptr, d.start, d.n, d.dst, d.tok, cap, cap, d.xq, d.scratch_ref, d.out_ref, s);
-    else
-        strata::kernels::native_expert_grouped(L, d.ptr, d.start, d.n, d.dst, d.tok, cap, cap, d.xq, d.scratch_new,
-                                               d.out_new, s);
+    else {
+        const int64_t xstride = L.gu_act == 15 ? (L.n_embd / 256) * 292 : (L.n_embd / 32) * 36;
+        strata::kernels::native_expert_grouped(L, d.ptr, d.start, d.n, d.dst, d.tok, cap, cap, d.xq, xstride,
+                                               d.scratch_new, d.out_new, s);
+    }
 }
 
 // microseconds per call, inside a graph of `reps` calls
@@ -480,7 +482,12 @@ int main(int argc, char** argv) {
     int bad = 0;
     std::mt19937 rng(11);
     for (const auto& [gu, dn] : pairs) {
-        const strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(gu, dn, H, FF);
+        // This historical test intentionally exercises the legacy q8_1
+        // grouped contract.  Make that contract explicit now that the native
+        // layout also carries per-layer CPU activation types; otherwise Q4_K /
+        // Q5_K would silently select the repaired Q8_K path while the test
+        // still uploads q8_1 rows.
+        const strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(gu, dn, H, FF, 9, 9);
         const size_t stride = (L.bytes + 255) & ~(size_t) 255;
         uint8_t* arena = make_arena(L, stride, gu * 100 + dn);
         const char* names = ggml_type_name((ggml_type) gu);

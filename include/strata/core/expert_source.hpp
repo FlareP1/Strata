@@ -151,13 +151,14 @@ struct ExpertDispatch {
     const uint8_t* cache_base = nullptr;   ///< the slot arena on the DEVICE
     int64_t cache_blob = 0;                ///< bytes per slot
     const uint64_t* cache_slot_off = nullptr;   ///< plan v0.3 P6: per-slot offsets when the slots differ in size
-    void* hit_scratch = nullptr;           ///< `moe_hit_grouped_scratch_bytes(K, ...)`
+    void* hit_scratch = nullptr;           ///< `moe_hit_grouped_scratch_bytes` or `native_expert_scratch_bytes`
     float* parts_out = nullptr;            ///< the graph's `parts` buffer, on the device
     /// Where the GPU's hits land, `K x n_embd`, DEVICE and separate from `parts_out` on purpose: see
     /// `HitPhase`.  Zeroed by the hit path each layer before the kernel writes it.
     float* hit_out = nullptr;
     int64_t parts_elems = 0;               ///< `K * n_embd`, the length of both buffers
     const float* mixed = nullptr;          ///< the layer's normed activation, for the hit kernel's Q8_0
+    bool native_hit = false;               ///< native pack: use the layer's NativeFmt contract, not Q2_0 S2
     uint8_t* x_q8_0_hit = nullptr;         ///< `(n_embd/32) * 34` bytes, its own buffer
     /// **R4.2h: THE CPU's fp32 ACTIVATION SCALES, `(n_embd/32)` FLOATS.**  Without them the GPU's hits are
     /// computed with the `block_q8_0`'s fp16 `d` while the CPU's misses use the fp32 `ActQ::scale`
@@ -168,6 +169,15 @@ struct ExpertDispatch {
     int32_t* d_slot = nullptr;             ///< device, K entries
     int32_t* d_dst = nullptr;              ///< device, K entries
     std::vector<int32_t> h_slot, h_dst;    ///< host staging, sized at session setup
+    // Native grouped-hit launch metadata.  One group contains this layer's resident routed entries; its
+    // pointers are built from the cache's per-slot offsets, so a profile-sized cache is addressed correctly.
+    unsigned long long* d_grp_ptr = nullptr;
+    int32_t* d_grp_start = nullptr;
+    int32_t* d_n_groups = nullptr;
+    int32_t* d_ent_tok = nullptr;
+    uint8_t* x_native = nullptr;            ///< one token in Q8_K (or Q8_1) according to NativeFmt.gu_act
+    std::vector<unsigned long long> h_grp_ptr;
+    std::vector<int32_t> h_grp_start, h_ent_tok;
     /// **PER ROUTER INDEX, DECIDED IN `Launch` AND CONSUMED BY THE POOL.**  The two callbacks share it
     /// so the decision is made exactly once, on this layer's ids, and neither side can re-decide it.
     std::vector<uint8_t> is_hit;
@@ -198,6 +208,7 @@ struct ExpertDispatch {
     /// lazy, this starts the GPU work before the pool instead of after it.
     bool hit_poke = false;
     bool hit_cpu_order = false;    ///< experimental CPU-order GPU expert arithmetic; opt-in only
+    bool disable_hit = false;      ///< diagnostic: preserve residency bookkeeping but route every expert to CPU
     int64_t n_hits = 0;                    ///< this layer's hits
     /// Set by `Launch` and consumed by `Combine`, so a `Combine` with no `Launch` in front of it cannot
     /// add a stale buffer into `parts`.
@@ -209,7 +220,10 @@ struct ExpertDispatch {
     bool hits_ready() const {
         return cache != nullptr && cache_base != nullptr && parts_out != nullptr && hit_out != nullptr &&
                mixed != nullptr &&
-               hit_scratch != nullptr && x_q8_0_hit != nullptr && x_q8_0_hit_scale != nullptr && d_slot != nullptr && d_dst != nullptr;
+               hit_scratch != nullptr && d_slot != nullptr && d_dst != nullptr &&
+               (native_hit ? (x_native != nullptr && d_grp_ptr != nullptr && d_grp_start != nullptr &&
+                              d_n_groups != nullptr && d_ent_tok != nullptr)
+                           : (x_q8_0_hit != nullptr && x_q8_0_hit_scale != nullptr));
     }
 
     std::vector<strata::kernels::cpu::ExpertJob> jobs;

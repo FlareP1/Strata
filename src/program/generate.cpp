@@ -115,6 +115,9 @@ struct Options {
     bool native_ple_postops = false;  // pinned PLE postprojection arithmetic
     bool native_router = false;       // pinned fused 512-expert top-10 router
     bool cpu_oracle_q8_0 = false;      // pinned x86 activation scales/codes at both expert stages
+    bool oracle_no_spec = false;       // diagnostic: permit native-pack direct oracle without MTP/speculation
+    bool disable_hit = false;          // diagnostic: keep residency/cache allocation but route every expert through CPU
+    bool verify_cache = false;         // diagnostic: read back every profile-filled slot and compare source bytes
     std::string native_head_gguf;      // native output.weight experiment; same model shard as the pack
     std::vector<std::string> native_dense_gguf; // repeat for native GDN/QSA projection shards
     /// Plan v0.3 P1: the whole native arithmetic set as ONE switch (model shard 1). It enables exactly the
@@ -331,6 +334,7 @@ void usage() {
                  "  --native-head-gguf PATH  native head from the model with this first shard; requires --stream-token\n"
                  "  --native-dense-gguf PATH native GDN/QSA/shared projections; repeat for each source model shard\n"
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
+                 "  --verify-cache           diagnostic: verify every profile-filled device slot against its source\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
                  "  --greedy             argmax (the default)\n"
@@ -638,8 +642,8 @@ void drive_tail(void* user) {
 }
 
 /// Plan v0.3 P6: the pool for a verify window.
-void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
+void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
+                      const float* weights, float* out, int64_t layer) {
     Drive* t = (Drive*) user;
     t->d.layers = layer;
     const Clock::time_point a = Clock::now();
@@ -657,6 +661,17 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     t->rows_at = Clock::now();
     t->cpu_ms += std::chrono::duration<double, std::milli>(t->rows_at - a).count();
     ++t->calls;
+    // The verifier uses the multi-token pool callback for every decode window,
+    // so mirror the single-token routing trace here.  The ids/weights arrays
+    // are laid out as n_tok consecutive rows of k entries.
+    if (t->routing != nullptr) {
+        for (int64_t tok = 0; tok < n_tok; ++tok) {
+            const int32_t rec[2] = {(int32_t) layer, (int32_t) k};
+            std::fwrite(rec, sizeof rec, 1, t->routing);
+            std::fwrite(ids + tok * k, sizeof(int32_t), (size_t) k, t->routing);
+            std::fwrite(weights + tok * k, sizeof(float), (size_t) k, t->routing);
+        }
+    }
 }
 
 /// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
@@ -866,6 +881,9 @@ int main(int argc, char** argv) {
         else if (a == "--native-ple-postops") o.native_ple_postops = true;
         else if (a == "--native-router") o.native_router = true;
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
+        else if (a == "--oracle-no-spec") o.oracle_no_spec = true;
+        else if (a == "--disable-hit") o.disable_hit = true;
+        else if (a == "--verify-cache") o.verify_cache = true;
         else if (a == "--native") o.native_preset = next("--native");
         else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
         else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
@@ -1115,7 +1133,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on AVX2\n");
     strata::core::NativeEmbed native_embed;
     if (native_pack) {
-        if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
+        if (o.native_preset.empty() || ((!o.oracle_no_spec) && o.spec < 2) || (o.keep_canonical && !o.oracle_no_spec) ||
             (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
             std::fprintf(stderr, "strata generate: %s is a native (IQ) pack: it needs --native SHARD1, --spec T (T >= 2) "
                                  "and --prefill CHUNK\n", o.pack.c_str());
@@ -1499,7 +1517,12 @@ int main(int argc, char** argv) {
         if (o.expert_cache == 0) o.expert_cache = (int) pslots;
         std::fprintf(stderr, "strata generate: profile %s: %zu ranked pairs, built for %lld slots\n",
                      o.expert_profile.c_str(), profile.size(), (long long) pslots);
+        // Native GPU hits are permitted here only on the repaired branch.  The
+        // grouped kernels now consume NativeFmt.gu_act/d_act, while callers can
+        // still force the deterministic CPU oracle with --disable-hit.
     }
+    // An explicit --disable-hit remains the safe fallback/oracle arm.  Do not
+    // silently disable repaired native hits when a profile is absent.
     const bool auto_cache = o.expert_cache < 0;
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
@@ -1591,19 +1614,12 @@ int main(int argc, char** argv) {
                      (long long) xcache.slots(), xcache.gib());
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
-        // **ROUND 328: THE HIT PATH IS PROVABLY WRONG, AND THIS SAYS SO OUT LOUD RATHER THAN LETTING IT
-        // CORRUPT A RUN QUIETLY.**  With the cache on, the generated tokens DIVERGE from the cache-off run:
-        // at 256 global slots (2.97% hits) the first difference is at **token 40**; at 4096 per-layer slots
-        // (54.4% hits) it is at **token 0**.  The cache-off run is deterministic across repeated runs, so
-        // this is a real fault in `moe_hit_grouped_s2`'s inputs or the fill - not noise.  It also explains
-        // what R4 recorded as "a better profile makes the token worse": more hits means more wrong rows, so
-        // the payoff is non-monotone BY CONSTRUCTION rather than by any memory-system effect.
-        // The cache stays opt-in and this warning is not a refusal, because the divergence IS the diagnostic.
+        // The repair branch makes the native GPU hit path honor each layer's NativeFmt activation
+        // contract.  Keep this diagnostic deliberately neutral: correctness is established by the
+        // CPU/GPU parity and full-model regression artifacts, while --disable-hit remains the oracle.
         std::fprintf(stderr,
-                     "strata generate: *** WARNING: --expert-cache is enabled and the GPU hit path is NOT\n"
-                     "                 CORRECT. The generated tokens diverge from a cache-off run (measured:\n"
-                     "                 first difference at token 40 at 2.97%% hits, token 0 at 54.4%%). Any\n"
-                     "                 timing from this run is real; any OUTPUT from it is not. ***\n");
+                     "strata generate: native GPU expert-cache repair path enabled; validate against the\n"
+                     "                 --disable-hit oracle before promoting a profile.\n");
         if (o.expert_cache_per_layer) {
             int64_t lo = 0, hi = 0;
             xcache.layer_slot_range(0, lo, hi);
@@ -1643,6 +1659,21 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (o.verify_cache) {
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            for (int64_t i = 0; i < prefilled; ++i) {
+                const auto pair = profile[(size_t) i];
+                const int32_t slot = xcache.slot_of(pair.first, pair.second);
+                if (!xcache.verify_slot(slot, srcp->blob(pair.first, pair.second), err,
+                                        (int64_t) lay.blob_bytes(pair.first))) {
+                    std::fprintf(stderr, "strata generate: cache verification failed at profile pair %lld (%d,%d), slot %d: %s\n",
+                                 (long long) i, pair.first, pair.second, slot, err.c_str());
+                    return 1;
+                }
+            }
+            std::fprintf(stderr, "strata generate: verified %lld/%lld profile-filled cache slots byte-for-byte\n",
+                         (long long) prefilled, (long long) want);
+        }
         mem_mark("the profile fill");
         std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
                      (long long) prefilled, (long long) want);
@@ -1650,6 +1681,7 @@ int main(int argc, char** argv) {
 
     Drive drive;
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
+    drive.d.disable_hit = o.disable_hit;
     drive.d.split_rows = !o.no_split_rows;
     drive.d.pool = &pool;
     drive.placement = &placement;
@@ -1664,9 +1696,19 @@ int main(int argc, char** argv) {
     int32_t* d_hit_dst = nullptr;
     uint8_t* d_hit_q8 = nullptr;
     float* d_hit_q8_scale = nullptr;   ///< R4.2h: the fp32 activation scales the CPU path also uses
+    uint8_t* d_hit_native = nullptr;
+    unsigned long long* d_hit_grp_ptr = nullptr;
+    int32_t* d_hit_grp_start = nullptr;
+    int32_t* d_hit_n_groups = nullptr;
+    int32_t* d_hit_ent_tok = nullptr;
     float* d_hit_out = nullptr;
     if (o.expert_cache > 0 && !o.no_pool) {
-        const uint64_t sb = strata::kernels::moe_hit_grouped_scratch_bytes(K, g.n_embd, strata::kernels::cpu::FF);
+        const bool native_hits = native_pack && strata::kernels::cpu::expert_layout().native;
+        const uint64_t sb_s2 = strata::kernels::moe_hit_grouped_scratch_bytes(K, g.n_embd, strata::kernels::cpu::FF);
+        const uint64_t sb_native = native_hits ? strata::kernels::native_expert_scratch_bytes(K, g.n_ff) : 0;
+        const uint64_t sb = std::max(sb_s2, sb_native);
+        const size_t native_x_bytes = std::max((size_t) (g.n_embd / 256) * 292,
+                                               (size_t) (g.n_embd / 32) * 36);
         if (cudaMalloc(&hit_scratch, (size_t) sb) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_slot, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_dst, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
@@ -1675,6 +1717,11 @@ int main(int argc, char** argv) {
             // while the CPU's misses use `ActQ::scale`, which is fp32 - a 4.761e-04 relative disagreement on
             // every chunk, and the reason enabling the cache changed the tokens.
             cudaMalloc((void**) &d_hit_q8_scale, (size_t) (g.n_embd / 32) * sizeof(float)) != cudaSuccess ||
+            cudaMalloc((void**) &d_hit_native, native_x_bytes) != cudaSuccess ||
+            cudaMalloc((void**) &d_hit_grp_ptr, (size_t) K * sizeof(unsigned long long)) != cudaSuccess ||
+            cudaMalloc((void**) &d_hit_grp_start, 2 * sizeof(int32_t)) != cudaSuccess ||
+            cudaMalloc((void**) &d_hit_n_groups, sizeof(int32_t)) != cudaSuccess ||
+            cudaMalloc((void**) &d_hit_ent_tok, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_out, (size_t) K * g.n_embd * 4) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: the R4 hit path could not allocate its device buffers\n");
             return 1;
@@ -1684,6 +1731,7 @@ int main(int argc, char** argv) {
         drive.d.cache_base = (const uint8_t*) xcache.device_slot(0);
         drive.d.cache_blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         drive.d.cache_slot_off = xcache.slot_offsets();
+        drive.d.native_hit = native_hits;
         drive.d.hit_scratch = hit_scratch;
         drive.d.parts_out = d_parts;
         drive.d.hit_out = d_hit_out;
@@ -1691,8 +1739,13 @@ int main(int argc, char** argv) {
         drive.d.mixed = ss.block.mixed;
         drive.d.x_q8_0_hit = d_hit_q8;
         drive.d.x_q8_0_hit_scale = d_hit_q8_scale;
+        drive.d.x_native = d_hit_native;
         drive.d.d_slot = d_hit_slot;
         drive.d.d_dst = d_hit_dst;
+        drive.d.d_grp_ptr = d_hit_grp_ptr;
+        drive.d.d_grp_start = d_hit_grp_start;
+        drive.d.d_n_groups = d_hit_n_groups;
+        drive.d.d_ent_tok = d_hit_ent_tok;
         drive.d.h_slot.resize((size_t) K);
         cudaEvent_t hit_done = nullptr;
         if (cudaEventCreate(&hit_done) != cudaSuccess) {
@@ -1784,7 +1837,7 @@ int main(int argc, char** argv) {
 
     // ---- the graphs
     strata::core::SessionGraphs gr;
-    if (!o.no_capture && !native_pack) {   // plan v0.3 P6: a native pack runs verify windows only
+    if (!o.no_capture && (!native_pack || o.oracle_no_spec)) {   // diagnostic oracle captures native-pack token loop
         if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages)) {
             std::fprintf(stderr, "strata generate: session_capture: %s\n", err.c_str());
             return 1;
@@ -2215,16 +2268,23 @@ int main(int argc, char** argv) {
     int32_t* d_res = nullptr;
     int32_t* d_hit_count = nullptr;
     strata::core::TokenHits thits;
-    const bool graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool;
-    if (graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr) {
+    const bool graph_hits = hit_fn != nullptr && !o.disable_hit && !profile.empty() && !o.no_pool;
+    // Diagnostic CPU oracle: keep the verifier's residency/slot metadata valid, but expose no resident
+    // experts to either the token graph or the host pool.  This is deliberately limited to native packs;
+    // it lets --disable-hit --no-token-graph execute the same verify path with every routed expert on CPU.
+    const bool cpu_oracle_hits = o.disable_hit && native_pack && !profile.empty() && !o.no_pool;
+    const bool token_hit_state = graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr;
+    const bool oracle_hit_state = cpu_oracle_hits && !o.no_capture;
+    if ((token_hit_state || oracle_hit_state)) {
         host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
         int64_t resident = 0;
-        for (int64_t l = 0; l < g.n_layers; ++l)
-            for (int64_t e = 0; e < g.n_expert; ++e) {
-                const int32_t slot = xcache.slot_of(l, e);
-                host_res[(size_t) (l * g.n_expert + e)] = slot;
-                if (slot != strata::core::kNotResident) ++resident;
-            }
+        if (token_hit_state)
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e) {
+                    const int32_t slot = xcache.slot_of(l, e);
+                    host_res[(size_t) (l * g.n_expert + e)] = slot;
+                    if (slot != strata::core::kNotResident) ++resident;
+                }
         if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_count, sizeof(int32_t)) != cudaSuccess ||
             cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -2243,8 +2303,9 @@ int main(int argc, char** argv) {
         thits.scratch = drive.d.hit_scratch;
         thits.hit_out = drive.d.hit_out;
         drive.d.host_res = host_res.data();
-        std::fprintf(stderr, "strata generate: token graph hit path: %lld resident experts, decided on the device\n",
-                     (long long) resident);
+        std::fprintf(stderr, "strata generate: %s hit metadata: %lld resident experts%s\n",
+                     token_hit_state ? "token graph" : "CPU oracle", (long long) resident,
+                     token_hit_state ? ", decided on the device" : " (all routed rows go to CPU)");
     }
     // plan v0.3 P6: the VRAM tier follows the conversation in both decode loops (--serve and the speculative loop):
     // moves every --adapt-every rounds on the adapt thread, admitted once their copies have landed
@@ -3097,7 +3158,7 @@ int main(int argc, char** argv) {
 
     for (int64_t pos = pos_start;; ++pos) {
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
-        if (native_pack) { spec_pos = pos; break; }
+        if (native_pack && !o.oracle_no_spec) { spec_pos = pos; break; }
         if (pos >= o.max_context) {
             std::fprintf(stderr, "strata generate: ran out of context at position %lld\n", (long long) pos);
             return 2;

@@ -47,8 +47,8 @@ class NativeHead;
 
 /// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd): the CPU's rows, the
 /// main GPU's zeroed unless `GpuPlanSink::host_rows_only`; a second GPU writes its own (`set_gpu2`).
-using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                             int64_t layer);
+using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
+                             const float* weights, float* out, int64_t layer);
 /// False, with the reason, when work the window waits for failed (the second GPU's).
 using WatchFn = bool (*)(void* user, std::string& err);
 /// Layer `layer`'s likely experts, its router applied to an estimate of its FFN input (`Verifier::set_predict`): ids
@@ -177,6 +177,8 @@ private:
     bool capture(int T, std::string& err);
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
+    void write_trace(int T, int64_t pos0);
+    void write_moe_trace(int T, int64_t pos0);
 
     strata::kernels::SamplerParams sampling_ = [] {
         strata::kernels::SamplerParams s;
@@ -226,6 +228,23 @@ private:
     uint32_t* h_pleflag_ = nullptr; uint32_t* m_pleflag_ = nullptr;  // the PLE rows are in h_ple_
     bool host_rows_ = false;
     float* h_rows_ = nullptr;    float* m_rows_ = nullptr;      // T * hc * n_embd: the final rows (set_host_rows)
+    // Opt-in graph-safe full-model divergence trace. The graph copies compact stage rows to pinned host memory;
+    // write_trace() serializes them only after the normal stream synchronization.
+    static constexpr int kTraceStages = 4; // residual input, attention output, FFN input, routed-MoE output
+    bool trace_enabled_ = false;
+    std::string trace_path_;
+    float* h_trace_ = nullptr;
+    uint64_t trace_span_ = 0;
+    uint64_t trace_seq_ = 0;
+    bool moe_trace_enabled_ = false;
+    bool moe_trace_seen_ = false;
+    int64_t moe_trace_layer_ = -1;
+    std::string moe_trace_path_;
+    float* h_moe_trace_ = nullptr;
+    int32_t* h_moe_meta_ = nullptr;
+    uint64_t moe_meta_words_ = 0;
+    uint64_t moe_trace_span_ = 0;
+    uint64_t moe_trace_seq_ = 0;
     int32_t ahead_tok_[8] = {};                                   // the tokens ple_ahead read for
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     struct FlagSet { uint32_t* flag; uint32_t value; };

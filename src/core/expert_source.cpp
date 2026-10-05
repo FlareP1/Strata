@@ -8,6 +8,7 @@
 #include "strata/platform/memory.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 
 #include <cuda_runtime.h>
@@ -480,8 +481,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     void (*submit2)(void*) = [](void* p) {
         Submit2& s = *(Submit2*) p;
         GpuPlanSink& S = *s.d->plan;
-        s.ok = s.d->gpu2->submit(s.d->layers, S.x1, s.n_tok, s.k, s.slots, s.starts, s.entries, s.n_groups, s.out,
-                                 S.gpu2_flag, S.ring, s.d->gpu2_err);
+        const auto& nf = strata::kernels::cpu::expert_layout().fmt[(size_t) s.d->layers];
+        const uint8_t* xa = nf.gu_act == 15 ? S.xk : S.x1;
+        const int64_t xs = nf.gu_act == 15 ? S.xk_stride : (int64_t) (strata::kernels::cpu::H / 32) * 36;
+        s.ok = xa != nullptr && s.d->gpu2->submit(s.d->layers, xa, xs, s.n_tok, s.k, s.slots, s.starts, s.entries,
+                                                   s.n_groups, s.out, S.gpu2_flag, S.ring, s.d->gpu2_err);
         if (s.ok) S.gpu2_ring = S.ring;
     };
     if (n2g <= 0) submit2 = nullptr;
@@ -556,6 +560,11 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
     if (phase == HitPhase::Launch) {
         d.decided = false;
         d.hit_pending = false;
+        if (d.disable_hit) {
+            d.decided = true;
+            d.n_hits = 0;
+            return;
+        }
         if (!d.hits_ready() || ids == nullptr || k <= 0) return;
         if ((int64_t) d.is_hit.size() < k) d.is_hit.resize((size_t) k);
 
@@ -615,25 +624,83 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
         // The activation is quantized HERE rather than reused from `s.moe.x_q8_0`, which `post[l-1]` wrote from
         // the PREVIOUS layer's `mixed`.  `pre[l]` has since overwritten `mixed`, so that buffer is a layer stale
         // - and a stale activation produces a perfectly finite expert for the wrong input.
-        // **R4.2h: THE SCALED QUANTIZER, SO A HIT REPRODUCES A MISS.**  The CPU pool quantizes this same
-        // activation with `act_quant_q8_1` and multiplies by the fp32 `ActQ::scale`; `quantize_q8_0` writes
-        // an fp16 `d` instead, and `bench/micro/act_quant_parity.cu` measured **80 of 80 chunks differing by
-        // up to 4.761e-04 relative**.  `quantize_q8_0_scaled` adopts the CPU's rule and scale, and the kernel
-        // takes the fp32 array.  Falling back to the old path would silently reintroduce the divergence, so
-        // the scales are required here rather than optional.
-        if (d.x_q8_0_hit_scale == nullptr) {
-            d.failed = true;
-            d.fail = "the hit path has no fp32 activation scales (R4.2h)";
-            return;
+        // Native packs have per-layer Q8_K/Q8_0/Q8_1 contracts and native GGUF blobs; the old S2 hit kernel is
+        // only for the canonical Q2_0 arena.  Using it on a native blob interprets Q4_K/Q5_K bytes as Q2_0 and
+        // is the exact reason larger profile-filled caches diverged while the one-slot control often did not.
+        if (d.native_hit) {
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            if (d.layers < 0 || d.layers >= (int64_t) lay.fmt.size()) {
+                d.failed = true;
+                d.fail = "the native hit path has no format for this layer";
+                d.fail_layer = d.layers;
+                return;
+            }
+            const auto& f = lay.fmt[(size_t) d.layers];
+            const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff,
+                                                                  f.gu_act, f.d_act);
+            if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
+                d.failed = true;
+                d.fail = "the native hit path does not support this layer's expert formats";
+                d.fail_layer = d.layers;
+                return;
+            }
+            // One grouped native call is enough for a token: every resident routed entry is one group member.
+            // Build device pointers from the cache's actual per-slot offsets; profile-sized slots are not
+            // `slot * max_blob` apart.
+            d.h_grp_ptr.resize((size_t) d.n_hits);
+            d.h_ent_tok.assign((size_t) d.n_hits, 0);
+            d.h_grp_start.resize(2);
+            d.h_grp_start[0] = 0;
+            d.h_grp_start[1] = (int32_t) d.n_hits;
+            const uint64_t uniform = (uint64_t) d.cache_blob;
+            for (int64_t i = 0; i < d.n_hits; ++i) {
+                const int32_t slot = d.h_slot[(size_t) i];
+                const uint64_t off = d.cache_slot_off != nullptr ? d.cache_slot_off[slot] : (uint64_t) slot * uniform;
+                d.h_grp_ptr[(size_t) i] = (unsigned long long) (d.cache_base + off);
+            }
+            const size_t ptr_bytes = (size_t) d.n_hits * sizeof(unsigned long long);
+            if (cudaMemcpyAsync(d.d_grp_ptr, d.h_grp_ptr.data(), ptr_bytes, cudaMemcpyHostToDevice, cs) != cudaSuccess ||
+                cudaMemcpyAsync(d.d_grp_start, d.h_grp_start.data(), 2 * sizeof(int32_t), cudaMemcpyHostToDevice, cs) != cudaSuccess ||
+                cudaMemcpyAsync(d.d_ent_tok, d.h_ent_tok.data(), (size_t) d.n_hits * sizeof(int32_t), cudaMemcpyHostToDevice, cs) != cudaSuccess) {
+                d.failed = true;
+                d.hit_fail = "the native hit metadata could not be staged";
+                d.fail = d.hit_fail;
+                return;
+            }
+            const int64_t xstride = f.gu_act == 15 ? (int64_t) (f.n_embd / 256) * 292
+                                                   : (int64_t) (f.n_embd / 32) * 36;
+            if (f.gu_act == 15)
+                strata::kernels::quantize_q8_K(d.mixed, d.x_native, f.n_embd, cs);
+            else
+                strata::kernels::quantize_q8_1_rows(d.mixed, 1, f.n_embd, d.x_native, cs);
+            const int32_t one = 1;
+            if (cudaMemcpyAsync(d.d_n_groups, &one, sizeof(one), cudaMemcpyHostToDevice, cs) != cudaSuccess) {
+                d.failed = true;
+                d.hit_fail = "the native hit group count could not be staged";
+                d.fail = d.hit_fail;
+                return;
+            }
+            strata::kernels::native_expert_grouped(L, d.d_grp_ptr, d.d_grp_start, d.d_n_groups, d.d_dst,
+                                                   d.d_ent_tok, 1, d.n_hits, d.x_native, xstride,
+                                                   d.hit_scratch, d.hit_out, cs);
+        } else {
+            // **R4.2h: THE SCALED QUANTIZER, SO A HIT REPRODUCES A MISS.**  The CPU pool quantizes this same
+            // activation with `act_quant_q8_1` and multiplies by the fp32 `ActQ::scale`; the canonical S2
+            // kernel takes the fp32 scales so its Q2_0 hit has the same contract.
+            if (d.x_q8_0_hit_scale == nullptr) {
+                d.failed = true;
+                d.fail = "the hit path has no fp32 activation scales (R4.2h)";
+                return;
+            }
+            strata::kernels::quantize_q8_0_scaled(d.mixed, d.x_q8_0_hit, d.x_q8_0_hit_scale, strata::kernels::cpu::H,
+                                                  cs);
+            if (d.hit_cpu_order)
+                strata::kernels::moe_hit_grouped_s2_cpu_order(d.cache_base, d.d_slot, d.d_dst, d.n_hits,
+                    d.cache_blob, d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
+            else
+                strata::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
+                    d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
         }
-        strata::kernels::quantize_q8_0_scaled(d.mixed, d.x_q8_0_hit, d.x_q8_0_hit_scale, strata::kernels::cpu::H,
-                                              cs);
-        if (d.hit_cpu_order)
-            strata::kernels::moe_hit_grouped_s2_cpu_order(d.cache_base, d.d_slot, d.d_dst, d.n_hits,
-                d.cache_blob, d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
-        else
-            strata::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
-                d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
         d.hit_pending = true;
         if (d.hit_done != nullptr) cudaEventRecord((cudaEvent_t) d.hit_done, cs);
         // The A/B arm: ONE driver entry here, and nothing else changes.  If the work was waiting for the host

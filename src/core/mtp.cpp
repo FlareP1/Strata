@@ -148,7 +148,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                 err = "mtp: experts.txt names formats the GPU expert kernels lack";
                 return false;
             }
-            nat_ = strata::kernels::native_expert_layout(gu, dn, g.n_embd, g.n_ff);
+            const int gu_act = (gu == 12 || gu == 13) ? 15 : 9;
+            const int d_act = dn == 8 ? 8 : 9;
+            nat_ = strata::kernels::native_expert_layout(gu, dn, g.n_embd, g.n_ff, gu_act, d_act);
             blob_ = nat_.bytes;
         }
         const uint64_t bytes = (uint64_t) g.n_expert * blob_;
@@ -219,7 +221,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         grp_ptr_ = b.take<unsigned long long>(T * K); grp_start_ = b.take<int32_t>(T * K + 1);
         grp_counts_ = b.take<int32_t>(4);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
-        nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
+        const uint64_t native_act_stride = std::max<uint64_t>((N / 32) * 36, (N / 256) * 292);
+        nat_xq_ = b.take<uint8_t>(T * native_act_stride);
         rseq_ = b.take<uint32_t>(4);
         rcount_ = b.take<unsigned>(4);
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
@@ -445,7 +448,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
                           N, g.n_ff, 32, side_, mixed_ + t * N, &nsw);
         }
         if (cudaEventRecord(sh_join_, side_) != cudaSuccess) { err = "mtp: the shared expert's branch"; return false; }
-        bool xq1 = false;   // the router kernel wrote the native experts' q8_1 rows
+        bool xq1 = false;   // the router kernel wrote q8_1 rows; K-native hits overwrite them with Q8_K below
         if (native_router_enabled()) {
             VerifyRouterArgs ra;
             ra.x = mixed_; ra.w = bf16("mlp.gate.weight"); ra.logits = logits_; ra.ids = ids_; ra.weights = w_;
@@ -464,9 +467,13 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) blob_, grp_ptr_, grp_start_, grp_counts_,
                            hit_dst_, hit_slot_, cs);
         if (nat_.gu_type >= 0) {
-            if (!xq1) quantize_q8_1_rows(mixed_, T, N, nat_xq_, cs);
+            if (nat_.gu_act == 15)
+                quantize_q8_K(mixed_, nat_xq_, (int64_t) T * N, cs);
+            else if (!xq1)
+                quantize_q8_1_rows(mixed_, T, N, nat_xq_, cs);
+            const int64_t xstride = nat_.gu_act == 15 ? (int64_t) (N / 256) * 292 : (int64_t) (N / 32) * 36;
             native_expert_grouped(nat_, grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K,
-                                  (int64_t) T * K, nat_xq_, hit_scratch_, parts_, cs);
+                                  (int64_t) T * K, nat_xq_, xstride, hit_scratch_, parts_, cs);
         } else {
             quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
             moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K,

@@ -47,25 +47,41 @@ void iq_dequant_experts_f16(int gu_type, int d_type, const uint8_t* const* blobs
 /// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.
 struct NativeExpertLayout {
     int gu_type = -1, d_type = -1;
+    int gu_act = 9, d_act = 9;             // ggml vec_dot activation types
     int64_t n_embd = 0, n_ff = 0;
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
 };
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff,
+                                        int gu_act = -1, int d_act = -1);
 /// Whether the GPU has the dot products (native_expert_grouped) and the dequantizers (the prompt path) for a layer's
 /// gate/up and down formats at this geometry.
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
+/// Test hook for the native Q8_0 activation contract.  x and y are device pointers.
+void native_q8_0_contract_probe(const float* x, int64_t n, void* y, void* stream);
 
-/// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
+
+/// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.  The largest supported hidden
+/// activation format is selected automatically (Q8_K, Q8_0 or Q8_1).
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 
 /// Grouped experts in the native format: group g's blob at device address grp_ptr[g]; its entries
-/// [grp_start[g], grp_start[g+1]) read token ent_tok[e]'s q8_1 activation (n_embd/32 blocks per token in x_q8_1)
-/// and write row ent_dst[e] of `out` (n_embd floats).  Counts are read on the device.
+/// [grp_start[g], grp_start[g+1]) read token ent_tok[e]'s activation in `L.gu_act` format and write row ent_dst[e]
+/// of `out` (n_embd floats).  The hidden activation between GU and DOWN is quantized in `L.d_act`.  Counts are
+/// read on the device.  The input and scratch pointers are byte-addressed because Q8_K and Q8_0 have different
+/// block sizes from q8_1. `x_stride` is the byte distance between token rows; it may include alignment padding
+/// (the verifier's mapped Q8_K rows are 2,928 bytes apart although their payload is 2,920 bytes).
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
-                           int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream);
+                           int64_t cap_entries, const void* x_q8_1, int64_t x_stride, void* scratch, float* out,
+                           void* stream, float* debug_h = nullptr, float* debug_gu = nullptr);
+/// Diagnostic-only DOWN replay.  It consumes an already quantized hidden buffer,
+/// bypassing GU/SwiGLU, so the strict contract test can evaluate all four CPU/GPU
+/// hidden-row combinations without changing the live grouped path.
+void native_expert_down_only(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                             const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                             const void* hidden, int64_t cap_groups, float* out, void* stream);
 /// Entries [grp_start[0], grp_start[*n_groups]): entry e's row ent_dst[e] of `rows` (n_embd floats each,
 /// n_embd % 4 == 0) to the same row of `*out`, at most `max_rows` rows, in 16-byte stores: rows bound for mapped host
 /// memory cross PCIe in full transactions (the grouped kernels' one-float stores there cost ~0.2 ms a layer).  Then,

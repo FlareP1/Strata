@@ -13,11 +13,13 @@
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "ggml-cpu.h"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/quantize_act.hpp"
 
 #include "ggml.h"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -25,6 +27,7 @@
 #include <cstdlib>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace cpu = strata::kernels::cpu;
@@ -38,6 +41,38 @@ double rel(const std::vector<float>& a, const std::vector<float>& b) {
     double n = 0, d = 0;
     for (size_t i = 0; i < a.size(); ++i) { n += std::fabs((double) a[i] - b[i]); d += std::fabs((double) b[i]); }
     return n / (d + 1e-30);
+}
+
+std::pair<double, double> abs_stats(const std::vector<float>& a, const std::vector<float>& b) {
+    double mx = 0.0, sum = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const double d = std::fabs((double) a[i] - (double) b[i]);
+        mx = std::max(mx, d);
+        sum += d;
+    }
+    return {mx, a.empty() ? 0.0 : sum / (double) a.size()};
+}
+
+int q8_0_tie_fixture(cudaStream_t s) {
+    std::vector<float> x(32, 0.0f);
+    x[0] = 1.0f;
+    x[1] = 0.019685039296746254f;
+    float* dx = nullptr;
+    uint8_t* dy = nullptr;
+    cudaMalloc((void**) &dx, x.size() * sizeof(float));
+    cudaMalloc((void**) &dy, 34);
+    cudaMemcpy(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice);
+    strata::kernels::native_q8_0_contract_probe(dx, 32, dy, s);
+    cudaStreamSynchronize(s);
+    std::vector<uint8_t> got(34);
+    cudaMemcpy(got.data(), dy, got.size(), cudaMemcpyDeviceToHost);
+    int failures = (got[2] != 127 || got[3] != 2);
+    for (size_t i = 4; i < got.size(); ++i) failures += got[i] != 0;
+    std::printf("q8_0_tie_fixture: q0=%u q1=%u expected=127,2 %s\n",
+                (unsigned) got[2], (unsigned) got[3], failures ? "FAIL" : "PASS");
+    cudaFree(dx);
+    cudaFree(dy);
+    return failures;
 }
 
 double us_since(std::chrono::steady_clock::time_point t0, int it) {
@@ -62,6 +97,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
     std::vector<float> x((size_t) NT * H);
     for (auto& v : x) v = nd(rng);
     std::vector<float> ref((size_t) NT * H), got_c((size_t) NT * H), got_g((size_t) NT * H);
+    std::vector<std::vector<uint8_t>> cpu_hq(NT, std::vector<uint8_t>(cpu::kNativeHBytes));
     for (int k = 0; k < NT; ++k) {
         std::vector<float> h(FF);
         for (int64_t r = 0; r < FF; ++r) {
@@ -78,7 +114,6 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
     // (b) the CPU
     {
         std::vector<std::vector<uint8_t>> act(NT, std::vector<uint8_t>(cpu::kNativeActBytes));
-        std::vector<std::vector<uint8_t>> hq(NT, std::vector<uint8_t>(cpu::kNativeHBytes));
         std::vector<std::vector<float>> ff(NT, std::vector<float>(FF));
         const void* a[NT];
         float* ffp[NT];
@@ -125,8 +160,8 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
                         2.0 * f.up_off / usg / 1e3);
         }
         for (int k = 0; k < NT; ++k) {
-            cpu::native_quant_h(f, ff[k].data(), hq[k].data());
-            hp[k] = hq[k].data();
+            cpu::native_quant_h(f, ff[k].data(), cpu_hq[k].data());
+            hp[k] = cpu_hq[k].data();
             op[k] = got_c.data() + k * H;
         }
         cpu::native_down_rows(f, blob.data(), hp, NT, op, 0, (int) H);
@@ -147,14 +182,14 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
     }
     // (c) the GPU: one group holding the NT entries; (d) its dequantizers
     {
-        const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF);
+        const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF, f.gu_act, f.d_act);
         void *dblob, *dx, *dxq, *dscr;
         float* dout;
         unsigned long long* dptr;
         int32_t *dstart, *dn, *ddst, *dtok;
         cudaMalloc(&dblob, blob.size());
         cudaMalloc(&dx, x.size() * 4);
-        cudaMalloc(&dxq, (size_t) NT * H / 32 * 36);
+        cudaMalloc(&dxq, (size_t) NT * (std::max)(H / 32 * 36, H / 256 * 292));
         cudaMalloc(&dscr, strata::kernels::native_expert_scratch_bytes(NT, FF));
         cudaMalloc((void**) &dout, (size_t) NT * H * 4);
         cudaMalloc((void**) &dptr, 8);
@@ -171,10 +206,41 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         cudaMemcpy(dn, &one, 4, cudaMemcpyHostToDevice);
         cudaMemcpy(ddst, idx, NT * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(dtok, idx, NT * 4, cudaMemcpyHostToDevice);
-        strata::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
-        strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
+        if (f.gu_act == 15)
+            strata::kernels::quantize_q8_K((const float*) dx, (uint8_t*) dxq, (int64_t) NT * H, s);
+        else
+            strata::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
+        const int64_t xstride = f.gu_act == 15 ? (H / 256) * 292 : (H / 32) * 36;
+        strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, xstride, dscr, dout, s);
         cudaStreamSynchronize(s);
         cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
+        // Keep the intermediate hidden quantization visible in the parity
+        // report.  This separates a GU/hidden-contract mismatch from a DOWN
+        // dot-product mismatch, which is especially important for the native
+        // Q5_1/Q8_1 layer-0 case.
+        std::vector<std::vector<uint8_t>> ghq(NT, std::vector<uint8_t>(f.h_bytes));
+        std::vector<const void*> ghqp(NT);
+        for (int k = 0; k < NT; ++k) {
+            cudaMemcpy(ghq[k].data(), (const uint8_t*) dscr + (size_t) k * f.h_bytes, f.h_bytes,
+                       cudaMemcpyDeviceToHost);
+            ghqp[k] = ghq[k].data();
+        }
+        size_t hdiff = 0;
+        for (int k = 0; k < NT; ++k)
+            for (size_t j = 0; j < f.h_bytes; ++j)
+                hdiff += ghq[k][j] != cpu_hq[k][j];
+        std::vector<float> cpu_from_gpu_h((size_t) NT * H);
+        std::vector<float*> cpu_from_gpu_hp(NT);
+        for (int k = 0; k < NT; ++k) cpu_from_gpu_hp[k] = cpu_from_gpu_h.data() + (size_t) k * H;
+        cpu::native_down_rows(f, blob.data(), ghqp.data(), NT, cpu_from_gpu_hp.data(), 0, (int) H);
+        std::printf("          hidden bytes differing: %zu/%zu; CPU down(GPU hidden) vs GPU rel %.2e\n",
+                    hdiff, (size_t) NT * f.h_bytes, rel(cpu_from_gpu_h, got_g));
+        // Native Q8_0 DOWN must consume the same hidden bytes as the CPU pool.
+        // This catches reciprocal/rounding ties in the activation quantizer.
+        if (f.d_act == 8 && hdiff != 0) {
+            std::fprintf(stderr, "          Q8_0 hidden quantization mismatch\n");
+            ++failures;
+        }
         float* dq = nullptr;
         cudaMalloc((void**) &dq, (size_t) FF * H * 4);
         std::vector<float> got_dq((size_t) FF * H);
@@ -195,10 +261,12 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
     }
     const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
+    const auto [gpu_max_abs, gpu_mean_abs] = abs_stats(got_c, got_g);
     const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
     std::printf("%-9s %-8s/%-7s blob %8zu  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  %s\n", label.c_str(),
                 ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), f.bytes, ec, eg, ecg,
                 ok ? "ok" : "FAIL");
+    std::printf("          CPU-GPU abs max %.6g mean %.6g\n", gpu_max_abs, gpu_mean_abs);
     return failures + (ok ? 0 : 1);
 }
 
@@ -246,6 +314,7 @@ int main(int argc, char** argv) {
     int failures = 0;
     cudaStream_t s;
     cudaStreamCreate(&s);
+    failures += q8_0_tie_fixture(s);
     if (std::string(argv[1]) == "--synthetic") {
         for (int i = 2; i < argc; ++i) {
             const std::string arg = argv[i];

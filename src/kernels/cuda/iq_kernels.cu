@@ -6,7 +6,11 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "iq_dot.cuh"
 #include "q8_1_il.cuh"
+#include "host_expf_contract.cuh"
+#include "strata/kernels/f16_bits.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
@@ -206,6 +210,159 @@ __global__ void rows_out_kernel(const float4* __restrict__ src, const int32_t* _
     if (last && threadIdx.x == 0) {
         *counter = 0u;   // for the next launch
         *(volatile uint32_t*) f = (uint32_t) *ring;
+    }
+}
+
+// Activation-contract-aware native expert kernels.  The legacy kernels above are retained for q8_1 callers and
+// for the historical parity target.  NativeFmt's Q4_K/Q5_K gate/up layers use Q8_K rows, while Q8_0 down layers
+// use Q8_0 hidden rows; these kernels keep those formats all the way through the grouped hit path.
+__device__ __forceinline__ int native_q8_0_contract_code(float xi, float amax) {
+    const float inv = amax == 0.0f ? 0.0f : __fdiv_rn(127.0f, amax);
+    const float z = amax == 0.0f ? 0.0f : __fmul_rn(xi, inv);
+    const int q = amax == 0.0f ? 0 : __float2int_rn(z);
+    return max(-127, min(127, q));
+}
+
+template<int TG>
+__global__ void __launch_bounds__(GUS_WARPS * 32) native_gus_contract_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok, const void* __restrict__ xq,
+    int64_t x_stride, NativeExpertLayout L, void* __restrict__ hq, float* __restrict__ debug_h,
+    float* __restrict__ debug_gu) {
+    using F = Fmt<TG>;
+    static_assert(TG == 12 || TG == 13, "native Q8_K GU is only defined for K-quants");
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    __shared__ float sh[GUS_BATCH][32];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, c = blockIdx.x;
+    const uint8_t* wg = (const uint8_t*) grp_ptr[g] + (size_t) (32 * c + GUS_ROWS * warp) * L.gu_row;
+    const uint8_t* wu = wg + L.up_off;
+    const int nb = (int) (L.n_embd / F::qk), xb = (int) (L.n_embd / 256), hb = (int) (L.n_ff / 32);
+    const size_t block_stride = L.gu_row / (size_t) nb;
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    for (int b0 = e0; b0 < e1; b0 += GUS_BATCH) {
+        const int b1 = min(e1, b0 + GUS_BATCH);
+        for (int e = b0; e < b1; ++e) {
+            const block_q8_K* x = (const block_q8_K*) ((const uint8_t*) xq + (size_t) ent_tok[e] * (size_t) x_stride);
+            float sg[GUS_ROWS], su[GUS_ROWS];
+#pragma unroll
+            for (int i = 0; i < GUS_ROWS; ++i) {
+                sg[i] = row_dot_k_q8_k_stride<TG == 13>(wg + (size_t) i * L.gu_row, block_stride, x, nb, lane);
+                su[i] = row_dot_k_q8_k_stride<TG == 13>(wu + (size_t) i * L.gu_row, block_stride, x, nb, lane);
+            }
+            if (lane == 0) {
+#pragma unroll
+                for (int i = 0; i < GUS_ROWS; ++i) {
+                    if (debug_gu != nullptr) {
+                        const size_t row = (size_t) c * 32 + (size_t) GUS_ROWS * (size_t) warp + (size_t) i;
+                        debug_gu[(size_t) e * 2 * (size_t) L.n_ff + row] = sg[i];
+                        debug_gu[(size_t) e * 2 * (size_t) L.n_ff + (size_t) L.n_ff + row] = su[i];
+                    }
+                    const float gd = sg[i], ud = su[i];
+                    const float ee = strata::cuda_contract::host_contract_expf_f32(-gd);
+                    const float den = __fadd_rn(1.0f, ee);
+                    const float sil = __fdiv_rn(gd, den);
+                    sh[e - b0][GUS_ROWS * warp + i] = __fmul_rn(sil, ud);
+                }
+            }
+        }
+        __syncthreads();
+        for (int e = b0 + warp; e < b1; e += GUS_WARPS) {
+            const float xi = sh[e - b0][lane];
+            if (debug_h != nullptr)
+                debug_h[(size_t) e * (size_t) L.n_ff + (size_t) c * 32 + (size_t) lane] = xi;
+            float amax = fabsf(xi);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            if (L.d_act == 8) {
+                uint8_t* y = (uint8_t*) hq + (size_t) e * (size_t) hb * 34 + (size_t) c * 34;
+                const float d32 = amax / 127.0f;
+                if (lane == 0) {
+                    const uint16_t bits = f16_from_f32(d32);
+                    y[0] = (uint8_t) bits; y[1] = (uint8_t) (bits >> 8);
+                }
+                const int q = native_q8_0_contract_code(xi, amax);
+                y[2 + lane] = (uint8_t) (int8_t) q;
+            } else {
+                uint8_t* y = (uint8_t*) hq + (size_t) e * (size_t) hb * 36 + (size_t) c * 36;
+                const float d32 = __fdiv_rn(amax, 127.0f);
+                // ggml's AVX2 quantize_row_q8_1 computes the reciprocal once,
+                // multiplies by 127/max, and converts with _MM_ROUND_NEAREST
+                // (ties-to-even).  Division plus roundf is a different contract
+                // at half-integer thresholds and changes the hidden bytes.
+                const float id = amax == 0.0f ? 0.0f : __fdiv_rn(127.0f, amax);
+                const float z = amax == 0.0f ? 0.0f : __fmul_rn(xi, id);
+                const int q = amax == 0.0f ? 0 : __float2int_rn(z);
+                int sumq = q;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) sumq += __shfl_xor_sync(0xffffffffu, sumq, o);
+                if (lane == 0)
+                    *reinterpret_cast<half2*>(y) = __halves2half2(__float2half(d32), __float2half(__fmul_rn((float) sumq, d32)));
+                y[4 + lane] = (uint8_t) (int8_t) q;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void native_q8_0_contract_probe_kernel(const float* x, uint8_t* y, int nblocks) {
+    const int b = blockIdx.x;
+    if (b >= nblocks || threadIdx.x != 0) return;
+    const float* xb = x + (size_t) b * 32;
+    uint8_t* out = y + (size_t) b * 34;
+    float amax = 0.0f;
+    for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(xb[i]));
+    const float d32 = amax / 127.0f;
+    const uint16_t bits = f16_from_f32(d32);
+    out[0] = (uint8_t) bits; out[1] = (uint8_t) (bits >> 8);
+    for (int i = 0; i < 32; ++i)
+        out[2 + i] = (uint8_t) (int8_t) native_q8_0_contract_code(xb[i], amax);
+}
+
+template<int TD>
+__global__ void __launch_bounds__(DOWN_WARPS * 32) native_down_contract_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst, const void* __restrict__ hq,
+    NativeExpertLayout L, float* __restrict__ out) {
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = (blockIdx.x * DOWN_WARPS + warp) * DOWN_ROWS;
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    const int nb = L.d_act == 8 ? (int) (L.n_ff / 32) : L.d_act == 15 ? (int) (L.n_ff / 256)
+                                                                         : (int) (L.n_ff / 32);
+    const size_t block_stride = L.d_row / (size_t) nb;
+    const int hb = L.d_act == 8 ? (int) (L.n_ff / 32) : L.d_act == 15 ? (int) (L.n_ff / 256)
+                                                                        : (int) (L.n_ff / 32);
+    for (int e = e0; e < e1; ++e) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g] + L.down_off;
+        float v[DOWN_ROWS];
+#pragma unroll
+        for (int i = 0; i < DOWN_ROWS; ++i) {
+            if (L.d_act == 8) {
+                const block_q8_0* x = (const block_q8_0*) ((const uint8_t*) hq + (size_t) e * hb * 34);
+                v[i] = row_dot_q8_0_q8_0(blob + (size_t) (r0 + i) * L.d_row, block_stride, x, nb, lane);
+            } else if (L.d_act == 15) {
+                const block_q8_K* x = (const block_q8_K*) ((const uint8_t*) hq + (size_t) e * hb * 292);
+                if constexpr (TD == 12 || TD == 13)
+                    v[i] = row_dot_k_q8_k_stride<TD == 13>(blob + (size_t) (r0 + i) * L.d_row, block_stride, x, nb, lane);
+                else v[i] = 0.0f;
+            } else {
+                const block_q8_1* x = (const block_q8_1*) ((const uint8_t*) hq + (size_t) e * hb * 36);
+                if constexpr (TD == 7) {
+                    v[i] = row_dot_q5_1_q8_1_cpu_avx2(blob + (size_t) (r0 + i) * L.d_row, x, nb, lane);
+                } else
+                    v[i] = row_dot<TD>(blob + (size_t) (r0 + i) * L.d_row, x, nb, lane);
+            }
+        }
+        if (lane == 0) {
+            float* o = out + (size_t) ent_dst[e] * L.n_embd + r0;
+            if constexpr (DOWN_ROWS == 4) *(float4*) o = make_float4(v[0], v[1], v[2], v[3]);
+            else if constexpr (DOWN_ROWS == 2) *(float2*) o = make_float2(v[0], v[1]);
+            else
+#pragma unroll
+                for (int i = 0; i < DOWN_ROWS; ++i) o[i] = v[i];
+        }
     }
 }
 
@@ -686,11 +843,25 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
     const int qg = fmt_qk(gu_type), qd = fmt_qk(d_type);
     return qg > 0 && qd > 0 && is_iq(gu_type) && is_iq(d_type) && n_embd % qg == 0 && n_ff % qd == 0;
 }
+void native_q8_0_contract_probe(const float* x, int64_t n, void* y, void* stream) {
+    if (n <= 0 || n % 32 != 0) { std::fprintf(stderr, "native_q8_0_contract_probe: n must be a positive multiple of 32\n"); std::exit(1); }
+    native_q8_0_contract_probe_kernel<<<(unsigned) (n / 32), 1, 0, (cudaStream_t) stream>>>(x, (uint8_t*) y, (int) (n / 32));
+    check("native_q8_0_contract_probe");
+}
 
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int gu_act, int d_act) {
     NativeExpertLayout L;
     L.gu_type = gu_type;
     L.d_type = d_type;
+    // A negative activation type means an intentional legacy q8_1 caller.
+    // Native production paths pass NativeFmt.gu_act/d_act explicitly; do not
+    // infer those values here because tests and future formats may use the
+    // same weight types with a different contract.
+    if (gu_act < 0) gu_act = 9;
+    if (d_act < 0) d_act = 9;
+    L.gu_act = gu_act;
+    L.d_act = d_act;
     L.n_embd = n_embd;
     L.n_ff = n_ff;
     L.gu_row = iq_row_bytes(gu_type, n_embd);
@@ -702,12 +873,16 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
 }
 
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
-    return ((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255;
+    const size_t q81 = (size_t) (n_ff / 32) * sizeof(block_q8_1);
+    const size_t q80 = (size_t) (n_ff / 32) * 34;
+    const size_t q8k = (size_t) (n_ff / 256) * 292;
+    return ((size_t) cap * (std::max)(q81, (std::max)(q80, q8k)) + 255) & ~(size_t) 255;
 }
 
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
-                           int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream) {
+                           int64_t cap_entries, const void* x_q8_1, int64_t x_stride, void* scratch, float* out,
+                           void* stream, float* debug_h, float* debug_gu) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (L.n_ff % 32 != 0 || L.n_embd % (DOWN_WARPS * DOWN_ROWS) != 0) {
         std::fprintf(stderr, "native_expert_grouped: n_ff %lld / n_embd %lld do not divide into the kernels' rows\n",
@@ -718,7 +893,15 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     auto* hq = (block_q8_1*) scratch;
     const auto* X = (const block_q8_1*) x_q8_1;
     const dim3 ggu((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
-    switch (L.gu_type) {
+    if (L.gu_act == 15) {
+        switch (L.gu_type) {
+        case 12: native_gus_contract_kernel<12><<<ggu, GUS_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok,
+                                                                                x_q8_1, x_stride, L, scratch, debug_h, debug_gu); break;
+        case 13: native_gus_contract_kernel<13><<<ggu, GUS_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok,
+                                                                                x_q8_1, x_stride, L, scratch, debug_h, debug_gu); break;
+        default: std::fprintf(stderr, "native_expert_grouped: Q8_K gate/up type %d\\n", L.gu_type); std::exit(1);
+        }
+    } else switch (L.gu_type) {
 #define STRATA_GU(T) case T: native_gus_kernel<T><<<ggu, GUS_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
         STRATA_FMTS(STRATA_GU)
 #undef STRATA_GU
@@ -726,13 +909,61 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     check("native_expert_grouped/gu");
     const dim3 gd((unsigned) (L.n_embd / (DOWN_WARPS * DOWN_ROWS)), (unsigned) cap_groups);
+    if (L.d_act == 8 && L.d_type == 8) {
+        native_down_contract_kernel<8><<<gd, DOWN_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst,
+                                                                       scratch, L, out);
+    } else if (L.gu_act == 15 && L.d_act == 9 && L.d_type == 7) {
+        native_down_contract_kernel<7><<<gd, DOWN_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst,
+                                                                       scratch, L, out);
+    } else if (L.d_act == 15 && L.d_type == 12) {
+        native_down_contract_kernel<12><<<gd, DOWN_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst,
+                                                                        scratch, L, out);
+    } else if (L.d_act == 15 && L.d_type == 13) {
+        native_down_contract_kernel<13><<<gd, DOWN_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst,
+                                                                        scratch, L, out);
+    } else {
     switch (L.d_type) {
 #define STRATA_DOWN(T) case T: native_down_kernel<T><<<gd, DOWN_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         STRATA_FMTS(STRATA_DOWN)
 #undef STRATA_DOWN
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
+    }
     check("native_expert_grouped/down");
+}
+
+void native_expert_down_only(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                             const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                             const void* hidden, int64_t cap_groups, float* out, void* stream) {
+    if (cap_groups <= 0) return;
+    if (L.n_embd % (DOWN_WARPS * DOWN_ROWS) != 0) {
+        std::fprintf(stderr, "native_expert_down_only: n_embd %lld does not divide into the kernel rows\n",
+                     (long long) L.n_embd);
+        std::exit(1);
+    }
+    const dim3 gd((unsigned) (L.n_embd / (DOWN_WARPS * DOWN_ROWS)), (unsigned) cap_groups);
+    cudaStream_t s = (cudaStream_t) stream;
+    if (L.d_act == 8 && L.d_type == 8) {
+        native_down_contract_kernel<8><<<gd, DOWN_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst,
+                                                                       hidden, L, out);
+    } else if (L.gu_act == 15 && L.d_act == 9 && L.d_type == 7) {
+        native_down_contract_kernel<7><<<gd, DOWN_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst,
+                                                                       hidden, L, out);
+    } else if (L.d_act == 15 && L.d_type == 12) {
+        native_down_contract_kernel<12><<<gd, DOWN_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst,
+                                                                        hidden, L, out);
+    } else if (L.d_act == 15 && L.d_type == 13) {
+        native_down_contract_kernel<13><<<gd, DOWN_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst,
+                                                                        hidden, L, out);
+    } else {
+        switch (L.d_type) {
+#define STRATA_DOWN_ONLY(T) case T: native_down_kernel<T><<<gd, DOWN_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, (const block_q8_1*) hidden, L, out); break;
+            STRATA_FMTS(STRATA_DOWN_ONLY)
+#undef STRATA_DOWN_ONLY
+            default: std::fprintf(stderr, "native_expert_down_only: unsupported down type %d\n", L.d_type); std::exit(1);
+        }
+    }
+    check("native_expert_down_only");
 }
 
 void native_expert_rows_out(const float* rows, const int32_t* n_groups, const int32_t* grp_start,

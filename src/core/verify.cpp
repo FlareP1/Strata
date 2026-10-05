@@ -37,7 +37,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <immintrin.h>
+#include <vector>
 
 namespace strata::core {
 namespace {
@@ -113,7 +115,7 @@ Verifier::~Verifier() {
     void* hosts[] = {h_tok_, h_val_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_,
                      h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_, h_pids_, h_pw_, h_pseq_, h_pleflag_, h_rows_, h_res_, h_flag2_,
-                     h_list2_, h_xk_, h_xq1_};
+                     h_list2_, h_xk_, h_xq1_, h_trace_, h_moe_trace_, h_moe_meta_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -171,6 +173,42 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
+    if (const char* path = std::getenv("STRATA_DIVERGENCE_TRACE"); path != nullptr && *path != '\0') {
+        trace_enabled_ = true;
+        trace_path_ = path;
+        trace_span_ = std::max<uint64_t>(HC * N, N);
+        const uint64_t count = (uint64_t) g.n_layers * kTraceStages * trace_span_;
+        if (cudaHostAlloc((void**) &h_trace_, (size_t) count * sizeof(float), cudaHostAllocPortable) != cudaSuccess) {
+            err = "verify: divergence trace allocation failed";
+            return false;
+        }
+        std::memset(h_trace_, 0, (size_t) count * sizeof(float));
+    }
+    if (const char* path = std::getenv("STRATA_MOE_TRACE_PATH"); path != nullptr && *path != '\0') {
+        const char* layer = std::getenv("STRATA_MOE_TRACE_LAYER");
+        char* end = nullptr;
+        const long long parsed = layer != nullptr ? std::strtoll(layer, &end, 10) : -1;
+        if (layer != nullptr && (end == layer || *end != '\0' || parsed < 0 || parsed >= g.n_layers)) {
+            err = "verify: invalid STRATA_MOE_TRACE_LAYER";
+            return false;
+        }
+        moe_trace_enabled_ = true;
+        moe_trace_layer_ = parsed;
+        moe_trace_path_ = path;
+        moe_trace_span_ = K * N;
+        const uint64_t count = 4 * moe_trace_span_;
+        if (cudaHostAlloc((void**) &h_moe_trace_, (size_t) count * sizeof(float), cudaHostAllocPortable) != cudaSuccess) {
+            err = "verify: MoE trace allocation failed";
+            return false;
+        }
+        std::memset(h_moe_trace_, 0, (size_t) count * sizeof(float));
+        moe_meta_words_ = 8 + 2 * (uint64_t) max_t * K + K;
+        if (cudaHostAlloc((void**) &h_moe_meta_, (size_t) moe_meta_words_ * sizeof(int32_t), cudaHostAllocPortable) != cudaSuccess) {
+            err = "verify: MoE trace metadata allocation failed";
+            return false;
+        }
+        std::memset(h_moe_meta_, 0, (size_t) moe_meta_words_ * sizeof(int32_t));
+    }
 
     // ---- mapped staging (portable where the second GPU writes: its rows and flags)
     const unsigned portable = cudaHostAllocMapped | cudaHostAllocPortable;
@@ -272,7 +310,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         res_ = b.take<int32_t>((uint64_t) res_words_); slot_ptr_ = b.take<unsigned long long>((uint64_t) hits.slots);
         staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
-        nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
+        nat_xq_ = b.take<uint8_t>(T * (uint64_t) (std::max<int64_t>(xk_stride_, (int64_t) (N / 32) * 36)));
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
             strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
             strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
@@ -399,6 +437,41 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto stamp = [&](int64_t row, int i, cudaStream_t st) {
         if (stamps_ != nullptr && G == 1)
             gpu_stamp(stamps_ + ((size_t) T * (size_t) (g.n_layers + 1) + (size_t) row) * kStamps + i, st);
+    };
+    auto trace_copy = [&](int64_t layer, int stage, const float* src, uint64_t count) -> bool {
+        if (!trace_enabled_ || G != 1) return true;
+        const size_t off = ((size_t) layer * (size_t) kTraceStages + (size_t) stage) * (size_t) trace_span_;
+        if (cudaMemcpyAsync(h_trace_ + off, src, (size_t) count * sizeof(float), cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+            err = "verify: divergence trace copy failed";
+            return false;
+        }
+        return true;
+    };
+    auto moe_copy = [&](int64_t layer, int stage, const float* src, uint64_t count) -> bool {
+        if (!moe_trace_enabled_ || G != 1 || layer != moe_trace_layer_) return true;
+        const size_t off = (size_t) stage * (size_t) moe_trace_span_;
+        if (count > moe_trace_span_ || cudaMemcpyAsync(h_moe_trace_ + off, src,
+                                                       (size_t) count * sizeof(float), cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+            err = "verify: MoE trace copy failed";
+            return false;
+        }
+        moe_trace_seen_ = true;
+        return true;
+    };
+    auto moe_meta_copy = [&](int64_t layer, const int32_t* vcounts, const int32_t* vdst,
+                             const int32_t* pcounts, const int32_t* pdst, int64_t count) -> bool {
+        if (!moe_trace_enabled_ || G != 1 || layer != moe_trace_layer_) return true;
+        if (count > (int64_t) max_t_ * (int64_t) K ||
+            cudaMemcpyAsync(h_moe_meta_, vcounts, 4 * sizeof(int32_t), cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+            cudaMemcpyAsync(h_moe_meta_ + 4, vdst, (size_t) count * sizeof(int32_t), cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+            (pcounts != nullptr && cudaMemcpyAsync(h_moe_meta_ + 4 + (size_t) max_t_ * (size_t) K, pcounts,
+                                                   4 * sizeof(int32_t), cudaMemcpyDeviceToHost, cs) != cudaSuccess) ||
+            (pdst != nullptr && cudaMemcpyAsync(h_moe_meta_ + 8 + (size_t) max_t_ * (size_t) K, pdst,
+                                                (size_t) count * sizeof(int32_t), cudaMemcpyDeviceToHost, cs) != cudaSuccess)) {
+            err = "verify: MoE trace metadata copy failed";
+            return false;
+        }
+        return true;
     };
     stamp(g.n_layers, 0, cs);
     if (gpu2_ && !quant_router_) {
@@ -597,6 +670,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             fused_gr_read_multi(fa, n, grs_, cs);
         };
         gr_read_group(0, pending, inj2_, inj_, nullptr, nullptr, nullptr);
+        if (!trace_copy(l, 0, Rt(tb), (uint64_t) HC * (uint64_t) N)) return false;
         stamp(l, 1, cs);
         float* xm = mixed_ + tb * N;
         try {
@@ -712,6 +786,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
             return false;
         }
+        if (!trace_copy(l, 1, bo_ + tb * N, (uint64_t) N)) return false;
         stamp(l, 2, cs);
         // the FFN read, and the next layer's estimated FFN input for the prediction (set_predict)
         const WeightRef* wn1 = predicts(l) ? need(LayerView(wt, l + 1), "hc_ffn_norm.weight", err) : nullptr;
@@ -719,12 +794,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         gr_read_group(1, true, inj_, inj2_, corrects(l) ? gate_ema_ + (size_t) l * HC * N : nullptr,
                       wn1 != nullptr ? (const float*) wn1->data : nullptr,
                       wn1 != nullptr ? gate_ema_ + (size_t) (l + 1) * HC * N : nullptr);
+        if (!trace_copy(l, 2, mixed_ + tb * N, (uint64_t) N)) return false;
         stamp(l, 3, cs);
         // the routed experts' activations: from the router kernel, else beside it (joined before the experts)
         if (!quant_router_) {
             if (!fork(side_, bfork_)) return false;
-            if (strata::kernels::cpu::expert_layout().native)
-                quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, side_);
+            if (strata::kernels::cpu::expert_layout().native) {
+                const auto& nf = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
+                if (nf.gu_act == 15)
+                    quantize_q8_K(xm, nat_xq_ + (size_t) tb * (size_t) xk_stride_, (int64_t) n * N, side_);
+                else
+                    quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, side_);
+            }
             else
                 quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32),
                                      (int64_t) n * N, side_);
@@ -868,9 +949,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
-                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-                native_expert_grouped(L, gp, gs, gn, p.dst, p.tok, cap, cap,
-                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
+                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff,
+                                                                    f.gu_act, f.d_act);
+                const void* xact = L.gu_act == 15
+                    ? (const void*) (m_xk_ + (size_t) tb * (size_t) xk_stride_)
+                    : (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36);
+                const int64_t xstride = L.gu_act == 15 ? xk_stride_ : (int64_t) (N / 32) * 36;
+                native_expert_grouped(L, gp, gs, gn, p.dst, p.tok, cap, cap, xact, xstride, hit_scratch_, hit_out, cs);
             } else {
                 moe_grouped_s2(gp, gs, gn, p.dst, p.tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
@@ -899,6 +984,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         } else {
             stamp(l, 7, cs);
         }
+        if (!moe_copy(l, 0, hit_out, (uint64_t) K * (uint64_t) N)) return false;
+        if (!moe_meta_copy(l, vram.counts, vram.dst, pcie.counts, pcie.dst, capx)) return false;
         stamp(l, 8, cs);
         if (!wait(cpjoin_[grp])) return false;                 // the CPU's share is in the mapped rows
         stamp(l, 9, cs);
@@ -920,6 +1007,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             err = "verify layer " + std::to_string(l) + " combine: " + e.what();
             return false;
         }
+        if (!moe_copy(l, 2, shared_ + tb * N, (uint64_t) N) ||
+            !moe_copy(l, 3, bo_ + tb * N, (uint64_t) N)) return false;
+        if (!trace_copy(l, 3, bo_ + tb * N, (uint64_t) N)) return false;
         stamp(l, 11, cs);
         if (branches(l) && cudaStreamWaitEvent(cs, join_, 0) != cudaSuccess) {
             err = "verify: the prediction branch could not join";
@@ -1216,7 +1306,51 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         sink_.x1 = h_xq1_ + (size_t) tb * (size_t) (g.n_embd / 32) * 36;
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
-                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+                 h_w_ + (size_t) tb * ss.k, h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        if (moe_trace_enabled_ && G == 1 && l == moe_trace_layer_) {
+            std::memcpy(h_moe_trace_ + moe_trace_span_, h_ymiss_ + (size_t) tb * ss.k * g.n_embd,
+                        (size_t) ss.k * (size_t) g.n_embd * sizeof(float));
+            std::memcpy(h_moe_meta_ + 8 + 2 * (size_t) max_t_ * (size_t) ss.k, h_ids_ + (size_t) tb * ss.k,
+                        (size_t) ss.k * sizeof(int32_t));
+            // Debug-only live-input sidecar.  The MoE trace already captures the four output stages and
+            // destination metadata; this sidecar preserves the exact router weights and quantized gate/up
+            // activation bytes consumed by the target layer so a single tier-swapped row can be replayed outside
+            // the full graph.  It is intentionally opt-in with STRATA_MOE_TRACE_PATH and never used by serving.
+            {
+                struct DetailHeader {
+                    uint64_t magic;
+                    uint32_t version;
+                    uint32_t T;
+                    int64_t pos0;
+                    int64_t layer;
+                    uint64_t n_embd;
+                    uint64_t n_ff;
+                    uint64_t k;
+                    uint64_t act_bytes;
+                    uint32_t act_type;
+                    uint32_t meta_words;
+                } dh{0x535452414d4f4532ull, 1u, (uint32_t) T, last_pos0_, l, (uint64_t) g.n_embd,
+                     (uint64_t) g.n_ff, (uint64_t) ss.k,
+                     xk_layer_[(size_t) l] ? (uint64_t) xk_stride_ : (uint64_t) ((g.n_embd / 32) * 36),
+                     (uint32_t) (xk_layer_[(size_t) l] ? 15 : 9), (uint32_t) moe_meta_words_};
+                std::ofstream detail(moe_trace_path_ + ".details", std::ios::binary | std::ios::app);
+                if (detail) {
+                    detail.write((const char*) &dh, sizeof dh);
+                    detail.write((const char*) (h_w_ + (size_t) tb * ss.k),
+                                 (std::streamsize) ss.k * sizeof(float));
+                    detail.write((const char*) (h_ids_ + (size_t) tb * ss.k),
+                                 (std::streamsize) ss.k * sizeof(int32_t));
+                    const size_t act_bytes = (size_t) dh.act_bytes;
+                    const uint8_t* act = xk_layer_[(size_t) l]
+                        ? h_xk_ + (size_t) tb * (size_t) xk_stride_
+                        : h_xq1_ + (size_t) tb * (size_t) (g.n_embd / 32) * 36;
+                    detail.write((const char*) act, (std::streamsize) act_bytes);
+                    detail.write((const char*) h_moe_meta_,
+                                 (std::streamsize) moe_meta_words_ * sizeof(int32_t));
+                }
+            }
+            moe_trace_seen_ = true;
+        }
         VDBG("layer %lld served\n", (long long) l);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -1338,8 +1472,48 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ++prof_windows_;
     }
     VDBG("window done\n");
+    write_trace(T, pos0);
+    write_moe_trace(T, pos0);
     ++windows;
     return true;
+}
+
+void Verifier::write_trace(int T, int64_t pos0) {
+    if (!trace_enabled_ || h_trace_ == nullptr || trace_path_.empty()) return;
+    struct Header {
+        uint64_t magic;
+        uint32_t version;
+        uint32_t T;
+        int64_t pos0;
+        uint32_t layers;
+        uint32_t stages;
+        uint64_t span;
+        uint64_t sequence;
+    } h{0x5354524154524331ull, 1u, (uint32_t) T, pos0, (uint32_t) g_->n_layers,
+        (uint32_t) kTraceStages, trace_span_, trace_seq_++};
+    std::ofstream out(trace_path_, std::ios::binary | std::ios::app);
+    if (!out) return;
+    out.write((const char*) &h, sizeof h);
+    out.write((const char*) h_trace_, (std::streamsize) ((uint64_t) g_->n_layers * kTraceStages * trace_span_ * sizeof(float)));
+}
+
+void Verifier::write_moe_trace(int T, int64_t pos0) {
+    if (!moe_trace_enabled_ || !moe_trace_seen_ || h_moe_trace_ == nullptr || moe_trace_path_.empty()) return;
+    struct Header {
+        uint64_t magic;
+        uint32_t version;
+        uint32_t T;
+        int64_t pos0;
+        int64_t layer;
+        uint64_t span;
+        uint64_t meta_words;
+        uint64_t sequence;
+    } h{0x535452414d4f4531ull, 1u, (uint32_t) T, pos0, moe_trace_layer_, moe_trace_span_, moe_meta_words_, moe_trace_seq_++};
+    std::ofstream out(moe_trace_path_, std::ios::binary | std::ios::app);
+    if (!out) return;
+    out.write((const char*) &h, sizeof h);
+    out.write((const char*) h_moe_trace_, (std::streamsize) (4 * moe_trace_span_ * sizeof(float)));
+    out.write((const char*) h_moe_meta_, (std::streamsize) (moe_meta_words_ * sizeof(int32_t)));
 }
 
 bool Verifier::copy_logits(int T, float* out, std::string& err) const {

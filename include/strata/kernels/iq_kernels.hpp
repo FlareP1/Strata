@@ -55,6 +55,26 @@ struct NativeExpertLayout {
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff,
                                         int gu_act = -1, int d_act = -1);
+
+/// How the GPU's native expert kernels quantize and sum (`--expert-math`).  The CPU pool always runs ggml's own contract
+/// (each layer's vec_dot types); this decides what the GPU does with the experts it holds.
+///  - Fast (the default): llama.cpp's CUDA contract - q8_1 activations for gate/up and the hidden, lane-strided warp
+///    sums.  A GPU hit agrees with the CPU computing the same expert to rounding (~1e-2 relative at the expert output,
+///    the same as the CPU's own distance from fp32), not bit for bit, so greedy output can change with which experts
+///    happen to be resident.
+///  - Exact: the host's ggml contract - Q8_K / Q8_0 / Q8_1 per the layer's vec_dot types, ggml's x86 AVX2 accumulation
+///    and reduction order, glibc's expf - so a GPU hit is bit-identical to the CPU pool's result and the output does
+///    not depend on residency.  Slower; for regression tests, A/B runs and reproducible output.  It reproduces ggml's
+///    AVX2 CPU back end (the pool's on x86): another CPU back end would need its own contract.
+enum class ExpertMath { Fast, Exact };
+void set_expert_math(ExpertMath m) noexcept;   ///< once, before any expert work
+ExpertMath expert_math() noexcept;
+/// The activation type the GPU's kernels take for a layer whose CPU vec_dot type is `cpu_act`: `cpu_act` under Exact,
+/// q8_1 (9) under Fast.
+int gpu_expert_act(int cpu_act) noexcept;
+/// Whether Exact has bit-exact GPU kernels for these weight and CPU activation types (Q4_K/Q5_K gate/up with Q8_K, and
+/// Q5_1 + Q8_1, Q8_0 + Q8_0 or Q4_K/Q5_K + Q8_K down).  Other formats only have the Fast kernels.
+bool native_expert_exact_supported(int gu_type, int d_type, int gu_act, int d_act) noexcept;
 /// Whether the GPU has the dot products (native_expert_grouped) and the dequantizers (the prompt path) for a layer's
 /// gate/up and down formats at this geometry.
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;

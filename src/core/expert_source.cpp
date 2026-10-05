@@ -482,8 +482,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         Submit2& s = *(Submit2*) p;
         GpuPlanSink& S = *s.d->plan;
         const auto& nf = strata::kernels::cpu::expert_layout().fmt[(size_t) s.d->layers];
-        const uint8_t* xa = nf.gu_act == 15 ? S.xk : S.x1;
-        const int64_t xs = nf.gu_act == 15 ? S.xk_stride : (int64_t) (strata::kernels::cpu::H / 32) * 36;
+        const bool xk = strata::kernels::gpu_expert_act(nf.gu_act) == 15;
+        const uint8_t* xa = xk ? S.xk : S.x1;
+        const int64_t xs = xk ? S.xk_stride : (int64_t) (strata::kernels::cpu::H / 32) * 36;
         s.ok = xa != nullptr && s.d->gpu2->submit(s.d->layers, xa, xs, s.n_tok, s.k, s.slots, s.starts, s.entries,
                                                    s.n_groups, s.out, S.gpu2_flag, S.ring, s.d->gpu2_err);
         if (s.ok) S.gpu2_ring = S.ring;
@@ -637,7 +638,8 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
             }
             const auto& f = lay.fmt[(size_t) d.layers];
             const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff,
-                                                                  f.gu_act, f.d_act);
+                                                                  strata::kernels::gpu_expert_act(f.gu_act),
+                                                                  strata::kernels::gpu_expert_act(f.d_act));
             if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
                 d.failed = true;
                 d.fail = "the native hit path does not support this layer's expert formats";
@@ -667,9 +669,9 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
                 d.fail = d.hit_fail;
                 return;
             }
-            const int64_t xstride = f.gu_act == 15 ? (int64_t) (f.n_embd / 256) * 292
+            const int64_t xstride = L.gu_act == 15 ? (int64_t) (f.n_embd / 256) * 292
                                                    : (int64_t) (f.n_embd / 32) * 36;
-            if (f.gu_act == 15)
+            if (L.gu_act == 15)
                 strata::kernels::quantize_q8_K(d.mixed, d.x_native, f.n_embd, cs);
             else
                 strata::kernels::quantize_q8_1_rows(d.mixed, 1, f.n_embd, d.x_native, cs);

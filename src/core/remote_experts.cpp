@@ -295,13 +295,14 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (lay.native) {
         const auto& fmt = lay.fmt[(size_t) layer];
-        if (fmt.gu_act == 15)
+        auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff,
+                                                       strata::kernels::gpu_expert_act(fmt.gu_act),
+                                                       strata::kernels::gpu_expert_act(fmt.d_act));
+        if (L.gu_act == 15)
             strata::kernels::quantize_q8_K(zero_copy_ ? z_x_ : d_x_, n_tok, H, d_q8_, s);
         else
             strata::kernels::quantize_q8_1_rows(zero_copy_ ? z_x_ : d_x_, n_tok, H, d_q8_, s);
-        auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff,
-                                                       fmt.gu_act, fmt.d_act);
-        const int64_t xq_stride = fmt.gu_act == 15 ? (H / 256) * 292 : (H / 32) * 36;
+        const int64_t xq_stride = L.gu_act == 15 ? (H / 256) * 292 : (H / 32) * 36;
         strata::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
                                                groups_, (int64_t) dst_.size(), d_q8_, xq_stride, d_scratch_,
                                                zero_copy_ ? z_out_ : d_out_, s);

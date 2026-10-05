@@ -228,13 +228,14 @@ bool SecondGpu::submit(int64_t layer, const uint8_t* x, int64_t x_stride, int n_
     p64[2 * cap_ + 1] = ng[1] == 0 ? (unsigned long long) flag : 0;   // the last launch raises it
     p64[2 * cap_ + 2] = ng[1] > 0 ? (unsigned long long) flag : 0;
     const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) layer];
-    const int64_t act_bytes = f.gu_act == 15 ? (n_embd_ / 256) * 292 : (n_embd_ / 32) * 36;
+    const int gu_act = strata::kernels::gpu_expert_act(f.gu_act), d_act = strata::kernels::gpu_expert_act(f.d_act);
+    const int64_t act_bytes = gu_act == 15 ? (n_embd_ / 256) * 292 : (n_embd_ / 32) * 36;
     for (int t = 0; t < n_tok; ++t)
         std::memcpy(h_x_ + (size_t) t * act_bytes, x + (size_t) t * x_stride, (size_t) act_bytes);
     DeviceScope scope(dev_, main_);
     cudaGraphExec_t own = nullptr, pre = nullptr;
-    if ((ng[0] > 0 && !graph_for(f.gu_type, f.d_type, f.gu_act, f.d_act, bucket(ng[0]), 0, true, own, err)) ||
-        (ng[1] > 0 && !graph_for(f.gu_type, f.d_type, f.gu_act, f.d_act, bucket(ng[1]), 1, ng[0] == 0, pre, err)))
+    if ((ng[0] > 0 && !graph_for(f.gu_type, f.d_type, gu_act, d_act, bucket(ng[0]), 0, true, own, err)) ||
+        (ng[1] > 0 && !graph_for(f.gu_type, f.d_type, gu_act, d_act, bucket(ng[1]), 1, ng[0] == 0, pre, err)))
         return false;
     if ((own != nullptr && cudaGraphLaunch(own, s_) != cudaSuccess) ||
         (pre != nullptr &&

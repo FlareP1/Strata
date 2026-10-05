@@ -213,9 +213,9 @@ __global__ void rows_out_kernel(const float4* __restrict__ src, const int32_t* _
     }
 }
 
-// Activation-contract-aware native expert kernels.  The legacy kernels above are retained for q8_1 callers and
-// for the historical parity target.  NativeFmt's Q4_K/Q5_K gate/up layers use Q8_K rows, while Q8_0 down layers
-// use Q8_0 hidden rows; these kernels keep those formats all the way through the grouped hit path.
+// Activation-contract-aware native expert kernels: --expert-math exact.  The kernels above are --expert-math fast
+// (llama.cpp's q8_1 contract, every format).  NativeFmt's Q4_K/Q5_K gate/up layers use Q8_K rows, while Q8_0 down
+// layers use Q8_0 hidden rows; these kernels keep those formats all the way through the grouped hit path.
 __device__ __forceinline__ int native_q8_0_contract_code(float xi, float amax) {
     const float inv = amax == 0.0f ? 0.0f : __fdiv_rn(127.0f, amax);
     const float z = amax == 0.0f ? 0.0f : __fmul_rn(xi, inv);
@@ -861,6 +861,22 @@ void native_q8_0_contract_probe(const float* x, int64_t n, void* y, void* stream
     check("native_q8_0_contract_probe");
 }
 
+
+namespace {
+ExpertMath g_expert_math = ExpertMath::Fast;
+}  // namespace
+
+void set_expert_math(ExpertMath m) noexcept { g_expert_math = m; }
+ExpertMath expert_math() noexcept { return g_expert_math; }
+int gpu_expert_act(int cpu_act) noexcept { return g_expert_math == ExpertMath::Exact ? cpu_act : 9; }
+
+bool native_expert_exact_supported(int gu_type, int d_type, int gu_act, int d_act) noexcept {
+    // native_expert_grouped's contract dispatch: Q8_K gate/up kernels, then the contract down kernels
+    const bool gu = gu_act == 15 && (gu_type == 12 || gu_type == 13);
+    const bool dn = (d_act == 8 && d_type == 8) || (d_act == 9 && d_type == 7) ||
+                    (d_act == 15 && (d_type == 12 || d_type == 13));
+    return gu && dn;
+}
 
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int gu_act, int d_act) {
     NativeExpertLayout L;

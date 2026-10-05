@@ -801,7 +801,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!fork(side_, bfork_)) return false;
             if (strata::kernels::cpu::expert_layout().native) {
                 const auto& nf = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
-                if (nf.gu_act == 15)
+                if (strata::kernels::gpu_expert_act(nf.gu_act) == 15)
                     quantize_q8_K(xm, nat_xq_ + (size_t) tb * (size_t) xk_stride_, (int64_t) n * N, side_);
                 else
                     quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, side_);
@@ -950,7 +950,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
                 const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff,
-                                                                    f.gu_act, f.d_act);
+                                                                    gpu_expert_act(f.gu_act), gpu_expert_act(f.d_act));
                 const void* xact = L.gu_act == 15
                     ? (const void*) (m_xk_ + (size_t) tb * (size_t) xk_stride_)
                     : (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36);

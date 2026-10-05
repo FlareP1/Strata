@@ -148,8 +148,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                 err = "mtp: experts.txt names formats the GPU expert kernels lack";
                 return false;
             }
-            const int gu_act = (gu == 12 || gu == 13) ? 15 : 9;
-            const int d_act = dn == 8 ? 8 : 9;
+            // the CPU's vec_dot types for these formats under --expert-math exact, q8_1 under fast
+            const int gu_act = strata::kernels::gpu_expert_act((gu == 12 || gu == 13) ? 15 : 9);
+            const int d_act = strata::kernels::gpu_expert_act(dn == 8 ? 8 : 9);
             nat_ = strata::kernels::native_expert_layout(gu, dn, g.n_embd, g.n_ff, gu_act, d_act);
             blob_ = nat_.bytes;
         }

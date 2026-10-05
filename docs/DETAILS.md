@@ -612,6 +612,31 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 
 ---
 
+## GPU expert math (`--expert-math`)
+
+The experts the GPU holds in VRAM and the ones the CPU computes in RAM are the same weights, but the two can round
+differently. `--expert-math` chooses how the GPU does it (native packs; the CPU always runs ggml's own kernels):
+
+- **`fast` (default)**: llama.cpp's CUDA arithmetic (q8_1 activations, lane-parallel sums), as in every llama.cpp CUDA
+  build. A GPU expert agrees with the CPU computing the same expert to rounding, not bit for bit, so greedy output
+  can change with which experts happen to be in VRAM.
+- **`exact`**: the GPU reproduces the CPU's ggml contract bit for bit (Q8_K / Q8_0 activations, ggml's AVX2
+  accumulation order, glibc's `expf`). Output is the same as a run with every expert on the CPU (`--disable-hit`),
+  whatever is resident. Use it for regression tests, A/B comparisons and anywhere output must be reproducible.
+
+**Measured here** (UD-Q4_K_XL, RTX 3090 + RTX 3080 Ti, i5-14600K; an 8,352-token prompt, 256 tokens out): output
+134 tok/s with `fast`, 97 tok/s with `exact`; prompt processing is the same (~2,150 tok/s). Against a run with every
+expert on the CPU, over 4,713 teacher-forced tokens (a document, C++ code, prose), `fast` changes the top-1 token at
+4.9% of positions (93% of those are near-ties, under 0.5 nats apart) and perplexity by +0.01% (95% interval -0.5% to
++0.5%); `exact` matches it bit for bit (hidden-state hashes and logits). Details:
+`bench/results/2026-10-04-expert-math/`.
+
+`exact` reproduces ggml's AVX2 CPU kernels (x86 without AVX-512); on another CPU back end, check a run against
+`--disable-hit`. Its kernels cover the K-quant files' formats (Q4_K / Q5_K gate/up, Q5_1 / Q8_0 down); the engine
+refuses `exact` for other files at start.
+
+---
+
 ## Troubleshooting
 
 | Symptom | What to do |

@@ -117,6 +117,7 @@ struct Options {
     bool cpu_oracle_q8_0 = false;      // pinned x86 activation scales/codes at both expert stages
     bool oracle_no_spec = false;       // diagnostic: permit native-pack direct oracle without MTP/speculation
     bool disable_hit = false;          // diagnostic: keep residency/cache allocation but route every expert through CPU
+    std::string expert_math = "fast";  // the GPU's native expert arithmetic: fast (llama.cpp q8_1) or exact (CPU ggml)
     bool verify_cache = false;         // diagnostic: read back every profile-filled slot and compare source bytes
     std::string native_head_gguf;      // native output.weight experiment; same model shard as the pack
     std::vector<std::string> native_dense_gguf; // repeat for native GDN/QSA projection shards
@@ -334,6 +335,11 @@ void usage() {
                  "  --native-head-gguf PATH  native head from the model with this first shard; requires --stream-token\n"
                  "  --native-dense-gguf PATH native GDN/QSA/shared projections; repeat for each source model shard\n"
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
+                 "  --expert-math M      native packs: how the GPU computes the experts it holds. fast (default):\n"
+                 "                       llama.cpp's CUDA q8_1 arithmetic. exact: the CPU pool's own ggml contract\n"
+                 "                       (Q8_K/Q8_0 activations, AVX2 summation order, glibc expf), so a GPU hit is\n"
+                 "                       bit-identical to the CPU's and the output does not depend on which experts\n"
+                 "                       are resident; slower, for regression tests and reproducible output\n"
                  "  --verify-cache           diagnostic: verify every profile-filled device slot against its source\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
@@ -883,6 +889,7 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
         else if (a == "--oracle-no-spec") o.oracle_no_spec = true;
         else if (a == "--disable-hit") o.disable_hit = true;
+        else if (a == "--expert-math") o.expert_math = next("--expert-math");
         else if (a == "--verify-cache") o.verify_cache = true;
         else if (a == "--native") o.native_preset = next("--native");
         else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
@@ -992,6 +999,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --kv must be fp16, int8, k8v4 or q4_0\n");
         return 2;
     }
+    if (o.expert_math != "fast" && o.expert_math != "exact") {
+        std::fprintf(stderr, "strata generate: --expert-math must be fast or exact\n");
+        return 2;
+    }
+    // before anything builds an expert layout (the MTP drafter's is fixed when it loads)
+    strata::kernels::set_expert_math(o.expert_math == "exact" ? strata::kernels::ExpertMath::Exact
+                                                              : strata::kernels::ExpertMath::Fast);
     // every CUDA call from here on uses this device; the adaptive tier sets it on its own thread too
     int n_dev = 0;
     if (cudaGetDeviceCount(&n_dev) != cudaSuccess || o.main_gpu < 0 || o.main_gpu >= n_dev ||
@@ -1119,12 +1133,24 @@ int main(int argc, char** argv) {
                              (long long) l, f.gu_type, f.d_type);
                 return 1;
             }
+            // exact's kernels cover the K-quant files' formats: refuse others here rather than at the first hit
+            if (strata::kernels::expert_math() == strata::kernels::ExpertMath::Exact &&
+                !strata::kernels::native_expert_exact_supported(f.gu_type, f.d_type, f.gu_act, f.d_act)) {
+                std::fprintf(stderr, "strata generate: --expert-math exact has no bit-exact GPU kernels for layer "
+                                     "%lld's experts (GGML types %d / %d, activations %d / %d); use --expert-math fast\n",
+                             (long long) l, f.gu_type, f.d_type, f.gu_act, f.d_act);
+                return 2;
+            }
         }
     if (!native_pack && (o.kv == "k8v4" || o.kv == "q4_0")) {
         std::fprintf(stderr, "strata generate: --kv %s needs a native pack (--native): the 4-bit formats run in its "
                              "verify windows\n", o.kv.c_str());
         return 2;
     }
+    if (native_pack && strata::kernels::expert_math() == strata::kernels::ExpertMath::Exact &&
+        strata::kernels::cpu::cpu_avx512_ok())
+        std::fprintf(stderr, "strata generate: WARNING: --expert-math exact reproduces ggml's AVX2 CPU kernels; this "
+                             "CPU has AVX-512, so check a run against --disable-hit\n");
     // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe)
     if (o.pcie_frac < 0.0) o.pcie_frac = native_pack ? 0.55 : 0.2;
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
@@ -1614,12 +1640,11 @@ int main(int argc, char** argv) {
                      (long long) xcache.slots(), xcache.gib());
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
-        // The repair branch makes the native GPU hit path honor each layer's NativeFmt activation
-        // contract.  Keep this diagnostic deliberately neutral: correctness is established by the
-        // CPU/GPU parity and full-model regression artifacts, while --disable-hit remains the oracle.
-        std::fprintf(stderr,
-                     "strata generate: native GPU expert-cache repair path enabled; validate against the\n"
-                     "                 --disable-hit oracle before promoting a profile.\n");
+        // --expert-math exact: the GPU's hits use each layer's NativeFmt activation contract, bit-identical to the
+        // CPU pool; --disable-hit remains the all-CPU oracle.
+        std::fprintf(stderr, "strata generate: GPU expert math %s%s\n", o.expert_math.c_str(),
+                     o.expert_math == "exact" ? " (bit-identical to the CPU pool)"
+                                              : " (llama.cpp q8_1; agrees with the CPU pool to rounding)");
         if (o.expert_cache_per_layer) {
             int64_t lo = 0, hi = 0;
             xcache.layer_slot_range(0, lo, hi);

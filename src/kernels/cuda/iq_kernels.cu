@@ -244,12 +244,18 @@ __global__ void __launch_bounds__(GUS_WARPS * 32) native_gus_contract_kernel(
         const int b1 = min(e1, b0 + GUS_BATCH);
         for (int e = b0; e < b1; ++e) {
             const block_q8_K* x = (const block_q8_K*) ((const uint8_t*) xq + (size_t) ent_tok[e] * (size_t) x_stride);
+            // The warp's four dots at once, one per eight-lane group: group q takes row q >> 1 of the gate (q even)
+            // or the up (q odd) matrix, each in the CPU's own order (row_dot_k_q8_k_cpu_avx2), so the values are
+            // bitwise those of the four dots in turn.
+            static_assert(GUS_ROWS == 2, "four eight-lane groups: the gate and up dots of two rows");
+            const int q = lane >> 3;
+            const float dv = row_dot_k_q8_k_stride<TG == 13>((q & 1 ? wu : wg) + (size_t) (q >> 1) * L.gu_row,
+                                                             block_stride, x, nb, lane);
             float sg[GUS_ROWS], su[GUS_ROWS];
-#pragma unroll
-            for (int i = 0; i < GUS_ROWS; ++i) {
-                sg[i] = row_dot_k_q8_k_stride<TG == 13>(wg + (size_t) i * L.gu_row, block_stride, x, nb, lane);
-                su[i] = row_dot_k_q8_k_stride<TG == 13>(wu + (size_t) i * L.gu_row, block_stride, x, nb, lane);
-            }
+            sg[0] = __shfl_sync(0xffffffffu, dv, 0);
+            su[0] = __shfl_sync(0xffffffffu, dv, 8);
+            sg[1] = __shfl_sync(0xffffffffu, dv, 16);
+            su[1] = __shfl_sync(0xffffffffu, dv, 24);
             if (lane == 0) {
 #pragma unroll
                 for (int i = 0; i < GUS_ROWS; ++i) {
@@ -337,23 +343,29 @@ __global__ void __launch_bounds__(DOWN_WARPS * 32) native_down_contract_kernel(
     for (int e = e0; e < e1; ++e) {
         const uint8_t* blob = (const uint8_t*) grp_ptr[g] + L.down_off;
         float v[DOWN_ROWS];
+        if (L.d_act == 9 && TD != 7) {
+            // a q8_1 hidden with no CPU-order dot: llama.cpp's lane-strided one, the whole warp on each row
+            const block_q8_1* x = (const block_q8_1*) ((const uint8_t*) hq + (size_t) e * hb * 36);
 #pragma unroll
-        for (int i = 0; i < DOWN_ROWS; ++i) {
+            for (int i = 0; i < DOWN_ROWS; ++i) v[i] = row_dot<TD>(blob + (size_t) (r0 + i) * L.d_row, x, nb, lane);
+        } else {
+            // The CPU-order dots, the warp's four rows at once: eight-lane group q takes row r0 + q, so each row's
+            // value is bitwise the one-row-per-warp result (see row_dot_q5_1_q8_1_cpu_avx2).
+            static_assert(DOWN_ROWS == 4, "four eight-lane groups: one row each");
+            const uint8_t* wrow = blob + (size_t) (r0 + (lane >> 3)) * L.d_row;
+            float vq = 0.0f;
             if (L.d_act == 8) {
                 const block_q8_0* x = (const block_q8_0*) ((const uint8_t*) hq + (size_t) e * hb * 34);
-                v[i] = row_dot_q8_0_q8_0(blob + (size_t) (r0 + i) * L.d_row, block_stride, x, nb, lane);
+                vq = row_dot_q8_0_q8_0(wrow, block_stride, x, nb, lane);
             } else if (L.d_act == 15) {
                 const block_q8_K* x = (const block_q8_K*) ((const uint8_t*) hq + (size_t) e * hb * 292);
-                if constexpr (TD == 12 || TD == 13)
-                    v[i] = row_dot_k_q8_k_stride<TD == 13>(blob + (size_t) (r0 + i) * L.d_row, block_stride, x, nb, lane);
-                else v[i] = 0.0f;
-            } else {
+                if constexpr (TD == 12 || TD == 13) vq = row_dot_k_q8_k_stride<TD == 13>(wrow, block_stride, x, nb, lane);
+            } else if constexpr (TD == 7) {
                 const block_q8_1* x = (const block_q8_1*) ((const uint8_t*) hq + (size_t) e * hb * 36);
-                if constexpr (TD == 7) {
-                    v[i] = row_dot_q5_1_q8_1_cpu_avx2(blob + (size_t) (r0 + i) * L.d_row, x, nb, lane);
-                } else
-                    v[i] = row_dot<TD>(blob + (size_t) (r0 + i) * L.d_row, x, nb, lane);
+                vq = row_dot_q5_1_q8_1_cpu_avx2(wrow, x, nb, lane);
             }
+#pragma unroll
+            for (int i = 0; i < DOWN_ROWS; ++i) v[i] = __shfl_sync(0xffffffffu, vq, 8 * i);
         }
         if (lane == 0) {
             float* o = out + (size_t) ent_dst[e] * L.n_embd + r0;

@@ -627,6 +627,12 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
+// The --expert-math exact dots below each compute ONE ROW PER EIGHT-LANE GROUP: lane l = lane & 7 of a group owns
+// AVX2 accumulator l, and the group reduces its eight accumulators with width-8 shuffles.  A warp's four groups
+// therefore take four rows at once (the callers pass each group its own row), and every group performs exactly the
+// operations of the one-row-per-warp form, so the values are bitwise unchanged.  Every lane receives its own group's
+// result.  All 32 lanes must call together (the shuffles are warp-wide); a caller with one row passes it to all four.
+
 // Match the AVX2/AVX-VNNI ggml implementation used by this VM.  ggml keeps
 // eight independent float accumulators, with each accumulator receiving the
 // integer dot for four bytes in the qx/qy vectors.  The qx vector is ordered
@@ -636,11 +642,12 @@ __device__ __forceinline__ float warp_sum(float v) {
 // m*s term afterward.
 __device__ __forceinline__ float row_dot_q5_1_q8_1_cpu_avx2(const uint8_t* row, const block_q8_1* x,
                                                              int nb, int lane) {
+    const int l = lane & 7;
     float acc = 0.0f;
     float summs = 0.0f;
-    if (lane < 8) {
+    {
         const block_q5_1* w = (const block_q5_1*) row;
-        const int qbase = lane * 4;
+        const int qbase = l * 4;
         for (int ib = 0; ib < nb; ++ib) {
             const uint32_t qh = (uint32_t) get_int_b4(w[ib].qh, 0);
             int sumi = 0;
@@ -656,7 +663,7 @@ __device__ __forceinline__ float row_dot_q5_1_q8_1_cpu_avx2(const uint8_t* row, 
             const float2 ds8 = __half22float2(x[ib].ds);
             const float d5d8 = __fmul_rn(dm5.x, ds8.x);
             acc = __fmaf_rn((float) sumi, d5d8, acc);
-            if (lane == 0) {
+            if (l == 0) {
                 summs = __fadd_rn(summs, __fmul_rn(dm5.y, ds8.y));
             }
         }
@@ -665,16 +672,16 @@ __device__ __forceinline__ float row_dot_q5_1_q8_1_cpu_avx2(const uint8_t* row, 
     // Every lane must execute the same shuffle instructions.  Having only
     // lane 0 issue these shuffles would read undefined values because lanes
     // 1..7 would be at a different shuffle instruction.
-    const float a0 = __shfl_sync(mask, acc, 0);
-    const float a1 = __shfl_sync(mask, acc, 1);
-    const float a2 = __shfl_sync(mask, acc, 2);
-    const float a3 = __shfl_sync(mask, acc, 3);
-    const float a4 = __shfl_sync(mask, acc, 4);
-    const float a5 = __shfl_sync(mask, acc, 5);
-    const float a6 = __shfl_sync(mask, acc, 6);
-    const float a7 = __shfl_sync(mask, acc, 7);
+    const float a0 = __shfl_sync(mask, acc, 0, 8);
+    const float a1 = __shfl_sync(mask, acc, 1, 8);
+    const float a2 = __shfl_sync(mask, acc, 2, 8);
+    const float a3 = __shfl_sync(mask, acc, 3, 8);
+    const float a4 = __shfl_sync(mask, acc, 4, 8);
+    const float a5 = __shfl_sync(mask, acc, 5, 8);
+    const float a6 = __shfl_sync(mask, acc, 6, 8);
+    const float a7 = __shfl_sync(mask, acc, 7, 8);
     float result = 0.0f;
-    if (lane == 0) {
+    if (l == 0) {
         const float lo0 = __fadd_rn(a0, a4);
         const float lo1 = __fadd_rn(a1, a5);
         const float lo2 = __fadd_rn(a2, a6);
@@ -682,7 +689,7 @@ __device__ __forceinline__ float row_dot_q5_1_q8_1_cpu_avx2(const uint8_t* row, 
         const float left = __fadd_rn(__fadd_rn(lo0, lo2), __fadd_rn(lo1, lo3));
         result = __fadd_rn(left, summs);
     }
-    return __shfl_sync(mask, result, 0);
+    return __shfl_sync(mask, result, 0, 8);
 }
 
 // One row against one q8_1 activation, the whole warp: call k = (block, part) is lane-strided.
@@ -723,13 +730,14 @@ __device__ __forceinline__ void unpack_k_scales_mins(const uint8_t* src, uint8_t
 // it reduced every block through a different FP32 order before the warp sum.  Keep
 // eight persistent main accumulators and four persistent min accumulators, exactly
 // as ggml_vec_dot_q4_K_q8_K / q5_K_q8_K do, then reproduce hsum_float_8 and its
-// final min reduction.  Lanes 0..7 own the main accumulators and lanes 0..3 own
-// the min accumulators; the result is broadcast so the caller can still consume
-// lane zero in the existing grouped kernel.
+// final min reduction.  Lanes 0..7 of each eight-lane group own the main
+// accumulators and its lanes 0..3 the min accumulators; the result is broadcast
+// to the group so the caller can still consume the group's lane zero.
 template<bool Q5>
 __device__ __forceinline__ float row_dot_k_q8_k_cpu_avx2(const uint8_t* row, size_t block_stride,
                                                          const block_q8_K* x, int nb, int lane) {
     using W = typename std::conditional<Q5, block_q5_K, block_q4_K>::type;
+    const int l = lane & 7;
     float acc = 0.0f;
     float acc_m = 0.0f;
     float summs = 0.0f;
@@ -742,14 +750,14 @@ __device__ __forceinline__ float row_dot_k_q8_k_cpu_avx2(const uint8_t* row, siz
         // This is the integer grouping produced by AVX2 maddubs/madd in ggml:
         // each output lane sums four adjacent q4/q5 bytes, with the low and high
         // nibbles occupying the two 32-value halves of the super-block.
-        if (lane < 8) {
+        {
             int32_t si = 0;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 int32_t lo = 0, hi = 0;
 #pragma unroll
                 for (int p = 0; p < 4; ++p) {
-                    const int qi = 4 * lane + p;
+                    const int qi = 4 * l + p;
                     int qlo = (int) (w->qs[j * 32 + qi] & 0x0f);
                     int qhi = (int) (w->qs[j * 32 + qi] >> 4);
                     if constexpr (Q5) {
@@ -768,23 +776,23 @@ __device__ __forceinline__ float row_dot_k_q8_k_cpu_avx2(const uint8_t* row, siz
 
         // ggml's q8sums/hadd/madd path forms four signed-int32 min products.
         int32_t mi = 0;
-        if (lane < 4) {
-            const int group = lane * 4;
+        if (l < 4) {
+            const int group = l * 4;
             const int qsum0 = (int) a->bsums[group + 0] + (int) a->bsums[group + 1];
             const int qsum1 = (int) a->bsums[group + 2] + (int) a->bsums[group + 3];
-            mi = (int32_t) mn[2 * lane + 0] * qsum0 +
-                 (int32_t) mn[2 * lane + 1] * qsum1;
+            mi = (int32_t) mn[2 * l + 0] * qsum0 +
+                 (int32_t) mn[2 * l + 1] * qsum1;
         }
         if constexpr (Q5) {
             // AVX2 Q5_K reduces the four signed integer min products inside
             // each 256-element block, then performs one scalar FP32 FMA into
             // a persistent summs value. Q4_K intentionally keeps its existing
             // four-lane packed min accumulator below.
-            const int32_t mi0 = __shfl_sync(0xffffffffu, mi, 0);
-            const int32_t mi1 = __shfl_sync(0xffffffffu, mi, 1);
-            const int32_t mi2 = __shfl_sync(0xffffffffu, mi, 2);
-            const int32_t mi3 = __shfl_sync(0xffffffffu, mi, 3);
-            if (lane == 0) {
+            const int32_t mi0 = __shfl_sync(0xffffffffu, mi, 0, 8);
+            const int32_t mi1 = __shfl_sync(0xffffffffu, mi, 1, 8);
+            const int32_t mi2 = __shfl_sync(0xffffffffu, mi, 2, 8);
+            const int32_t mi3 = __shfl_sync(0xffffffffu, mi, 3, 8);
+            if (l == 0) {
                 const int32_t t01 = mi0 + mi1;
                 const int32_t t23 = mi2 + mi3;
                 const int32_t total = t01 + t23;
@@ -792,30 +800,30 @@ __device__ __forceinline__ float row_dot_k_q8_k_cpu_avx2(const uint8_t* row, siz
                 const float dmin = -__fmul_rn(a->d, dm.y);
                 summs = fmaf(dmin, (float) total, summs);
             }
-        } else if (lane < 4) {
+        } else if (l < 4) {
             const float2 dm = __half22float2(w->dm);
             const float dmin = -__fmul_rn(a->d, dm.y);
             acc_m = fmaf(dmin, (float) mi, acc_m);
         }
     }
     const unsigned mask = 0xffffffffu;
-    const float v = lane < 8 ? acc : 0.0f;
+    const float v = acc;
     // Every lane executes every shuffle.  Keeping the shuffles out of the
     // lane-zero branch is required by CUDA's warp-synchronous contract.
-    const float a0 = __shfl_sync(mask, v, 0);
-    const float a1 = __shfl_sync(mask, v, 1);
-    const float a2 = __shfl_sync(mask, v, 2);
-    const float a3 = __shfl_sync(mask, v, 3);
-    const float a4 = __shfl_sync(mask, v, 4);
-    const float a5 = __shfl_sync(mask, v, 5);
-    const float a6 = __shfl_sync(mask, v, 6);
-    const float a7 = __shfl_sync(mask, v, 7);
-    const float m0 = __shfl_sync(mask, lane < 4 ? acc_m : 0.0f, 0);
-    const float m1 = __shfl_sync(mask, lane < 4 ? acc_m : 0.0f, 1);
-    const float m2 = __shfl_sync(mask, lane < 4 ? acc_m : 0.0f, 2);
-    const float m3 = __shfl_sync(mask, lane < 4 ? acc_m : 0.0f, 3);
+    const float a0 = __shfl_sync(mask, v, 0, 8);
+    const float a1 = __shfl_sync(mask, v, 1, 8);
+    const float a2 = __shfl_sync(mask, v, 2, 8);
+    const float a3 = __shfl_sync(mask, v, 3, 8);
+    const float a4 = __shfl_sync(mask, v, 4, 8);
+    const float a5 = __shfl_sync(mask, v, 5, 8);
+    const float a6 = __shfl_sync(mask, v, 6, 8);
+    const float a7 = __shfl_sync(mask, v, 7, 8);
+    const float m0 = __shfl_sync(mask, l < 4 ? acc_m : 0.0f, 0, 8);
+    const float m1 = __shfl_sync(mask, l < 4 ? acc_m : 0.0f, 1, 8);
+    const float m2 = __shfl_sync(mask, l < 4 ? acc_m : 0.0f, 2, 8);
+    const float m3 = __shfl_sync(mask, l < 4 ? acc_m : 0.0f, 3, 8);
     float result = 0.0f;
-    if (lane == 0) {
+    if (l == 0) {
         // Same sequence as hsum_float_8: high+low, movehl pair, then scalar add.
         const float r0 = __fadd_rn(a0, a4);
         const float r1 = __fadd_rn(a1, a5);
@@ -828,7 +836,7 @@ __device__ __forceinline__ float row_dot_k_q8_k_cpu_avx2(const uint8_t* row, siz
             result = __fadd_rn(main, minsum);
         }
     }
-    return __shfl_sync(mask, result, 0);
+    return __shfl_sync(mask, result, 0, 8);
 }
 
 // Row-stride-aware versions.  The caller supplies the block stride so this remains valid if ggml changes padding.
@@ -840,32 +848,31 @@ __device__ __forceinline__ float row_dot_k_q8_k_stride(const uint8_t* row, size_
 
 __device__ __forceinline__ float row_dot_q8_0_q8_0(const uint8_t* row, size_t row_stride,
                                                    const block_q8_0* x, int nb, int lane) {
+    const int l = lane & 7;
     float acc = 0.0f;
     for (int kbx = 0; kbx < nb; ++kbx) {
         const auto* w = (const block_q8_0*) (row + (size_t) kbx * row_stride);
         const block_q8_0* a = x + kbx;
-        if (lane < 8) {
-            int32_t si = 0;
+        int32_t si = 0;
 #pragma unroll
-            for (int j = 0; j < 4; ++j)
-                si += (int32_t) w->qs[4 * lane + j] * (int32_t) a->qs[4 * lane + j];
-            const float d = __fmul_rn(__half2float(w->d), __half2float(a->d));
-            acc = fmaf(d, (float) si, acc);
-        }
+        for (int j = 0; j < 4; ++j)
+            si += (int32_t) w->qs[4 * l + j] * (int32_t) a->qs[4 * l + j];
+        const float d = __fmul_rn(__half2float(w->d), __half2float(a->d));
+        acc = fmaf(d, (float) si, acc);
     }
     const unsigned mask = 0xffffffffu;
-    const float v = lane < 8 ? acc : 0.0f;
-    const float a0 = __shfl_sync(mask, v, 0), a1 = __shfl_sync(mask, v, 1);
-    const float a2 = __shfl_sync(mask, v, 2), a3 = __shfl_sync(mask, v, 3);
-    const float a4 = __shfl_sync(mask, v, 4), a5 = __shfl_sync(mask, v, 5);
-    const float a6 = __shfl_sync(mask, v, 6), a7 = __shfl_sync(mask, v, 7);
+    const float v = acc;
+    const float a0 = __shfl_sync(mask, v, 0, 8), a1 = __shfl_sync(mask, v, 1, 8);
+    const float a2 = __shfl_sync(mask, v, 2, 8), a3 = __shfl_sync(mask, v, 3, 8);
+    const float a4 = __shfl_sync(mask, v, 4, 8), a5 = __shfl_sync(mask, v, 5, 8);
+    const float a6 = __shfl_sync(mask, v, 6, 8), a7 = __shfl_sync(mask, v, 7, 8);
     float result = 0.0f;
-    if (lane == 0) {
+    if (l == 0) {
         const float r0 = __fadd_rn(a0, a4), r1 = __fadd_rn(a1, a5);
         const float r2 = __fadd_rn(a2, a6), r3 = __fadd_rn(a3, a7);
         result = __fadd_rn(__fadd_rn(r0, r2), __fadd_rn(r1, r3));
     }
-    return __shfl_sync(mask, result, 0);
+    return __shfl_sync(mask, result, 0, 8);
 }
 
 }  // namespace

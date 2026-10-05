@@ -29,8 +29,12 @@ public:
     /// `host_res` is the residency table (n_layers x n_expert, slot or kNotResident) the dispatch reads (the verify
     /// windows take a snapshot of it; a device copy of it is its owner's to refresh); up to `max_moves` experts move
     /// per call.  `device`: the cache's GPU (its stream and copies), `main_device` current again afterwards.
-    bool init(ExpertCache& cache, ExpertSource& src, std::vector<int32_t>& host_res, int64_t n_layers, int64_t n_expert,
-              int max_moves, std::string& err, int device = -1, int main_device = 0);
+    /// `deterministic_adapt` settles the prior epoch, submits the next one as a full batch, and orders equal gains
+    /// by tuple; false preserves the asynchronous gain-only policy.
+    bool init(ExpertCache& cache, ExpertSource& src,
+              std::vector<int32_t>& host_res, int64_t n_layers, int64_t n_expert,
+              int max_moves, std::string& err, int device = -1, int main_device = 0,
+              bool deterministic_adapt = false);
     bool on() const { return res_ != nullptr; }
     /// An empty slot sized for `layer`'s experts.
     void add_free(int64_t layer, int32_t slot) { free_[(size_t) layer].push_back(slot); }
@@ -87,6 +91,7 @@ private:
     const AdaptiveTier* upper_ = nullptr;
     const AdaptiveTier* lower_ = nullptr;
     bool wait_ = false;
+    bool deterministic_ = false;
     std::vector<uint8_t> blocked_;                        // per (layer, expert): not a candidate, rebuilt each call
     std::vector<uint8_t> upper_has_;                      // per (layer, expert), rebuilt each call
     std::vector<std::vector<int32_t>> free_;              // per layer

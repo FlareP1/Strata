@@ -245,6 +245,8 @@ struct Options {
     /// Keep GPU 1 resident and executing, but do not adapt its residency while the main tier adapts.
     /// The default remains coupled dual-tier adaptation.
     bool no_second_gpu_adapt = false;
+    /// Fixed epoch-boundary adaptive copies and total tie ordering; opt-in, preserving async adaptation by default.
+    bool deterministic_adapt = false;
     double head_split = 0.45;                ///< the second GPU's share of the head's rows (0: all on the main GPU)
     /// Plan v0.3 P6: the share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the
     /// pinned arena while the CPU computes the rest (verify windows).
@@ -379,6 +381,8 @@ void usage() {
                  "                       (default 12: ~0.28 ms at its ~48 GB/s; 0 = off)\n"
                  "  --no-second-gpu-adapt  with --second-gpu: keep GPU 1\'s resident expert assignment static while\n"
                  "                       the main GPU\'s adaptive tier continues to replace experts\n"
+                 "  --deterministic-adapt  fixed-epoch adaptive copies and stable equal-gain ordering; default async\n"
+                 "                       adaptation remains unchanged (with --second-gpu, applies to both tiers)\n"
                  "  --head-split F       with --second-gpu: its share of the output head's rows (default 0.45;\n"
                  "                       each GPU streams its part after the last layer; 0 = all on the main GPU)\n"
                  "  --no-prompt-offload  with --second-gpu: the prompt path streams the experts the main GPU's cache\n"
@@ -910,6 +914,7 @@ int main(int argc, char** argv) {
         else if (a == "--second-gpu-min-mb") o.second_gpu_min_mb = std::atof(next("--second-gpu-min-mb"));
         else if (a == "--second-gpu-prefetch-mb") o.second_gpu_prefetch_mb = std::atof(next("--second-gpu-prefetch-mb"));
         else if (a == "--no-second-gpu-adapt") o.no_second_gpu_adapt = true;
+        else if (a == "--deterministic-adapt") o.deterministic_adapt = true;
         else if (a == "--head-split") o.head_split = std::atof(next("--head-split"));
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
@@ -2257,7 +2262,7 @@ int main(int argc, char** argv) {
     strata::core::AdaptiveTier tier;
     const bool adaptive = !host_res.empty() && o.adapt_every > 0 && o.adapt_swaps > 0;
     if (adaptive && !tier.init(xcache, *srcp, host_res, g.n_layers, g.n_expert, o.adapt_swaps, err,
-                               o.main_gpu, o.main_gpu)) {
+                               o.main_gpu, o.main_gpu, o.deterministic_adapt)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
@@ -2353,7 +2358,7 @@ int main(int argc, char** argv) {
         }
         if (ok && adaptive) {
             ok = tier2.init(gpu2.cache(), *srcp, host_res2, g.n_layers, g.n_expert, o.adapt_swaps, err,
-                            o.second_gpu, main_dev);
+                            o.second_gpu, main_dev, o.deterministic_adapt);
             if (ok) {
                 // lowest slots first: the last ones, which the prompt path borrows, stay empty longest
                 for (size_t i = empty2.size(); i-- > 0;) tier2.add_free(empty2[i], (int32_t) (pre.size() + i));

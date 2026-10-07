@@ -158,6 +158,10 @@ struct Options {
     bool graph_only = false;
     bool gpu_only_full = false;   ///< R0.3: pre + post + head, the true per-token GPU floor
     int pool_workers = 0;         ///< R2.2: 0 = "all physical cores minus the host's"; >0 overrides
+    /// `--pool-cores`: logical processors to pin the workers to, in worker order (empty = `CorePlacement`).
+    /// Multi-CCD CPUs: the automatic order packs the workers onto the first CCDs, each of which has its own
+    /// memory-bandwidth limit, so one worker per CCD at a low count reads faster than more workers packed.
+    std::vector<int> pool_cores;
     /// R2.2's first half, as an A/B arm.  **ON by default**, because the measurement that justifies it is the
     /// pool's own drain: 33.7 GB/s against 5/6 x 44.14 = 36.8 for five workers, on a machine whose sixth core
     /// is reserved for a host thread that has nothing to do while the drain runs.
@@ -429,6 +433,12 @@ void usage() {
                  "  --pool-workers N     R2.2: CPU expert pool worker count.  Default 0 = every physical core\n"
                  "                       except the one the host loop spins on.  A sweep is how the pool's\n"
                  "                       deviation from `cpu_s2` is attributed.\n"
+                 "  --pool-cores LIST    R2.2: pin the workers to these logical processors (comma-separated,\n"
+                 "                       worker order); 0 workers means one per listed core.  For multi-CCD\n"
+                 "                       CPUs (Threadripper): the automatic placement packs the first CCDs,\n"
+                 "                       which each carry their own bandwidth limit - one core per CCD spans\n"
+                 "                       them.  The host takes a physical core none of them sits on, and the\n"
+                 "                       placement never moves an explicit worker.\n"
                  "  --mmap-experts       R2.1: opt OUT of the resident expert arena, back to MapViewOfFile.\n"
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
                  "                       34 GB, and measured 71.97 vs 34.78 ms/token cold vs warm.\n");
@@ -451,6 +461,28 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
         out.push_back(id);
     }
     if (out.empty()) { err = "token list was empty"; return false; }
+    return true;
+}
+
+// `--pool-cores`: a comma-separated list of logical processor ids.  Checked here as far as syntax goes;
+// main() checks every id against the machine's actual processors before the session starts.
+bool parse_int_list(const char* s, std::vector<int>& out, std::string& err) {
+    out.clear();
+    std::string text(s);
+    for (char& c : text) if (c == ',') c = ' ';
+    std::istringstream input(text);
+    std::string token;
+    while (input >> token) {
+        int v = 0;
+        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), v);
+        if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size() || v < 0) {
+            err = "invalid token: expected a comma-separated list of logical processor ids";
+            out.clear();
+            return false;
+        }
+        out.push_back(v);
+    }
+    if (out.empty()) { err = "processor list was empty"; return false; }
     return true;
 }
 
@@ -876,6 +908,13 @@ int main(int argc, char** argv) {
         else if (a == "--graph-only") o.graph_only = true;
         else if (a == "--gpu-only-full") o.gpu_only_full = true;
         else if (a == "--pool-workers") o.pool_workers = std::atoi(next("--pool-workers"));
+        else if (a == "--pool-cores") {
+            std::string e;
+            if (!parse_int_list(next("--pool-cores"), o.pool_cores, e)) {
+                std::fprintf(stderr, "strata generate: --pool-cores: %s\n", e.c_str());
+                return 2;
+            }
+        }
         else if (a == "--no-host-worker") o.no_host_worker = true;
         else if (a == "--no-ple-prefetch") o.no_ple_prefetch = true;
         else if (a == "--expert-cache") {
@@ -1053,6 +1092,32 @@ int main(int argc, char** argv) {
         o.top_p <= 0 || o.top_p > 1 || o.top_k < 0 || o.expert_cache < -1 || o.pool_workers < 0) {
         std::fprintf(stderr, "strata generate: invalid sampling or resource parameter\n");
         return 2;
+    }
+    // `--pool-cores`: every id must be a processor this machine actually has (the pin is a single-word mask,
+    // so a wrong one silently pins the worker NOWHERE), no repeats, and it settles the worker count:
+    // `--pool-workers` may only repeat it.
+    if (!o.pool_cores.empty()) {
+        std::vector<int> known;
+        for (const auto& c : strata::kernels::cpu::physical_cores())
+            for (int p : c) known.push_back(p);
+        std::sort(known.begin(), known.end());
+        for (size_t i = 0; i < o.pool_cores.size(); ++i) {
+            const int p = o.pool_cores[i];
+            if (!std::binary_search(known.begin(), known.end(), p)) {
+                std::fprintf(stderr, "strata generate: --pool-cores: %d is not a logical processor of this machine\n", p);
+                return 2;
+            }
+            if (std::find(o.pool_cores.begin(), o.pool_cores.begin() + (ptrdiff_t) i, p) !=
+                o.pool_cores.begin() + (ptrdiff_t) i) {
+                std::fprintf(stderr, "strata generate: --pool-cores: %d listed twice\n", p);
+                return 2;
+            }
+        }
+        if (o.pool_workers > 0 && o.pool_workers != (int) o.pool_cores.size()) {
+            std::fprintf(stderr, "strata generate: --pool-cores lists %zu processors; --pool-workers must be 0 or %zu\n",
+                         o.pool_cores.size(), o.pool_cores.size());
+            return 2;
+        }
     }
 
     if (o.native_flash_attn_short && o.max_context > 256) {
@@ -1434,8 +1499,9 @@ int main(int argc, char** argv) {
     if (ple_table.is_open() && !ple_table.start_ram_load(err))
         std::fprintf(stderr, "strata generate: %s; its rows stay on the SSD\n", err.c_str());
     // where the host loop and the pool's workers run, moved off the processors that take interrupts as generation
-    // goes (drive_window); with a second GPU, whose work raises most of them, the first core starts free
-    strata::kernels::cpu::CorePlacement placement(/*spare_first=*/o.second_gpu >= 0);
+    // goes (drive_window); with a second GPU, whose work raises most of them, the first core starts free.
+    // `--pool-cores` replaces the worker list and freezes the moves (the layout was chosen on purpose).
+    strata::kernels::cpu::CorePlacement placement(/*spare_first=*/o.second_gpu >= 0, o.pool_cores);
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker,
                                           placement.workers());
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);

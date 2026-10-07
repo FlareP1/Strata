@@ -169,9 +169,42 @@ def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
         settings["--pcie-frac"] = f"{chosen[0]:.2f}"
         settings["--spec-min-p"] = f"{chosen[1]:.2f}"
     base_rate = statistics.median(confirm[chosen]) if confirm.get(chosen) else None
-    # 4. fewer CPU workers (a restart each), with the chosen settings
+    # 4. fewer CPU workers (a restart each), with the chosen settings.  A `--pool-cores` list (a deliberate
+    # CCD placement) is swept as evenly-spaced SUBSETS of itself - the spread across CCDs survives the
+    # shrink, and a worker count mixed into an explicit core list is a startup error by design.
+    tuned = with_arg(with_arg(base_args, "--pcie-frac", f"{chosen[0]:.2f}"), "--spec-min-p", f"{chosen[1]:.2f}")
+    cores = arg_value(base_args, "--pool-cores")
+    if cores is not None:
+        base_cores = [int(x) for x in cores.split(",") if x.strip()]
+        subsets = [base_cores]
+        for k in (round(len(base_cores) * 2 / 3), round(len(base_cores) / 2)):
+            if 2 <= k < len(base_cores):
+                subsets.append([base_cores[i * len(base_cores) // k] for i in range(k)])
+        key0 = ",".join(str(c) for c in base_cores)
+        if len(subsets) > 1:
+            by_cores = {}
+            for cs in subsets:
+                key = ",".join(str(c) for c in cs)
+                say(f"  Measuring with {len(cs)} CPU workers on {key} (restarts the engine) ...")
+                e = start_engine(with_arg(tuned, "--pool-cores", key))
+                try:
+                    sw = Session(e, ids_list)
+                    sw.warm_up(1)
+                    by_cores[key] = [sw.rate(), sw.rate()]
+                    say(f"    {len(cs)} workers: {statistics.median(by_cores[key]):.1f} tok/s")
+                finally:
+                    close(e)
+            c_best = pick(by_cores, key0)
+            report["workers"] = by_cores
+            if c_best != key0:
+                settings["--pool-cores"] = c_best
+                base_rate = statistics.median(by_cores[c_best])
+            elif by_cores.get(key0):
+                base_rate = statistics.median(by_cores[key0])
+        report["seconds"] = round(time.time() - t0)
+        report["tok_s"] = round(base_rate, 1) if base_rate else None
+        return {"settings": settings, "report": report}
     if d_workers and len(worker_candidates(d_workers)) > 1:
-        tuned = with_arg(with_arg(base_args, "--pcie-frac", f"{chosen[0]:.2f}"), "--spec-min-p", f"{chosen[1]:.2f}")
         by_workers = {}
         for w in worker_candidates(d_workers):
             say(f"  Measuring with {w} CPU workers (restarts the engine) ...")

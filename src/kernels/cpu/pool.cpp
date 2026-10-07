@@ -93,6 +93,21 @@ CorePlacement::CorePlacement(bool spare_first) : cores_(physical_cores()) {
         workers_.push_back(cores_[c].front());
 }
 
+CorePlacement::CorePlacement(bool spare_first, const std::vector<int>& workers) : CorePlacement(spare_first) {
+    if (workers.empty()) return;
+    workers_ = workers;
+    explicit_workers_ = true;
+    // The host stays off every worker's PHYSICAL core when one is free: on a 3970X asked for one processor per
+    // CCD, an SMT sibling of a worker would share that worker's core and halve its bandwidth (the very error
+    // physical_cores() exists to avoid).  Only when no core is free does the host share, as before.
+    std::vector<char> taken(cores_.size(), 0);
+    for (int w : workers)
+        if (w >= 0 && w < (int) core_of_.size() && core_of_[(size_t) w] >= 0)
+            taken[(size_t) core_of_[(size_t) w]] = 1;
+    for (size_t c = cores_.size(); c-- > 0;)
+        if (!taken[c]) { host_ = cores_[c].front(); break; }
+}
+
 // A quiet processor for a thread on `from`: the first of the quietest free core whose processors are all quiet, else
 // the other processor of `from`'s own core, or -1.
 int CorePlacement::quiet_processor(int from, const std::vector<double>& load) const {
@@ -122,6 +137,9 @@ int CorePlacement::quiet_processor(int from, const std::vector<double>& load) co
 }
 
 std::string CorePlacement::tick(ExpertPool& pool) {
+    // `--pool-cores` asked for these processors deliberately; a quiet-core move would undo the chosen
+    // layout (one per CCD on a Threadripper), so with an explicit list the threads never move.
+    if (explicit_workers_) return {};
 #if defined(_WIN32)
     const auto now = std::chrono::steady_clock::now();
     const double s = std::chrono::duration<double>(now - at_).count();

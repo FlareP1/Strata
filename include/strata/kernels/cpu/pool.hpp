@@ -81,6 +81,12 @@ public:
     /// whose work raises most of the interrupts) and more than four cores, the first core stays free: where Windows
     /// sends interrupts first, and a place to move to.
     explicit CorePlacement(bool spare_first);
+    /// `--pool-cores`: the workers pinned to `workers` exactly, in worker order, and the host on the LAST physical
+    /// core that holds none of them (falling back to the automatic host when every core holds one).  A multi-CCD
+    /// CPU (Threadripper: per-CCD memory bandwidth) wants this: one worker per CCD at a low count spans the
+    /// limits, and the automatic order packs the workers onto the first CCDs instead.  `tick` then NEVER moves a
+    /// thread: the list was chosen on purpose and a "quiet" move would undo it.  Empty `workers`: the automatic start.
+    CorePlacement(bool spare_first, const std::vector<int>& workers);
     int host() const { return host_; }
     /// The workers' logical processors, by worker (the pool pins worker i to `workers()[i]`).
     const std::vector<int>& workers() const { return workers_; }
@@ -95,6 +101,7 @@ private:
     std::vector<int> core_of_;     // logical processor -> physical core, -1 when unknown
     int host_ = -1;
     std::vector<int> workers_;
+    bool explicit_workers_ = false;   // `--pool-cores`: `tick` must not move these threads
     std::vector<uint64_t> busy_;   // each processor's interrupt and DPC time at the last sample (100 ns units)
     std::vector<int> hot_;         // the samples in a row a processor spent over 5% there
     std::chrono::steady_clock::time_point at_{};

@@ -43,6 +43,8 @@ public:
     /// Per token: the pick's row within this part, its logit; T x (n_vocab - split) logits after a `logits` submit.
     const int32_t* idx() const { return h_idx_; }
     const float* val() const { return h_val_; }
+    /// Per token: 1 when its rows here held a NaN or an infinity, else 0.
+    const uint32_t* nonfinite() const { return h_bad_; }
     const float* logits() const { return h_logits_; }
 
 private:
@@ -59,6 +61,7 @@ private:
     uint32_t *h_hand_ = nullptr, *h_done_ = nullptr;
     int32_t* h_idx_ = nullptr;
     float *h_val_ = nullptr, *h_logits_ = nullptr;
+    uint32_t* h_bad_ = nullptr;
     cudaGraphExec_t exec_[9][2] = {};
 };
 

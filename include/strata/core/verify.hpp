@@ -104,6 +104,10 @@ public:
     /// before anything outside the next `run` reads the sequence state.
     bool commit(int n_keep, std::string& err, bool wait = true);
     bool wait_commit(std::string& err);
+    /// The first token of the last window whose logits held a NaN or an infinity, or -1 (upstream #879): its picks are
+    /// not to be used, and the sequence state behind them is poisoned.  Read from flags the head's argmax wrote.
+    /// STRATA_NAN_GUARD=0: always -1.  STRATA_NAN_INJECT=n[,n...]: the n-th call reports token 0 (a test of the path).
+    int nonfinite(int T);
 
     /// The residency the window decides the main GPU's hits by: `VerifyHits::res` as `init` and the last `run` found
     /// it.  The pool reads this one (`ExpertDispatch::host_res`), so it leaves exactly the GPU's rows to the GPU.
@@ -211,6 +215,10 @@ private:
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
     float* h_val_ = nullptr;     float* m_val_ = nullptr;       // their logits (a split head's merge)
+    uint32_t* h_bad_ = nullptr;  uint32_t* m_bad_ = nullptr;    // T: a NaN or an infinity among the token's logits
+    bool nan_guard_ = true;
+    uint64_t guard_calls_ = 0;
+    std::vector<uint64_t> nan_inject_;
     SplitHead* shead_ = nullptr;
     bool logits_wanted_ = false;
     int64_t head_rows_ = 0;                                     // the head's rows here: n_vocab, or the split

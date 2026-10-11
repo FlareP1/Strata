@@ -48,6 +48,9 @@ public:
     void checkpoint(int64_t pos);
     /// Forgets the live sequence (after an image request).
     void forget();
+    /// Forgets the live sequence, every checkpoint and every stashed sequence (after non-finite logits: whatever the
+    /// state holds may be poisoned).
+    void clear();
 
     /// One line for the log: checkpoints and stashed sequences.
     std::string summary() const;

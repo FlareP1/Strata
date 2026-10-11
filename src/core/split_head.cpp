@@ -30,7 +30,7 @@ SplitHead::~SplitHead() {
         for (auto& x : e) if (x) cudaGraphExecDestroy(x);
     void* dev[] = {w_, mixed_, out_, xq_, xil_, scratch_};
     for (void* p : dev) if (p) cudaFree(p);
-    void* host[] = {h_in_, h_hand_, h_done_, h_idx_, h_val_, h_logits_};
+    void* host[] = {h_in_, h_hand_, h_done_, h_idx_, h_val_, h_logits_, h_bad_};
     for (void* p : host) if (p) cudaFreeHost(p);
     if (s_) cudaStreamDestroy(s_);
 }
@@ -82,6 +82,7 @@ bool SplitHead::init(int device, int main_device, const std::vector<std::string>
         run("mapped", cudaHostAlloc((void**) &h_done_, 64, pm));
         run("mapped", cudaHostAlloc((void**) &h_idx_, T * 4 + 64, pm));
         run("mapped", cudaHostAlloc((void**) &h_val_, T * 4 + 64, pm));
+        run("mapped", cudaHostAlloc((void**) &h_bad_, T * 4 + 64, pm));
         run("mapped", cudaHostAlloc((void**) &h_logits_, T * (size_t) rows_ * 4, pm));
         if (e != cudaSuccess) {
             err = std::string("split head: ") + step + ": " + cudaGetErrorString(e);
@@ -114,7 +115,7 @@ bool SplitHead::capture(int T, bool logits, std::string& err) {
             native_quantize_q8_1(mixed_, xq_, (int) n_in_, T, s_);
             native_mmvq(type_, w_, xq_, out_, (int) n_in_, (int) rows_, T, s_);
         }
-        argmax_rows(out_, T, (int) rows_, scratch_, h_idx_, s_, h_val_);
+        argmax_rows(out_, T, (int) rows_, scratch_, h_idx_, s_, h_val_, h_bad_);
         if (logits) copy_from_mapped(h_logits_, out_, (int64_t) T * rows_, s_);
         mapped_bump(h_done_, s_);
     } catch (const std::exception& x) {

@@ -526,6 +526,8 @@ int test_router_rows(std::mt19937& rng, cudaStream_t s) {
                 x[40] = -5e4f;
                 x[256 + 3] = -6e4f;
                 x[256 + 20] = 6e4f;
+                x[512 + 1] = x[512 + 2] = x[512 + 3] = 3e4f;   // a block's sum past 65504 (#606)
+                x[1024 + 5] = -2e7f;                            // its scale past 65504
             }
             up(d_x, x);
             std::memset(h_q1, 0xcd, 8 * row1);
@@ -546,6 +548,13 @@ int test_router_rows(std::mt19937& rng, cudaStream_t s) {
                 std::fprintf(stderr, "router_rows: n_tok %d rep %d: the q8_1 rows differ\n", n_tok, rep);
                 ++b;
             }
+            for (size_t i = 0; i < ref.size(); i += 36)   // every scale and sum a finite half
+                if ((ref[i + 1] & 0x7c) == 0x7c || (ref[i + 3] & 0x7c) == 0x7c) {
+                    std::fprintf(stderr, "router_rows: n_tok %d rep %d: q8_1 block %zu's scale or sum is not finite\n",
+                                 n_tok, rep, i / 36);
+                    ++b;
+                    break;
+                }
             for (int t = 0; t < n_tok && rep != 3; ++t) {
                 std::vector<uint8_t> want(strata::kernels::cpu::kNativeActBytes, 0);
                 strata::kernels::cpu::native_quant_act(f, x.data() + (size_t) t * N, want.data());
@@ -571,7 +580,8 @@ int test_router_rows(std::mt19937& rng, cudaStream_t s) {
         cudaFree(q);
     std::printf("router_rows: %s\n", bad ? "MISMATCH"
                                          : "the q8_1 rows bitwise quantize_q8_1_rows', the Q8_K rows ggml's, the float "
-                                           "copy the input (1-8 tokens, denormals, zero blocks, tied maxima)");
+                                           "copy the input (1-8 tokens, denormals, zero blocks, tied maxima; scales "
+                                           "and sums past 65504 held finite)");
     return bad;
 }
 
@@ -1570,12 +1580,19 @@ int test_argmax(std::mt19937& rng, cudaStream_t s) {
         for (const int rows : {4, 8, 1, 3, 8, 2}) {
             std::vector<float> h((size_t) rows * n);
             for (float& v : h) v = nd(rng);
+            std::vector<uint32_t> want_nf((size_t) rows, 1);   // rows with a NaN or an infinity
             for (int r = 0; r < rows; ++r) {
                 float* row = h.data() + (size_t) r * n;
                 const int a = (int) (rng() % n), b = (int) (rng() % n);
                 row[a] = row[b] = 40.0f;                       // a tie at the maximum
-                row[(int) (rng() % n)] = std::nanf("");        // never picked
-                row[(int) (rng() % n)] = -INFINITY;
+                if (r % 4 == 1) {                              // finite
+                    want_nf[(size_t) r] = 0;
+                } else if (r % 4 == 3) {                       // an infinity alone
+                    row[(int) (rng() % n)] = -INFINITY;
+                } else {
+                    row[(int) (rng() % n)] = std::nanf("");    // never picked
+                    row[(int) (rng() % n)] = -INFINITY;
+                }
                 if (r == 2)                                    // no value above -inf: 0
                     for (int i = 0; i < n; ++i) row[i] = i % 7 ? -INFINITY : std::nanf("");
             }
@@ -1585,17 +1602,23 @@ int test_argmax(std::mt19937& rng, cudaStream_t s) {
             int32_t* d_out = dev<int32_t>(rows);
             float* d_p1 = dev<float>(rows);
             float* d_p2 = dev<float>(rows);
+            uint32_t* d_nf = dev<uint32_t>(rows);
             SamplerParams sp;
             sp.greedy = true;
             sp.temperature = 0.0f;
             sample_tokens(d_l, rows, n, nullptr, 0, sp, d_ref, s);
             row_top_prob(d_l, rows, n, d_ref, d_p1, s);
             for (int rep = 0; rep < 3; ++rep) {
-                argmax_rows(d_l, rows, n, sa, d_out, s);
+                check(cudaMemset(d_nf, 0xcd, (size_t) rows * 4), "memset");
+                argmax_rows(d_l, rows, n, sa, d_out, s, nullptr, rep > 0 ? d_nf : nullptr);
                 row_top_prob_split(d_l, rows, n, d_out, d_p2, st, s);
                 check(cudaStreamSynchronize(s), "argmax");
                 const std::vector<int> ref = down(d_ref, rows);
                 const std::vector<int32_t> out = down(d_out, rows);
+                if (rep > 0 && down(d_nf, rows) != want_nf) {
+                    if (bad < 5) std::printf("  argmax n %d rows %d: the non-finite flags differ\n", n, rows);
+                    ++bad;
+                }
                 const std::vector<float> p1 = down(d_p1, rows), p2 = down(d_p2, rows);
                 for (int r = 0; r < rows; ++r)
                     if (ref[r] != out[r] || std::memcmp(&p1[r], &p2[r], 4) != 0) {
@@ -1605,13 +1628,14 @@ int test_argmax(std::mt19937& rng, cudaStream_t s) {
                         ++bad;
                     }
             }
-            cudaFree(d_l); cudaFree(d_ref); cudaFree(d_out); cudaFree(d_p1); cudaFree(d_p2);
+            cudaFree(d_l); cudaFree(d_ref); cudaFree(d_out); cudaFree(d_p1); cudaFree(d_p2); cudaFree(d_nf);
         }
     }
     cudaFree(sa);
     cudaFree(st);
     std::printf("argmax_rows, row_top_prob_split: %s\n",
-                bad ? "MISMATCH" : "bitwise equal to the one-block kernels (ties, NaN, -inf, 1-8 rows on one scratch)");
+                bad ? "MISMATCH" : "bitwise equal to the one-block kernels (ties, NaN, -inf, 1-8 rows on one scratch), "
+                                   "the rows with a NaN or an infinity flagged");
     return bad;
 }
 

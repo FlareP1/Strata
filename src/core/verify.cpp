@@ -31,6 +31,7 @@
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -111,15 +112,35 @@ Verifier::~Verifier() {
     if (arena_) cudaFree(arena_);
     if (stamps_) cudaFree(stamps_);
     void* hosts[] = {h_tok_, h_val_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_,
-                     h_ymiss_,
+                     h_ymiss_, h_bad_,
                      h_flagA_, h_plan_, h_flagB_, h_pids_, h_pw_, h_pseq_, h_pleflag_, h_rows_, h_res_, h_flag2_,
                      h_list2_, h_xk_, h_xq1_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
 
+int Verifier::nonfinite(int T) {
+    if (!nan_guard_) return -1;
+    ++guard_calls_;
+    if (std::find(nan_inject_.begin(), nan_inject_.end(), guard_calls_) != nan_inject_.end()) return 0;
+    for (int t = 0; t < T; ++t)
+        if (((volatile const uint32_t*) h_bad_)[t] != 0 ||
+            (shead_ != nullptr && ((volatile const uint32_t*) shead_->nonfinite())[t] != 0))
+            return t;
+    return -1;
+}
+
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
+    if (const char* v = std::getenv("STRATA_NAN_GUARD")) nan_guard_ = !(v[0] == '0' && v[1] == '\0');
+    if (const char* v = std::getenv("STRATA_NAN_INJECT"))
+        for (const char* c = v; *c != '\0';) {
+            char* e = nullptr;
+            const unsigned long long n = std::strtoull(c, &e, 10);
+            if (e == c) break;
+            nan_inject_.push_back(n);
+            c = *e == ',' ? e + 1 : e;
+        }
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -188,6 +209,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
               mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
               mapped(T * 4 + 16, (void**) &h_val_, (void**) &m_val_) &&
+              mapped(T * 4 + 16, (void**) &h_bad_, (void**) &m_bad_) &&
               mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
               mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
@@ -986,7 +1008,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 return false;
             }
         }
-        argmax_rows(head_logits_, T, (int) head_rows_, arg_scratch_, m_out_, cs, m_val_);
+        argmax_rows(head_logits_, T, (int) head_rows_, arg_scratch_, m_out_, cs, m_val_, nan_guard_ ? m_bad_ : nullptr);
     }
     if (host_rows_) copy_from_mapped(m_rows_, R_, (int64_t) T * HC * N, cs);   // a plain copy kernel, here to host
     stamp(g.n_layers, 3, cs);
@@ -1266,6 +1288,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
         if (rows_in_ != nullptr && k + 1 < g.n_layers * G) rows_in_(rows_user_, l);
     }
+    // the last layer's second-GPU rows: no later doorbell bounds the graph's wait for them, and a spin kernel left
+    // running when the engine ends can leave the GPU lost until a power cycle (upstream #267)
+    for (const Clock::time_point w0 = Clock::now();
+         gpu2_ && *(volatile uint32_t*) sink_.gpu2_flag < (uint32_t) (g.n_layers * G);) {
+        settle(false);
+        _mm_pause();
+        if (ms_since(w0) > 5000.0) {
+            err = "verify: the second GPU's rows of the last layer never came";
+            return release();
+        }
+    }
     while (late_flag != nullptr && ms_since(late_at) < 50.0) {   // the last layer's (the graph ends after them)
         settle(false);
         _mm_pause();
@@ -1281,7 +1314,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             if (ms_since(h0) > 5000.0) {
                 err = std::string("verify: the head's input never came (") + cudaGetErrorString(cudaStreamQuery(cs_)) +
                       ")";
-                return false;
+                return release();
             }
         }
         if (!shead_->submit(T, whole, err)) return false;

@@ -459,18 +459,19 @@ __device__ __forceinline__ void arg_block(float& bv, int& bi, int none) {
     }
 }
 
-// A row's scratch, whatever the launch's row count (one scratch serves windows of every size): its counter, then
-// the blocks' values and indices.
+// A row's scratch, whatever the launch's row count (one scratch serves windows of every size): its counter, whether
+// a block saw a NaN or an infinity, then the blocks' values and indices.
 struct ArgRow {
     unsigned counter;
-    unsigned pad[3];
+    unsigned bad;
+    unsigned pad[2];
     float v[kArgMaxBlocks];
     int i[kArgMaxBlocks];
 };
 
 // grid (blocks, rows): block b scans [b * per_block, +per_block) of its row
 __global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int per_block, ArgRow* __restrict__ rows,
-                                   int32_t* out, float* out_val) {
+                                   int32_t* out, float* out_val, uint32_t* nonfinite) {
     const int row = (int) blockIdx.y, b = (int) blockIdx.x, nb = (int) gridDim.x;
     unsigned* counter = &rows[row].counter;
     float* pv = rows[row].v;
@@ -479,15 +480,19 @@ __global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int 
     const int lo = b * per_block, hi = min(n, lo + per_block);
     float bv = __int_as_float(0xff800000);   // -inf
     int bi = n;
+    int bad = 0;   // a NaN or an infinity: the exponent's bits all ones (a test fast math cannot fold away)
     for (int v = lo + (int) threadIdx.x; v < hi; v += (int) blockDim.x) {
         const float s = l[v];
         if (s > bv) { bv = s; bi = v; }
+        bad |= (__float_as_uint(s) & 0x7f800000u) == 0x7f800000u;
     }
     arg_block(bv, bi, n);
+    if (nonfinite != nullptr) bad = __syncthreads_or(bad);
     __shared__ bool last;
     if (threadIdx.x == 0) {
         pv[b] = bv;
         pi[b] = bi;
+        if (nonfinite != nullptr && bad) atomicOr(&rows[row].bad, 1u);
         __threadfence();
         last = atomicAdd(counter, 1u) == (unsigned) (nb - 1);
     }
@@ -504,6 +509,10 @@ __global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int 
     if (threadIdx.x == 0) {
         out[row] = bi < n ? bi : 0;   // no value above -inf: 0, as the one-block kernel
         if (out_val != nullptr) out_val[row] = bv;
+        if (nonfinite != nullptr) {
+            nonfinite[row] = ((volatile const unsigned*) &rows[row].bad)[0];
+            rows[row].bad = 0;
+        }
         *counter = 0;
     }
 }
@@ -557,12 +566,13 @@ __global__ void row_top_prob_split_kernel(const float* __restrict__ logits, int 
 
 uint64_t argmax_rows_scratch_bytes(int n_rows) { return (uint64_t) n_rows * sizeof(ArgRow); }
 
-void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream, float* out_val) {
+void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream, float* out_val,
+                 uint32_t* nonfinite) {
     if (n_rows <= 0) return;
     const int nb = std::min(kArgMaxBlocks, std::max(1, (n + 4095) / 4096));
     const int per_block = (n + nb - 1) / nb;
     argmax_rows_kernel<<<dim3((unsigned) nb, (unsigned) n_rows), kArgThreads, 0, (cudaStream_t) stream>>>(
-        logits, n, per_block, (ArgRow*) scratch, out, out_val);
+        logits, n, per_block, (ArgRow*) scratch, out, out_val, nonfinite);
     check("argmax_rows");
 }
 

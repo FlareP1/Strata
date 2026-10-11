@@ -258,6 +258,13 @@ void PromptCache::forget() {
     live_.tokens.clear();
 }
 
+void PromptCache::clear() {
+    release(live_, -1);
+    live_.tokens.clear();
+    for (Seq& s : stash_) release(s, -1);
+    stash_.clear();
+}
+
 std::string PromptCache::summary() const {
     size_t n = live_.ckpts.size();
     uint64_t kv = 0;

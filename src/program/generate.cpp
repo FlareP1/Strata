@@ -675,6 +675,13 @@ int argmax(const std::vector<float>& v) {
     return best;
 }
 
+// Uploads the expert residency table. Kernels on non-blocking streams read it, which do not wait for the legacy
+// stream this copy runs on, and a copy from pageable memory can return before its DMA has landed: so it waits for it.
+static cudaError_t res_put(int32_t* dst, const std::vector<int32_t>& res) {
+    const cudaError_t e = cudaMemcpy(dst, res.data(), res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+    return e != cudaSuccess ? e : cudaStreamSynchronize(cudaStreamLegacy);
+}
+
 /// Expert-cache slots lent to the batched prompt path for its buffers: the cache's last slots, as many as hold the
 /// buffers, while at least 128 stay.  `lend` takes their experts out of the residency table (the prompt path
 /// streams them instead), `give_back` copies them in again from the arena once the prompt is done.
@@ -709,7 +716,7 @@ struct SlotLoan {
                 lent.emplace_back((int32_t) i, r[i]);
                 r[i] = strata::core::kNotResident;
             }
-        if (d_res != nullptr) cudaMemcpy(d_res, r.data(), r.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+        if (d_res != nullptr) res_put(d_res, r);
     }
     /// After the borrower's last use: its GPU work is waited for first.
     bool give_back(strata::core::ExpertSource& src, int64_t n_expert, std::string& err) {
@@ -729,8 +736,7 @@ struct SlotLoan {
             (*res)[(size_t) i] = slot;
         }
         cudaSetDevice(main_device);
-        if (ok && d_res != nullptr)
-            cudaMemcpy(d_res, res->data(), res->size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+        if (ok && d_res != nullptr) res_put(d_res, *res);
         lent.clear();
         return ok;
     }
@@ -2227,7 +2233,7 @@ int main(int argc, char** argv) {
             }
         if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_count, sizeof(int32_t)) != cudaSuccess ||
-            cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            res_put(d_res, host_res) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: the device residency table could not be staged\n");
             return 1;
         }
@@ -2631,6 +2637,7 @@ int main(int argc, char** argv) {
         bool mrope_identity = true;
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
+        bool poisoned = false;   // the last request ended on non-finite logits: the next one reads its prompt anew
         while (next_line(line)) {
             if (line == "QUIT") break;
             stop_req.store(false);   // a STOP that arrived between requests is stale
@@ -2795,6 +2802,10 @@ int main(int argc, char** argv) {
             // ---- the prompt cache: continue from the longest prefix it holds (or start from an empty sequence).
             // Image requests are not cached: their cells are not identified by the token ids alone.
             const bool track = pcache.enabled() && !geni;
+            if (poisoned) {
+                pcache.clear();
+                poisoned = false;
+            }
             const int64_t reuse = pcache.begin(ids, !geni);
             tr("request", n, reuse);
             mtp.set_prompt_len(n);
@@ -2847,6 +2858,9 @@ int main(int argc, char** argv) {
                 }
                 tr("prompt done (slots refilled)");
             }
+            // A window whose logits held a NaN or an infinity (upstream #879): nothing of it is used, the request
+            // ends with the finish "nonfinite", and the next one starts from an empty sequence.
+            int64_t poison_at = -1;
             // prompt tokens through verify windows as wide as the verifier's: each window is committed whole, and the
             // draft layer catches up on the same cells (its drafts are not used, so its chain stops at the first)
             auto feed = [&](int64_t from, int64_t to) -> bool {
@@ -2862,6 +2876,10 @@ int main(int argc, char** argv) {
                     if (!ver.run(T, window.data(), j, &drive_pool_multi, &drive, outv.data(), err) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) err = drive.d.fail;
                         return false;
+                    }
+                    if (const int r = ver.nonfinite(T); r >= 0) {
+                        poison_at = j + r;
+                        return true;
                     }
                     if (!ver.commit(T, err, false)) return false;   // beside the draft
                     for (int i = 0; i < T; ++i) outv[(size_t) i] = (int32_t) ids[(size_t) (j + i + 1)];
@@ -2887,10 +2905,10 @@ int main(int argc, char** argv) {
                 const int64_t split = q > batched_end ? q : batched_end;
                 if (!feed(batched_end, split)) { report(err); return 1; }
                 if (split > batched_end) pp_line(split);
-                if (track && split == q) pcache.checkpoint(q);
-                if (!feed(split, n - 1)) { report(err); return 1; }
+                if (track && split == q && poison_at < 0) pcache.checkpoint(q);
+                if (poison_at < 0 && !feed(split, n - 1)) { report(err); return 1; }
                 if (n - 1 > split) pp_line(n - 1);
-                if (track) pcache.checkpoint(n - 1);
+                if (track && poison_at < 0) pcache.checkpoint(n - 1);
             }
             pp_total = 0;
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
@@ -2899,7 +2917,7 @@ int main(int argc, char** argv) {
             int32_t x = (int32_t) ids[(size_t) (n - 1)];
             bool first_window = true;
             int64_t produced_n = 0;
-            const char* finish = "length";
+            const char* finish = poison_at >= 0 ? "nonfinite" : "length";
             const Clock::time_point d0 = Clock::now();
             int64_t draft_offered = 0, draft_accepted = 0;
             // the expert-cache hits of the decode: rows either GPU computes from its VRAM cache, of all routed rows
@@ -2916,7 +2934,7 @@ int main(int argc, char** argv) {
             mtp.on_draft = [&](int j, int32_t tok, float prob) {   // the drafts the next window will verify
                 if (lk == 0 && prob >= (float) req_spec_min_p) ver.ple_ahead(j + 1, tok);
             };
-            while (produced_n < max_new) {
+            while (poison_at < 0 && produced_n < max_new) {
                 if (stop_req.load()) { finish = "cancel"; break; }   // the client went away
                 int T = S;
                 if (req_spec_min_p > 0.0) {
@@ -2957,6 +2975,12 @@ int main(int argc, char** argv) {
                     drive.join_adapt();
                     report(drive.d.failed && drive.d.fail ? drive.d.fail : err);
                     return 1;
+                }
+                if (const int r = ver.nonfinite(T); r >= 0) {
+                    drive.join_adapt();
+                    poison_at = p + r;
+                    finish = "nonfinite";
+                    break;
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
@@ -3005,6 +3029,11 @@ int main(int argc, char** argv) {
                 p += a + 1;
             }
             mtp.on_draft = nullptr;
+            if (poison_at >= 0) {
+                std::fprintf(stderr, "strata serve: non-finite logits at position %lld: the request ends, and the next "
+                                     "one reads its prompt from the start\n", (long long) poison_at);
+                poisoned = true;
+            }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             const int64_t hits1 = drive.d.cache_hits + drive.d.gpu2_entries, look1 = hits1 + drive.d.cache_refused;
             // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused>
@@ -3453,11 +3482,8 @@ int main(int argc, char** argv) {
             }
             if (lk > 0) T = 1 + lk;
             if (first_window) T = 1;
+            T = (int) std::min<int64_t>(T, o.max_context - p);   // near the context's end, the rows that fit
             ++window_hist[(size_t) T];
-            if (p + T > o.max_context) {
-                std::fprintf(stderr, "strata generate: ran out of context at position %lld\n", (long long) p);
-                return 2;
-            }
             window[0] = x;
             for (int i = 1; i < T; ++i) {
                 const size_t at = produced.size() - 1 + (size_t) i;

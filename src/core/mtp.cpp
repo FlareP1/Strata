@@ -617,8 +617,10 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (probs) probs[0] = pj;
     if (on_draft) on_draft(0, drafts[0], pj);
     int n = 1;
-    // the chain continues while the last draft is likely enough to be verified
-    const int chain = max_drafts_ > 0 ? std::min(max_drafts_, max_t_ - 1) : max_t_ - 1;
+    // the chain continues while the last draft is likely enough to be verified; draft j's K/V goes to cell p + a + j,
+    // so near the context's end it stops at the last cell
+    const int chain = (int) std::min<int64_t>(max_drafts_ > 0 ? std::min(max_drafts_, max_t_ - 1) : max_t_ - 1,
+                                              st_.max_cells - (p + a));
     for (int j = 1; j < chain && pj >= min_p; ++j) {
         if (!capture_step(j, err)) return false;
         put(max_t_ + j - 1, p + a + j);

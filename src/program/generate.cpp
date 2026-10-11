@@ -2614,6 +2614,17 @@ int main(int argc, char** argv) {
                         (long long) (strata::kernels::cpu::expert_layout().total >> 20), pool.workers(), o.pcie_frac,
                         o.spec_min_p, o.second_gpu);
         }
+        // --ple-io ram: READY only once the table is in RAM.  While it loads, its 28.8 GB of reads compete with the
+        // requests and the rows still come from the SSD: a first chat right after READY decoded at ~21 tok/s instead
+        // of ~95 and a 32K prompt read 13% slower.  STRATA_PLE_RAM_NOWAIT=1: before.
+        if (ple_table.is_open() && ple_table.mode() == strata::kernels::PleIo::Ram && !ple_table.ram_ready() &&
+            !std::getenv("STRATA_PLE_RAM_NOWAIT")) {
+            const auto w0 = std::chrono::steady_clock::now();
+            ple_table.wait_ram_load();
+            std::fprintf(stderr, "strata serve: waited %.1f s for the PLE table before READY (%s)\n",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count(),
+                         ple_table.ram_ready() ? "in RAM" : "its rows stay on the SSD");
+        }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;

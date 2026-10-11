@@ -350,6 +350,9 @@ bool PleTable::start_ram_load(std::string& err) {
 }
 
 bool PleTable::ram_ready() const { return impl_->from_ram(); }
+void PleTable::wait_ram_load() {
+    if (impl_->loader.joinable()) impl_->loader.join();
+}
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }

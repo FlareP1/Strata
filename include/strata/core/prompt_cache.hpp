@@ -24,6 +24,15 @@
 
 namespace strata::core {
 
+/// Identity of an image embedded in a GENI request.  Token IDs alone only
+/// describe the image-pad run; the embedding bytes and grid describe what the
+/// model actually saw.  `start` is the first image-pad token position.
+struct ImgKey {
+    int64_t start = 0;
+    uint64_t hash = 0;
+    bool operator==(const ImgKey& other) const { return start == other.start && hash == other.hash; }
+};
+
 class PromptCache {
 public:
     /// `kv`: every state whose cells a stashed sequence keeps (the QSA layers and the draft layer).
@@ -37,16 +46,18 @@ public:
     uint64_t ckpt_bytes() const { return ckpt_bytes_; }
 
     /// Sets the session up for a prompt of `ids`: continues from the longest prefix (at most ids.size() - 1
-    /// cells, the last token always goes through a verify window) that the live sequence, a checkpoint or a
-    /// stashed sequence holds, or zeroes the session.  With `cacheable` false (an image request, whose cells the
-    /// ids do not describe) it zeroes the session and the live sequence is not kept.  Returns the cells reused.
-    int64_t begin(const std::vector<int64_t>& ids, bool cacheable);
+    /// cells, the last token always goes through a verify window) whose token
+    /// and image prefix matches the live sequence, a checkpoint or a stashed
+    /// sequence, or zeroes the session.  Image identity is checked before the
+    /// matching position is returned; a changed image clamps reuse to before
+    /// that image.  Text-only requests pass an empty image-key vector.
+    int64_t begin(const std::vector<int64_t>& ids, const std::vector<ImgKey>& imgs);
     /// The cells [pos, pos + n) now hold `tokens`; pos <= live length, and anything after pos is gone.
     void set(int64_t pos, const int64_t* tokens, int64_t n);
     void set(int64_t pos, const int32_t* tokens, int64_t n);
     /// Checkpoints the session, which is at `pos` == the live length.
     void checkpoint(int64_t pos);
-    /// Forgets the live sequence (after an image request).
+    /// Forgets the live sequence after a failed/cancelled request.
     void forget();
     /// Forgets the live sequence, every checkpoint and every stashed sequence (after non-finite logits: whatever the
     /// state holds may be poisoned).
@@ -59,6 +70,7 @@ private:
     struct Ckpt { int64_t pos; void* host; uint64_t stamp; };
     struct Seq {
         std::vector<int64_t> tokens;
+        std::vector<ImgKey> imgs;
         std::vector<Ckpt> ckpts;
         std::unique_ptr<uint8_t[]> kv;   // cells [0, kv_cells) of every K/V state (stashed sequences only)
         int64_t kv_cells = 0;
@@ -71,7 +83,8 @@ private:
 
     /// Cells of `seq` a prompt can continue from: the whole sequence when it is a prefix of the prompt (live
     /// only: the state is there), else its best checkpoint within the common prefix (its position; -1: none).
-    int64_t reusable(const Seq& seq, const std::vector<int64_t>& ids, bool live) const;
+    int64_t reusable(const Seq& seq, const std::vector<int64_t>& ids, const std::vector<ImgKey>& imgs,
+                     bool live) const;
     static Ckpt* find(Seq& seq, int64_t pos);
     void* take_buffer();
     void release(Seq& seq, int64_t keep_upto);   // frees the checkpoints after `keep_upto`

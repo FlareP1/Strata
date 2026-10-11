@@ -79,6 +79,18 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// FNV-1a is deliberately kept local to the request parser: image identity is
+// part of prompt-cache matching, not a model/runtime checksum.  The seed and
+// byte order match the upstream conversation-cache implementation.
+uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 struct Options {
     std::string pack = "pack/full";
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
@@ -2637,6 +2649,7 @@ int main(int argc, char** argv) {
         bool mrope_identity = true;
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
+        std::vector<strata::core::ImgKey> req_imgs;
         bool poisoned = false;   // the last request ended on non-finite logits: the next one reads its prompt anew
         while (next_line(line)) {
             if (line == "QUIT") break;
@@ -2695,6 +2708,7 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
                 // positions for every cell this request can reach; the identity again for a text request
@@ -2736,6 +2750,11 @@ int main(int argc, char** argv) {
                         if (ids[(size_t) i] != kImagePad) { put(i, p, p, p); ++p; ++i; continue; }
                         if (k >= imgs.size()) { ve = "the prompt has more images than the embeddings file"; break; }
                         const Img& im = imgs[k++];
+                        const int64_t grid[3] = {im.n, im.nx, im.ny};
+                        uint64_t image_hash = fnv1a(grid, sizeof grid);
+                        image_hash = fnv1a(img_rows.data() + im.off,
+                                           (size_t) im.n * (size_t) g.n_embd * sizeof(float), image_hash);
+                        req_imgs.push_back({i, image_hash});
                         for (int64_t j = 0; j < im.n && ve.empty(); ++j)
                             if (i + j >= n || ids[(size_t) (i + j)] != kImagePad)
                                 ve = "image " + std::to_string(k) + " has " + std::to_string((long long) im.n) +
@@ -2800,13 +2819,13 @@ int main(int argc, char** argv) {
                 exit_on_cuda_fault();
             };
             // ---- the prompt cache: continue from the longest prefix it holds (or start from an empty sequence).
-            // Image requests are not cached: their cells are not identified by the token ids alone.
-            const bool track = pcache.enabled() && !geni;
+            // GENI requests are cacheable too, but only after the parser has supplied embedding/grid identities.
+            const bool track = pcache.enabled();
             if (poisoned) {
                 pcache.clear();
                 poisoned = false;
             }
-            const int64_t reuse = pcache.begin(ids, !geni);
+            const int64_t reuse = pcache.begin(ids, req_imgs);
             tr("request", n, reuse);
             mtp.set_prompt_len(n);
             std::vector<int32_t> drafts((size_t) W, 0), window((size_t) W), outv((size_t) W);

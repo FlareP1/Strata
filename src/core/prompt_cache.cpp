@@ -31,10 +31,26 @@ PromptCache::~PromptCache() {
     }
 }
 
-int64_t PromptCache::reusable(const Seq& seq, const std::vector<int64_t>& ids, bool live) const {
+int64_t PromptCache::reusable(const Seq& seq, const std::vector<int64_t>& ids, const std::vector<ImgKey>& imgs,
+                              bool live) const {
     const int64_t m = std::min<int64_t>((int64_t) seq.tokens.size(), (int64_t) ids.size() - 1);
     int64_t lcp = 0;
     while (lcp < m && seq.tokens[(size_t) lcp] == ids[(size_t) lcp]) ++lcp;
+
+    // The token prefix is necessary but not sufficient for multimodal input:
+    // every image that falls inside the reusable prefix must have the same
+    // embedding/grid identity at the same position.  If an image was changed,
+    // removed, added, or reordered, fail closed before its first pad token.
+    auto matching_image = [](const std::vector<ImgKey>& all, const ImgKey& wanted) {
+        for (const ImgKey& image : all)
+            if (image.start == wanted.start) return image == wanted;
+        return false;
+    };
+    for (const ImgKey& image : seq.imgs)
+        if (image.start < lcp && !matching_image(imgs, image)) lcp = image.start;
+    for (const ImgKey& image : imgs)
+        if (image.start < lcp && !matching_image(seq.imgs, image)) lcp = image.start;
+
     if (live && lcp > 0 && lcp == (int64_t) seq.tokens.size()) return lcp;
     int64_t best = -1;
     for (const Ckpt& c : seq.ckpts)
@@ -157,6 +173,8 @@ void PromptCache::stash_live(int64_t keep_upto) {
     }
     if (s.ckpts.empty()) return;
     s.tokens = live_.tokens;
+    for (const ImgKey& image : live_.imgs)
+        if (image.start < L) s.imgs.push_back(image);
     s.kv_cells = L;
     s.kv_bytes = bytes;
     s.stamp = ++clock_;
@@ -171,24 +189,21 @@ bool PromptCache::restore(Seq& seq, int64_t pos) {
     return session_ckpt_load(ss_, g_, pos, ck->host, stream_);
 }
 
-int64_t PromptCache::begin(const std::vector<int64_t>& ids, bool cacheable) {
+int64_t PromptCache::begin(const std::vector<int64_t>& ids, const std::vector<ImgKey>& imgs) {
     const int64_t L = (int64_t) live_.tokens.size();
     auto zero = [&]() -> int64_t {
         release(live_, 0);
         live_.tokens.clear();
+        live_.imgs.clear();
         session_zero(ss_, g_, nullptr, stream_);
         cudaStreamSynchronize((cudaStream_t) stream_);
         return 0;
     };
     if (!enabled()) return zero();
-    if (!cacheable) {
-        stash_live(0);
-        return zero();
-    }
-    int64_t best = reusable(live_, ids, true);
+    int64_t best = reusable(live_, ids, imgs, true);
     int from = -1;   // -1: the live sequence, else a stashed one
     for (size_t i = 0; i < stash_.size(); ++i) {
-        const int64_t r = reusable(stash_[i], ids, false);
+        const int64_t r = reusable(stash_[i], ids, imgs, false);
         if (r > best) {
             best = r;
             from = (int) i;
@@ -196,7 +211,9 @@ int64_t PromptCache::begin(const std::vector<int64_t>& ids, bool cacheable) {
     }
     if (best <= 0) {
         stash_live(0);
-        return zero();
+        const int64_t result = zero();
+        live_.imgs = imgs;
+        return result;
     }
     if (from < 0) {
         // The live sequence continues.  When the prompt drops most of it (another conversation that shares a
@@ -209,6 +226,7 @@ int64_t PromptCache::begin(const std::vector<int64_t>& ids, bool cacheable) {
         if (best < L && !restore(live_, best)) return zero();
         release(live_, best);
         live_.tokens.resize((size_t) best);
+        live_.imgs = imgs;
         return best;
     }
     // Another sequence continues: the live one is stashed and the chosen one becomes live.
@@ -224,6 +242,7 @@ int64_t PromptCache::begin(const std::vector<int64_t>& ids, bool cacheable) {
     live_.tokens.assign(chosen.tokens.begin(), chosen.tokens.begin() + best);
     live_.ckpts = std::move(chosen.ckpts);
     release(live_, best);
+    live_.imgs = imgs;
     return best;
 }
 
@@ -256,11 +275,13 @@ void PromptCache::checkpoint(int64_t pos) {
 void PromptCache::forget() {
     release(live_, 0);
     live_.tokens.clear();
+    live_.imgs.clear();
 }
 
 void PromptCache::clear() {
     release(live_, -1);
     live_.tokens.clear();
+    live_.imgs.clear();
     for (Seq& s : stash_) release(s, -1);
     stash_.clear();
 }

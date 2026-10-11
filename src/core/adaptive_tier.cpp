@@ -1,6 +1,7 @@
 // src/core/adaptive_tier.cpp - see include/strata/core/adaptive_tier.hpp.
 #include "strata/core/adaptive_tier.hpp"
 
+#include "strata/core/adaptive_policy.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
@@ -28,8 +29,10 @@ AdaptiveTier::~AdaptiveTier() {
     if (stage_arena_ != nullptr) cudaFreeHost(stage_arena_);
 }
 
-bool AdaptiveTier::init(ExpertCache& cache, ExpertSource& src, std::vector<int32_t>& host_res, int64_t n_layers,
-                        int64_t n_expert, int max_moves, std::string& err, int device, int main_device) {
+bool AdaptiveTier::init(ExpertCache& cache, ExpertSource& src,
+                        std::vector<int32_t>& host_res, int64_t n_layers, int64_t n_expert,
+                        int max_moves, std::string& err, int device, int main_device,
+                        bool deterministic_adapt) {
     cache_ = &cache;
     src_ = &src;
     res_ = &host_res;
@@ -38,6 +41,7 @@ bool AdaptiveTier::init(ExpertCache& cache, ExpertSource& src, std::vector<int32
     max_moves_ = max_moves;
     dev_ = device;
     main_ = main_device;
+    deterministic_ = deterministic_adapt;
     free_.assign((size_t) n_layers, {});
     OnDevice on(dev_, main_);
     bool ok = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) == cudaSuccess &&
@@ -223,7 +227,8 @@ bool AdaptiveTier::pump(uint64_t budget, uint64_t& sent, std::string& err) {
 bool AdaptiveTier::adapt(std::vector<float>& usage, std::string& err, bool decay) {
     const auto t0 = std::chrono::steady_clock::now();
     if (!failed_.empty()) { err = failed_; return false; }
-    apply_pending(false);
+    apply_pending(deterministic_);
+    if (!failed_.empty()) { err = failed_; return false; }
     if (wait_ && admitted_ < queued_.size()) return true;
     // the moves whose residents are still in place give way to this call's (ranked again if still worth it)
     for (size_t i = staged_; i < queued_.size(); ++i) {
@@ -252,7 +257,7 @@ bool AdaptiveTier::adapt(std::vector<float>& usage, std::string& err, bool decay
         for (size_t i = 0; i < upper_has_.size(); ++i) upper_has_[i] = (*upper_->res_)[i] >= 0;
         for (size_t i = 0; i < upper_->staged_; ++i) upper_has_[(size_t) upper_->pending_[i].first] = 1;
     }
-    struct Ranked { float gain; int32_t layer, in, out, slot; };   // out < 0: an empty slot
+    using Ranked = AdaptiveMoveOrder;   // out < 0: an empty slot
     std::vector<Ranked> moves;
     std::vector<std::pair<float, int32_t>> cand, vict;
     std::vector<int32_t>& res = *res_;
@@ -270,21 +275,31 @@ bool AdaptiveTier::adapt(std::vector<float>& usage, std::string& err, bool decay
             else vict.emplace_back(up != nullptr && up[e] ? -1.0f : u[e], e);   // the upper tier's copy goes first
         }
         if (cand.empty()) continue;
-        std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        std::sort(cand.begin(), cand.end(), [this](auto& a, auto& b) {
+            if (a.first > b.first) return true;
+            if (b.first > a.first) return false;
+            return deterministic_ && a.second < b.second;
+        });
         const std::vector<int32_t>& fr = free_[(size_t) l];
         size_t c = 0;
         for (; c < cand.size() && c < fr.size(); ++c)
             moves.push_back({cand[c].first, (int32_t) l, cand[c].second, -1, fr[fr.size() - 1 - c]});
         const size_t nv = std::min(cand.size() - c, vict.size());
         std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nv, vict.end(),
-                          [](auto& a, auto& b) { return a.first < b.first; });
+                          [this](auto& a, auto& b) {
+                              if (a.first < b.first) return true;
+                              if (b.first < a.first) return false;
+                              return deterministic_ && a.second < b.second;
+                          });
         for (size_t i = 0; i < nv; ++i, ++c) {
             if (cand[c].first < vict[i].first + 1.5f) break;
             moves.push_back({cand[c].first - vict[i].first, (int32_t) l, cand[c].second, vict[i].second,
                              r[vict[i].second]});
         }
     }
-    std::sort(moves.begin(), moves.end(), [](const Ranked& a, const Ranked& b) { return a.gain > b.gain; });
+    std::sort(moves.begin(), moves.end(), [this](const Ranked& a, const Ranked& b) {
+        return adaptive_move_less(a, b, deterministic_);
+    });
     if ((int) moves.size() > max_moves_) moves.resize((size_t) max_moves_);
     // a move counts once queued; its resident leaves when it is staged (or sent, paced), its expert comes once landed
     for (const Ranked& m : moves) {
@@ -300,6 +315,22 @@ bool AdaptiveTier::adapt(std::vector<float>& usage, std::string& err, bool decay
     }
     if (decay)
         for (float& v : usage) v *= 0.7f;
+    if (deterministic_) {
+        std::string submit_err;
+        bool submitted = false;
+        if (!paced_) {
+            stage(UINT64_MAX);
+            submitted = pump_bytes(UINT64_MAX, submit_err);
+        } else {
+            uint64_t sent = 0;
+            submitted = pump(UINT64_MAX, sent, submit_err);
+        }
+        if (!submitted) {
+            failed_ = submit_err;
+            err = failed_;
+            return false;
+        }
+    }
     ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return true;
 }
@@ -318,6 +349,7 @@ void AdaptiveTier::retire() {
 }
 
 void AdaptiveTier::apply_pending(bool wait) {
+    if (deterministic_ && !wait) return;
     if (wait && admitted_ < queued_.size()) {   // send the rest and wait for it
         std::string err;
         uint64_t sent = 0;
@@ -337,7 +369,10 @@ void AdaptiveTier::apply_pending(bool wait) {
                 retire();
             }
         }
-        cudaStreamSynchronize(stream_);
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) {
+            failed_ = "adaptive tier: refill synchronization failed";
+            return;
+        }
     }
     retire();   // the batches landed, oldest first (or already retired by a pump: landed_ remembers them)
     if (landed_ <= admitted_) return;

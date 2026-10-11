@@ -268,6 +268,16 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(strata PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec CUDA::cudart)
 
+  add_executable(adaptive_policy_test tests/core/adaptive_policy_test.cpp)
+  target_include_directories(adaptive_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(adaptive_policy_test PRIVATE strata_artifact)
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME adaptive_policy_test COMMAND adaptive_policy_test)
+    add_test(NAME deterministic_adapt_help COMMAND strata --deterministic-adapt --help)
+    set_tests_properties(deterministic_adapt_help PROPERTIES
+                         PASS_REGULAR_EXPRESSION "--deterministic-adapt")
+  endif()
+
   add_executable(dequant_s2_parity src/kernels/dequant_s2_parity.cpp)
   # The tests are HOST C++ files that call cudaMalloc/cudaMemcpy themselves, so they need the toolkit headers
   # and cudart explicitly: enabling the CUDA language gives those to .cu sources automatically, but a .cpp

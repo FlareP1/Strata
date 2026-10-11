@@ -22,7 +22,7 @@
     "--adapt-every",
     "1",
     "--mtp",
-    "../Strata-data/mtp/rt",
+    "../Strata-data/mtp/rt-tuned",
     "--max-context",
     "200192",
     "--kv",

@@ -26,7 +26,12 @@ quantized tensors, the experts and most projections, from the GGUF files at star
 
 1. Set up IQ3_S once: `START-HERE.bat --setup --model IQ3_S --no-start` downloads the model into
    `../Strata-data/models/IQ3_S`, makes its pack in `../Strata-data/packs/iq3_s`, and makes the MTP draft layer in
-   `../Strata-data/mtp/rt` from the ~5 GB of MTP tensors of Qwen's original checkpoint.
+   `../Strata-data/mtp/rt` from the ~5 GB of MTP tensors of Qwen's original checkpoint. The configs' draft layer is
+   `../Strata-data/mtp/rt-tuned`: a copy of `mtp/rt` with its `dense.bin` replaced by the self-distilled one published
+   with jesdga95's basalt fork ([jesdga/Qwen3.8-Flash-Next-Basalt](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt),
+   `convert/mtp/rt/dense.bin`, sha256 `dfe18647e0c95d05302907be88f021590119645a1567fcd770c8d309df852d75`, under Qwen's
+   license). It drafts better (0.2 more tokens per verify pass on thinking text and after long prompts: 4-6% faster
+   there), and the output stays the same: every token is verified.
 2. Build the engine from this branch with code for both cards (the ready-made engine setup puts in `engine/` is
    upstream's, without this fork's options), with MSVC, CUDA 13, CMake and Ninja (setup puts the last two in
    `.venv\Scripts`):

@@ -298,6 +298,8 @@ private:
     cudaEvent_t pfork_ = nullptr, pjoin_ = nullptr;               // shs_'s projections
     cudaStream_t shs_ = nullptr;                                  // the shared expert's branch (and the snapshot's copy)
     cudaEvent_t shfork_ = nullptr, shjoin_ = nullptr, res_ready_ = nullptr;
+    cudaStream_t ples_ = nullptr;                                 // the PLE block's projections, beside layer 0
+    cudaEvent_t plefork_ = nullptr, plejoin_ = nullptr;
     cudaStream_t g2s_ = nullptr;                                  // the second GPU's rows, per token group
     cudaEvent_t g2fork_ = nullptr, g2join_[2] = {};
     cudaStream_t cps_ = nullptr;                                  // the wait for the CPU's rows, per token group

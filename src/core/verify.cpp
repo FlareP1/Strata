@@ -101,11 +101,13 @@ Verifier::~Verifier() {
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (side_) cudaStreamDestroy(side_);
     if (shs_) cudaStreamDestroy(shs_);
+    if (ples_) cudaStreamDestroy(ples_);
     if (g2s_) cudaStreamDestroy(g2s_);
     if (cps_) cudaStreamDestroy(cps_);
     if (kst_) cudaStreamDestroy(kst_);
     if (sgs_) cudaStreamDestroy(sgs_);
-    for (cudaEvent_t e : {join_, bfork_, bjoin_, pfork_, pjoin_, shfork_, shjoin_, res_ready_, done_, g2fork_,
+    for (cudaEvent_t e : {join_, bfork_, bjoin_, pfork_, pjoin_, shfork_, shjoin_, res_ready_, done_, g2fork_, plefork_,
+                          plejoin_,
                           g2join_[0], g2join_[1], cpfork_, cpjoin_[0], cpjoin_[1], efork_, rdone_, kjoin_, iproj_,
                           sgjoin_})
         if (e) cudaEventDestroy(e);
@@ -354,6 +356,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&shs_, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&ples_, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&plefork_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&plejoin_, cudaEventDisableTiming) != cudaSuccess ||
         cudaStreamCreateWithFlags(&g2s_, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&cps_, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&kst_, cudaStreamNonBlocking) != cudaSuccess ||
@@ -458,6 +463,23 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     if (cudaEventRecord(res_ready_, shs_) != cudaSuccess) {
         err = "verify: the residency copy could not join";
         return false;
+    }
+    // the PLE block's key and value projections read only the window's PLE rows: on a branch from the window's start,
+    // beside layer 0 (from jesdga95/basalt 2ad5813), for every token at once (each row's bits as in its own call);
+    // layer 1 joins it
+    const bool ple_beside = ple_on && ss.ple.w.key_bf16 != nullptr;
+    if (ple_beside) {
+        if (!fork(ples_, plefork_)) return false;
+        wait_flag_ge(m_pleflag_, 1, ples_);   // the host reads the rows while layer 0 runs
+        copy_from_mapped(ple_, m_ple_, (int64_t) T * N, ples_);
+        try {
+            bf16_gemv_fp32_mmvf_multi(ple_, ss.ple.w.key_bf16, ple_key_, N, NG_HC_DIM, T, ples_);
+            bf16_gemv_fp32_mmvf_multi(ple_, ss.ple.w.value_bf16, ple_val_, N, N, T, ples_);
+        } catch (const std::exception& e) {
+            err = std::string("verify PLE: ") + e.what();
+            return false;
+        }
+        if (!mark(ples_, plejoin_)) return false;
     }
 
     // ---- the embeddings, broadcast to the hc streams
@@ -574,7 +596,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mm(w->native_type, w->native_data, y, n_in, n_out, ps);
         };
         if (l == 1 && ple_on) {
-            if (grp == 0) {                                // the host reads the rows while layer 0 runs
+            if (grp == 0 && ple_beside) {
+                if (!wait(plejoin_)) return false;
+            } else if (grp == 0) {                         // the host reads the rows while layer 0 runs
                 wait_flag_ge(m_pleflag_, 1, cs);
                 copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
             }
@@ -586,13 +610,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             float* key = ple_key_ + (size_t) tb * NG_HC_DIM;
             float* norm = ple_norm_ + (size_t) tb * NG_HC_DIM;
             try {
-                if (pw.key_bf16 != nullptr) {
-                    bf16_gemv_fp32_mmvf_multi(emb, pw.key_bf16, key, N, NG_HC_DIM, n, cs);
-                } else {
+                if (!ple_beside) {
                     quant(emb, N);
                     mm(pw.key_native_type, pw.key_native_data, key, N, NG_HC_DIM, cs);
+                    bf16_gemv_fp32_mmvf_multi(emb, pw.value_bf16, ple_val_ + tb * N, N, N, n, cs);
                 }
-                bf16_gemv_fp32_mmvf_multi(emb, pw.value_bf16, ple_val_ + tb * N, N, N, n, cs);
                 const NativePleTokensBuffers pb{ple_nkey_ + (size_t) tb * NG_HC_DIM, norm, ple_gate_ + tb * HC,
                                                 ple_gated_ + (size_t) tb * NG_HC_DIM, norm, Rt(tb)};
                 native_ple_postops_tokens(key, Rt(tb), ple_val_ + tb * N, ss.ple.hist, pw, pb, n, cs,

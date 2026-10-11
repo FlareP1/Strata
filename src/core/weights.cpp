@@ -2,7 +2,9 @@
 #include "strata/core/weights.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/platform/memory.hpp"
 
+#include <cinttypes>
 #include <cuda_runtime.h>
 
 #include <chrono>
@@ -118,6 +120,29 @@ bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::st
     return true;
 }
 
+bool WeightTable::index_code_bits(const std::string& pack_dir, const std::string& name, int& code_bits,
+                                  std::string& err) {
+    const std::string path = pack_dir + "/index.txt";
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open " + path; return false; }
+    char line[1024];
+    code_bits = -1;
+    while (std::fgets(line, sizeof line, f)) {
+        if (line[0] == '#') continue;
+        char row[256] = {0};
+        unsigned long long dummy = 0;
+        long long ne = 0;
+        int i1 = 0, i2 = 0, bits = 0;
+        // the first ten fields of the row `load` parses: name file kind src_off src_bytes dst_off dst_bytes ne0 ne1 code_bits
+        if (std::sscanf(line, "%255s %d %d %llu %llu %llu %llu %lld %lld %d", row, &i1, &i2, &dummy, &dummy, &dummy,
+                        &dummy, &ne, &ne, &bits) != 10)
+            continue;
+        if (name == row) { code_bits = bits; break; }
+    }
+    std::fclose(f);
+    return true;
+}
+
 bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t arena_bytes, std::string& err,
                        const std::set<std::string>* skip) {
     const std::string path = pack_dir + "/index.txt";
@@ -141,7 +166,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         // The format is written by tools/pack_index.py and is space-separated with no quoting; a name with a
         // space in it would break the parse, which is why the parser REFUSES rather than taking what it got.
         const int n = std::sscanf(line,
-                                  "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+                                  "%255s %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNd64 " %" SCNd64 " %d %d %d %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %d %d",
                                   name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
                                   &r.ne0, &r.ne1, &r.code_bits, &r.code_bias, &r.group_elems, &r.codebook,
                                   &r.has_offset, &r.codes_bytes, &r.scales_bytes, &r.offset_bytes,
@@ -256,6 +281,12 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             cur = std::fopen(p.c_str(), "rb");
             if (!cur) { err = "cannot open " + p; cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
             cur_file = r.file;
+#if !defined(_WIN32)
+            // ask for this file's remaining rows up front so their reads overlap
+            for (size_t j = row_i; j < rows.size(); ++j)
+                if (rows[j].file == r.file && !skipped[j])
+                    strata::platform::advise_willneed(fileno(cur), rows[j].src_off, rows[j].src_bytes);
+#endif
         }
 
         // ---- the segment list: what this tensor's bytes are, plane by plane, in both forms

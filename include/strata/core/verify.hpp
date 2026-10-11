@@ -161,7 +161,13 @@ public:
     /// `fn` runs once each layer's CPU rows are in and the next layer's prediction has gone out, but the last's (the
     /// tail's): the main GPU's link then has nothing to carry until the next layer's router writes its rows to the
     /// host.  Set before the first `run`.
-    void set_rows_in(RowsFn fn, void* user) { rows_in_ = fn; rows_user_ = user; }
+    /// With `after_gpu2`, a layer's hook runs only once the second GPU's rows are in too (a guarded tier: its copies
+    /// can block this thread, which launches that GPU's graphs, while the main GPU waits for them).
+    void set_rows_in(RowsFn fn, void* user, bool after_gpu2 = false) {
+        rows_in_ = fn;
+        rows_user_ = user;
+        rows_after_gpu2_ = after_gpu2;
+    }
     cudaEvent_t window_done() const { return done_; }
     /// The pool gives a second GPU a share of each layer (`GpuPlanSink::gpu2_flag`): it writes its rows into the
     /// pool's rows and raises its token group's flag, and a branch of the window, forked at the ring, takes them
@@ -277,6 +283,7 @@ private:
     TailFn tail_ = nullptr;
     void* tail_user_ = nullptr;
     RowsFn rows_in_ = nullptr;
+    bool rows_after_gpu2_ = false;
     void* rows_user_ = nullptr;
     int32_t* h_pids_ = nullptr;  int32_t* m_pids_ = nullptr;     // 2 x T * k
     float* h_pw_ = nullptr;      float* m_pw_ = nullptr;         // 2 x T * k

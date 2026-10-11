@@ -1286,7 +1286,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             }
             ms_predict += ms_since(c);
         }
-        if (rows_in_ != nullptr && k + 1 < g.n_layers * G) rows_in_(rows_user_, l);
+        // a guarded tier's pump never runs while the second GPU is behind: its enqueue can block on a GPU that is
+        // spinning on the second-GPU flag, and this thread is what launches that GPU's next graph (deadlock)
+        if (rows_in_ != nullptr && k + 1 < g.n_layers * G &&
+            (!rows_after_gpu2_ || !gpu2_ || *(volatile uint32_t*) sink_.gpu2_flag >= want))
+            rows_in_(rows_user_, l);
     }
     // the last layer's second-GPU rows: no later doorbell bounds the graph's wait for them, and a spin kernel left
     // running when the engine ends can leave the GPU lost until a power cycle (upstream #267)

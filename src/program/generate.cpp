@@ -2528,7 +2528,7 @@ int main(int argc, char** argv) {
         }
         if (drive.tier1 != nullptr || drive.tier2 != nullptr) {   // the tiers' updates start at the tail
             ver.set_tail(&drive_tail, &drive);
-            ver.set_rows_in(&drive_rows_in, &drive);
+            ver.set_rows_in(&drive_rows_in, &drive, tier.guarded());
         }
         prefill.draft = &mtp;
         drive.d.plan = ver.plan_sink();
@@ -3420,7 +3420,7 @@ int main(int argc, char** argv) {
         }
         if (drive.tier1 != nullptr || drive.tier2 != nullptr) {   // the tiers' updates start at the tail
             ver.set_tail(&drive_tail, &drive);
-            ver.set_rows_in(&drive_rows_in, &drive);
+            ver.set_rows_in(&drive_rows_in, &drive, tier.guarded());
         }
         drive.d.plan = ver.plan_sink();
         drive.d.host_res = ver.residency();   // the snapshot the windows decide their GPU hits by

@@ -301,6 +301,11 @@ struct Options {
     /// the 3090 alone; verify windows of 8 tokens (--spec-lookup) cost 5-8 ms per token.  They break even at ~73
     /// (UD-Q4_K_XL) and ~113 (IQ3_XXS) tokens with a second GPU, ~400 without (bench/feed_test.py).
     int64_t feed_max = 128;
+    /// --serve (upstream #458): the role token of a short turn the server puts right before the new assistant turn
+    /// (the "system" of a trailing reasoning-effort turn, with the config's "effort_position": "end").  When the turn
+    /// before the last <|im_start|> opens with it, the turn checkpoint goes in front of that turn, so it holds the
+    /// conversation and not the effort.  -1: off.
+    int64_t tail_role_token = -1;
     int adapt_swaps = 96;
 };
 
@@ -372,6 +377,8 @@ void usage() {
                  "                       so switching back to them continues where they were (default 16384)\n"
                  "  --feed-max N         --serve: new prompt parts and last prompt chunks of up to N tokens run\n"
                  "                       through verify windows instead of the batched prompt path (default 128)\n"
+                 "  --tail-role-token ID --serve: a turn of this role right before the last turn stays out of the\n"
+                 "                       turn checkpoint (a trailing reasoning-effort turn; default -1 = off)\n"
                  "  --spec T             verify windows of up to T tokens: the last one and T-1 MTP drafts (2..8)\n"
                  "  --spec-min-p P       a draft enters the window only while it and the drafts before it have at\n"
                  "                       least probability P under the draft layer (default 0: always T-1 drafts)\n"
@@ -961,6 +968,7 @@ int main(int argc, char** argv) {
         else if (a == "--cache-every") o.cache_every = std::max<int64_t>(1, std::atoll(next("--cache-every")));
         else if (a == "--cache-ram") o.cache_ram_mib = std::max<int64_t>(0, std::atoll(next("--cache-ram")));
         else if (a == "--feed-max") o.feed_max = std::max<int64_t>(0, std::atoll(next("--feed-max")));
+        else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--no-spec-split") o.spec_split = false;
         else if (a == "--eos-ids") {
             std::string e;
@@ -2636,11 +2644,11 @@ int main(int argc, char** argv) {
             cudaMemGetInfo(&free_b, &total_b);
             std::printf("INFO context=%lld kv=%s kv_resident=0 expert_slots=%lld expert_cache_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=0 arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                        "spec_min_p=%.2f second_gpu=%d engine=" STRATA_VERSION " fork=custom\n",
+                        "spec_min_p=%.2f second_gpu=%d tail_role_token=%lld engine=" STRATA_VERSION " fork=custom\n",
                         (long long) o.max_context, o.kv.c_str(), (long long) xcache.slots(),
                         (long long) (xcache.bytes() >> 20), o.spec, o.spec, o.spec_lookup, (long long) (free_b >> 20),
                         (long long) (strata::kernels::cpu::expert_layout().total >> 20), pool.workers(), o.pcie_frac,
-                        o.spec_min_p, o.second_gpu);
+                        o.spec_min_p, o.second_gpu, (long long) o.tail_role_token);
         }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
@@ -2850,6 +2858,12 @@ int main(int argc, char** argv) {
             if (track)
                 for (int64_t i = n - 2; i > reuse; --i)
                     if (ids[(size_t) i] == kImStart) { q = i; break; }
+            if (q > 0 && o.tail_role_token >= 0)   // a trailing effort turn stays out of the checkpoint
+                for (int64_t i = q - 1; i > reuse; --i)
+                    if (ids[(size_t) i] == kImStart) {
+                        if (ids[(size_t) i + 1] == o.tail_role_token) q = i;
+                        break;
+                    }
             // An agent sends one long prefix again and again with a different tail (a classifier's, a coder's, a
             // critic's question after the same context; a transcript that grows inside one user message): none of
             // the cuts above falls where those prompts part.  Two more checkpoints for them: where this prompt leaves

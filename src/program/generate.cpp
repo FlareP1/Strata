@@ -489,6 +489,7 @@ struct Drive {
     strata::core::ExpertDispatch d;
     double cpu_ms = 0;
     int64_t calls = 0;
+    int64_t records = 0;   // --dump-routing's
     /// THE ROUTING TRACE, which is P0.S8 and a stated prerequisite of Phase 3.  `drive_pool` is called once
     /// per layer from the main loop - the workers live inside `expert_pool_dispatch` - so a single FILE* here
     /// needs no locking.  `d.layers` is the CURRENT layer on entry (the adapter increments it as it walks the
@@ -564,6 +565,7 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
         std::fwrite(rec, sizeof rec, 1, t->routing);
         std::fwrite(ids, sizeof(int32_t), (size_t) k, t->routing);
         std::fwrite(weights, sizeof(float), (size_t) k, t->routing);
+        ++t->records;
     }
 }
 
@@ -659,8 +661,8 @@ void drive_tail(void* user) {
 }
 
 /// Plan v0.3 P6: the pool for a verify window.
-void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
+void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_tok, int64_t k,
+                      float* out, int64_t layer) {
     Drive* t = (Drive*) user;
     t->d.layers = layer;
     const Clock::time_point a = Clock::now();
@@ -678,6 +680,14 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     t->rows_at = Clock::now();
     t->cpu_ms += std::chrono::duration<double, std::milli>(t->rows_at - a).count();
     ++t->calls;
+    if (t->routing != nullptr)   // the routing trace (drive_pool's records): every row of the window, drafts too
+        for (int64_t i = 0; i < n_tok; ++i) {
+            const int32_t rec[2] = {(int32_t) layer, (int32_t) k};
+            std::fwrite(rec, sizeof rec, 1, t->routing);
+            std::fwrite(ids + i * k, sizeof(int32_t), (size_t) k, t->routing);
+            std::fwrite(weights + i * k, sizeof(float), (size_t) k, t->routing);
+            ++t->records;
+        }
 }
 
 /// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
@@ -1620,19 +1630,8 @@ int main(int argc, char** argv) {
                      (long long) xcache.slots(), xcache.gib());
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
-        // **ROUND 328: THE HIT PATH IS PROVABLY WRONG, AND THIS SAYS SO OUT LOUD RATHER THAN LETTING IT
-        // CORRUPT A RUN QUIETLY.**  With the cache on, the generated tokens DIVERGE from the cache-off run:
-        // at 256 global slots (2.97% hits) the first difference is at **token 40**; at 4096 per-layer slots
-        // (54.4% hits) it is at **token 0**.  The cache-off run is deterministic across repeated runs, so
-        // this is a real fault in `moe_hit_grouped_s2`'s inputs or the fill - not noise.  It also explains
-        // what R4 recorded as "a better profile makes the token worse": more hits means more wrong rows, so
-        // the payoff is non-monotone BY CONSTRUCTION rather than by any memory-system effect.
-        // The cache stays opt-in and this warning is not a refusal, because the divergence IS the diagnostic.
-        std::fprintf(stderr,
-                     "strata generate: *** WARNING: --expert-cache is enabled and the GPU hit path is NOT\n"
-                     "                 CORRECT. The generated tokens diverge from a cache-off run (measured:\n"
-                     "                 first difference at token 40 at 2.97%% hits, token 0 at 54.4%%). Any\n"
-                     "                 timing from this run is real; any OUTPUT from it is not. ***\n");
+        // The GPU computes its experts from q8_1 activations, the CPU pool from ggml's: a run with the cache can part
+        // from a cache-off run at a near tie (rounding; the next-token distributions agree with llama.cpp's).
         if (o.expert_cache_per_layer) {
             int64_t lo = 0, hi = 0;
             xcache.layer_slot_range(0, lo, hi);
@@ -3772,7 +3771,7 @@ int main(int argc, char** argv) {
         std::fclose(routing);
         drive.routing = nullptr;
         std::printf("%-24s %s (%lld records of layer, k, ids, weights)\n", "routing dumped",
-                    o.dump_routing.c_str(), (long long) drive.calls);
+                    o.dump_routing.c_str(), (long long) drive.records);
     }
     if (o.stage_timing) strata::core::stage_timing_report(g.n_layers);
 

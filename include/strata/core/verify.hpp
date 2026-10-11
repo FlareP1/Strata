@@ -45,10 +45,11 @@ namespace strata::core {
 
 class NativeHead;
 
-/// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd): the CPU's rows, the
-/// main GPU's zeroed unless `GpuPlanSink::host_rows_only`; a second GPU writes its own (`set_gpu2`).
-using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                             int64_t layer);
+/// The CPU pool for a window: x_f (n_tok, n_embd), ids and their router weights (n_tok, k) -> out (n_tok * k,
+/// n_embd): the CPU's rows, the main GPU's zeroed unless `GpuPlanSink::host_rows_only`; a second GPU writes its own
+/// (`set_gpu2`).
+using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_tok,
+                             int64_t k, float* out, int64_t layer);
 /// False, with the reason, when work the window waits for failed (the second GPU's).
 using WatchFn = bool (*)(void* user, std::string& err);
 /// Layer `layer`'s likely experts, its router applied to an estimate of its FFN input (`Verifier::set_predict`): ids

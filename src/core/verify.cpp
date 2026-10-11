@@ -1237,8 +1237,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         sink_.xk_stride = xk_stride_;
         sink_.x1 = h_xq1_ + (size_t) tb * (size_t) (g.n_embd / 32) * 36;
         if (pool != nullptr)
-            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
-                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, h_w_ + (size_t) tb * ss.k, n,
+                 ss.k, h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
         VDBG("layer %lld served\n", (long long) l);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();

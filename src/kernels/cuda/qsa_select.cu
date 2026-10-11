@@ -542,8 +542,10 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream) {
     if (nq <= 0) return;
+    // the rows hold the complete blocks, at most max_blocks - 2 (the callers' max_cells / 4 + 2 leaves room for the
+    // tail block and one more): 262,144 cells fill 64 rows exactly
     if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s) ||
-        max_blocks > (int64_t) TOPK_MAX_ROWS * TOPK_T) {
+        max_blocks - 2 > (int64_t) TOPK_MAX_ROWS * TOPK_T) {
         std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
         std::exit(1);
     }

@@ -190,7 +190,7 @@ template <typename T> T* dev(size_t n) {
     return p;
 }
 
-constexpr int64_t kMaxCells = 200192;   // the configs' --max-context
+constexpr int64_t kMaxCells = 262144;   // the trained context, the top-k's capacity
 constexpr int QD = 512;                 // a query's floats: 4 heads x 128
 
 struct Data {
@@ -291,7 +291,7 @@ int compare(Data& d, int64_t pos0, int64_t nq, int64_t grid_blocks, cudaStream_t
 int selftest(Data& d, cudaStream_t s) {
     int bad = 0, cases = 0;
     // decode windows: the captured graph's fixed grid, 1-8 queries at consecutive positions
-    const int64_t pos_dec[] = {0, 3, 2046, 2047, 2050, 2051, 2052, 8190, 16381, 32766, 65533, 131070, 200180};
+    const int64_t pos_dec[] = {0, 3, 2046, 2047, 2050, 2051, 2052, 8190, 16381, 32766, 65533, 131070, 200180, 262136};
     for (int64_t p : pos_dec)
         for (int64_t nq : {1, 2, 3, 4, 8}) {
             if (p + nq > kMaxCells) continue;

@@ -728,13 +728,22 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, const fl
         }
 }
 
-/// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
+/// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized).
+/// STRATA_TRACE=2 also waits for the device at each mark and names the first step after which it reports an error:
+/// a sticky failure that surfaces in a later, unrelated call is pinned to the step that ran the faulting work.
 void mem_mark(const char* where) {
-    static const bool on = std::getenv("STRATA_TRACE") != nullptr;
-    if (!on) return;
+    static const char* const env = std::getenv("STRATA_TRACE");
+    if (env == nullptr) return;
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
     std::fprintf(stderr, "strata trace: %lld MiB free after %s\n", (long long) (free_b >> 20), where);
+    if (env[0] == '2') {
+        const cudaError_t sync_e = cudaDeviceSynchronize();
+        const cudaError_t last_e = cudaGetLastError();
+        std::fprintf(stderr, "strata trace: device %s after %s (sync: %s, last error: %s)\n",
+                     sync_e == cudaSuccess && last_e == cudaSuccess ? "ok" : "ERROR", where, cudaGetErrorString(sync_e),
+                     cudaGetErrorString(last_e));
+    }
 }
 
 int argmax(const std::vector<float>& v) {

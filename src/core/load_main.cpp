@@ -65,8 +65,8 @@ int main(int argc, char** argv) {
 
     const strata::core::LoadStats st =
         strata::core::load_experts(path, dst, blob_bytes, blobs_per_layer, layers, threads, chunk);
-    if (!st.ok) {
-        std::fprintf(stderr, "loading the experts failed: %s\n", st.error.empty() ? "unknown" : st.error.c_str());
+    if (st.seconds < 0.0) {  // load_experts_ranges has already printed the reason
+        std::fprintf(stderr, "loading the experts failed\n");
         return 1;
     }
 

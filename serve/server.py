@@ -912,10 +912,33 @@ class StrataEngine:
                     self.slot_cv.notify_all()    # new engine, or (it did not start) end with a clean EngineDied
         self.info = {**info, **self.info}
 
+    def _note_line(self, line) -> bool:
+        """A line the engine sends about the request before its DONE, kept for the DONE figures: `LP id:logprob ...`
+        (score=, POST /v1/choose; alone when the row could not be read) and `TIERS key=value ...` (the expert tiers'
+        counters over the request: the adaptive tiers' moves, the second GPU's work and prefetch).  False: another
+        line."""
+        f = line.split()
+        if f[:1] == ["LP"]:
+            note = {"scores": {int(k): float(v) for k, v in (x.split(":") for x in f[1:])}}
+        elif f[:1] == ["TIERS"]:
+            tiers = {}
+            for x in f[1:]:
+                k, sep, v = x.partition("=")
+                if sep and v.lstrip("-").isdigit():  # telemetry: a malformed field is left out, never an error
+                    tiers[k] = int(v)
+            note = {"expert_tiers": tiers}
+        else:
+            return False
+        self._pending = {**getattr(self, "_pending", {}), **note}
+        return True
+
     def _parse_done(self, line):
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
                      "decode_ms": float(f[4]), "finish": f[5]}
+        pending, self._pending = getattr(self, "_pending", None), {}
+        if pending:
+            self.last.update(pending)
         if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate fields
@@ -1640,7 +1663,7 @@ class StrataEngine:
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
-        scores = None                                    # score=: the `LP` line, {id: log-probability}
+        self._pending = {}                               # the request's LP / TIERS lines (_note_line)
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -1714,12 +1737,10 @@ class StrataEngine:
                         read_to = self.reused = int(line.split()[1])
                     except (IndexError, ValueError):
                         pass
-                elif line.split()[:1] == ["LP"]:          # score=: before the first token (alone: the row was unread)
-                    scores = {int(k): float(v) for k, v in (f.split(":") for f in line.split()[1:])}
+                elif self._note_line(line):               # LP, TIERS: kept for the DONE figures
+                    pass
                 elif line.startswith("DONE"):
                     self._parse_done(line)
-                    if scores is not None:
-                        self.last["scores"] = scores
                     done = True
                     if self.last.get("finish") == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
@@ -1750,6 +1771,7 @@ class StrataEngine:
                                            f"within {allow:.0f} s") from None
                     if line is None or line.startswith("ERR"):
                         break
+                    self._note_line(line)
                     if line.startswith("DONE"):
                         self._parse_done(line)
                         break
@@ -4129,7 +4151,8 @@ class Service:
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
-                                "drafts_accepted": last.get("drafts_accepted")})
+                                "drafts_accepted": last.get("drafts_accepted"),
+                                **({"expert_tiers": dict(last["expert_tiers"])} if last.get("expert_tiers") else {})})
                             t = self.totals
                             t["requests"] += 1
                             t["prompt_tokens"] += seen
@@ -4247,7 +4270,9 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             "predicted_per_second": round(decoded / (decode_ms / 1000), 1) if decoded and decode_ms > 0 else None,
             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
-               if last.get("drafts_offered") is not None else {})}
+               if last.get("drafts_offered") is not None else {}),
+            # the expert tiers over the request (the engine's TIERS line; PR #11)
+            **({"expert_tiers": dict(last["expert_tiers"])} if last.get("expert_tiers") else {})}
 
 
 def request_stats(segments: list[dict]) -> dict:
@@ -4264,6 +4289,10 @@ def request_stats(segments: list[dict]) -> dict:
                 "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb"):
         if any(segment.get(key) is not None for segment in segments):
             result[key] = sum(segment.get(key) or 0 for segment in segments)
+    tiers = [segment["expert_tiers"] for segment in segments if segment.get("expert_tiers")]
+    if len(tiers) > 1:
+        result["expert_tiers"] = {k: v if k in ("second_empty_slots", "deterministic_adapt")
+                                  else sum(t.get(k, 0) for t in tiers) for k, v in tiers[-1].items()}
     return result
 
 

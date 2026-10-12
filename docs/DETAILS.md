@@ -555,6 +555,12 @@ it also reads a vLLM server.
 
 `/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `/slots` uses llama.cpp's names: `n_ctx` and `n_prompt_tokens` (the running request's prompt size, kept after it ends: what a front-end's context meter divides by `n_ctx`). `total_slots` in `/props` is the number of `--batch` slots (1 without). `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
 
+An answer's `timings` (llama.cpp's names) and its `/metrics` record also carry `expert_tiers`, the expert tiers over
+that request: the adaptive tier's moves on the main GPU (`main_swaps`, `main_fills`, `main_dropped`: moves an update
+dropped before they were copied) and, with a second GPU, its routed entries, experts and layers, the layers the CPU took
+its share of, its tier's moves, its empty slots, the experts prefetched to it and of those used, and
+`deterministic_adapt`. The engine sends them as a `TIERS key=value ...` line before each `DONE`.
+
 `chat_template_caps` uses llama.cpp's field names. Strata checks them when loading the active template by rendering
 small requests; a rejected or omitted feature is `false`, and a template that fails a probe in any way only turns that
 feature off (the server still starts). `supports_tools` checks tool definitions and XML call

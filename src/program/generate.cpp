@@ -2671,6 +2671,19 @@ int main(int argc, char** argv) {
         std::vector<const float*> row_ptr;
         std::vector<strata::core::ImgKey> req_imgs;
         bool poisoned = false;   // the last request ended on non-finite logits: the next one reads its prompt anew
+        // The expert tiers' counters over a request, as a TIERS line before its DONE (whose positional fields are
+        // upstream's protocol): the moves of both GPUs' adaptive tiers, the second GPU's work and prefetch.
+        struct TierCounters {
+            int64_t main_swaps, main_fills, main_dropped;
+            int64_t second_entries, second_experts, second_layers, second_cpu_layers;
+            int64_t second_swaps, second_fills, second_dropped, second_prefetched, second_prefetch_used;
+        };
+        const auto tier_counters = [&]() {
+            return TierCounters{tier.swaps,          tier.fills,         tier.dropped,        gpu2.entries_done,
+                                gpu2.experts,        gpu2.layers,        drive.d.gpu2_skipped, tier2.swaps,
+                                tier2.fills,         tier2.dropped,      gpu2.prefetch_copied, gpu2.prefetch_used};
+        };
+        TierCounters req_tiers{};
         while (next_line(line)) {
             if (line == "QUIT") break;
             stop_req.store(false);   // a STOP that arrived between requests is stale
@@ -2843,6 +2856,7 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
+            req_tiers = tier_counters();
             const Clock::time_point r0 = Clock::now();
             auto report = [&](const std::string& e) {   // a failed request: the engine exits after it
                 std::fprintf(stderr, "strata serve: %s\n", e.c_str());
@@ -3148,6 +3162,21 @@ int main(int argc, char** argv) {
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             const int64_t hits1 = drive.d.cache_hits + drive.d.gpu2_entries, look1 = hits1 + drive.d.cache_refused;
+            const TierCounters t1 = tier_counters(), &t0 = req_tiers;
+            std::printf("TIERS main_swaps=%lld main_fills=%lld main_dropped=%lld second_entries=%lld "
+                        "second_experts=%lld second_layers=%lld second_cpu_layers=%lld second_swaps=%lld "
+                        "second_fills=%lld second_dropped=%lld second_empty_slots=%lld second_prefetched=%lld "
+                        "second_prefetch_used=%lld deterministic_adapt=%d\n",
+                        (long long) (t1.main_swaps - t0.main_swaps), (long long) (t1.main_fills - t0.main_fills),
+                        (long long) (t1.main_dropped - t0.main_dropped),
+                        (long long) (t1.second_entries - t0.second_entries),
+                        (long long) (t1.second_experts - t0.second_experts),
+                        (long long) (t1.second_layers - t0.second_layers),
+                        (long long) (t1.second_cpu_layers - t0.second_cpu_layers),
+                        (long long) (t1.second_swaps - t0.second_swaps), (long long) (t1.second_fills - t0.second_fills),
+                        (long long) (t1.second_dropped - t0.second_dropped), (long long) tier2.free_slots(),
+                        (long long) (t1.second_prefetched - t0.second_prefetched),
+                        (long long) (t1.second_prefetch_used - t0.second_prefetch_used), o.deterministic_adapt ? 1 : 0);
             // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused>
             // <expert-cache hits> <lookups>
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld\n", (long long) produced_n, (long long) n,

@@ -157,6 +157,9 @@ public:
     /// done.  Reports on stderr when done.
     bool start_ram_load(std::string& err);
     bool ram_ready() const;
+    /// Ram mode: waits for start_ram_load's thread to finish (the table in RAM, or its failure reported); returns at
+    /// once if no load is running.
+    void wait_ram_load();
 
     /// Maps the ORIGINAL second GGUF shard read-only.  The tensor's data does NOT start at file offset 0:
     /// the manifest's `shard2_tensor.offset` is relative to the GGUF's DATA SECTION, and the header before it

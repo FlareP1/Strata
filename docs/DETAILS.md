@@ -677,6 +677,9 @@ print(r.choices[0].message.content)
   second call's parameters merge into the first). Anything else in those forms stays the text it is. Measured on
   1,462 agent turns (Qwen3.8 under Claude Code, from signalnine/q27's drift corpus): 98.3% read as intended with it,
   92.9% without. Off by default, so what a client gets back is unchanged unless you turn it on.
+- **Requests without tools.** Tool calls are taken out of the text only when the request declares tools. Without
+  them the answer is the model's text as written, `<tool_call>` tags included, for clients with their own text tool
+  protocol (OpenAI's API never returns `tool_calls` for a request without tools either).
 - **Prefill progress in the stream (opt-in).** `"return_progress": true` puts that progress on the stream instead of
   sending only the keep-alive, as one extra field on a chunk with an empty delta: `prompt_progress` with `total`,
   `cache`, `processed` and `time_ms`. Those are llama.cpp's four fields and mean the same there (`time_ms` is the time
@@ -885,8 +888,8 @@ engine holds and be read again from the start, at its longest. With the option o
 sent the last prompt other than a compaction (`session_id` and `thread_id` from `client_metadata["x-codex-turn-metadata"]`)
 and the tools that prompt was rendered with; a request Codex marks `"request_kind": "compaction"`, from that same
 conversation and without tools of its own, is rendered with them. Only the prompt: for the output parser and in the
-response the request's tools stay what Codex sent, none, so a tool call the model writes comes back as a plain function
-call without its namespace or custom-tool form. It is one entry, replaced by each such prompt; a compaction of another
+response the request's tools stay what Codex sent, none, so a tool call the model writes comes back as its text, as for
+any request without tools. It is one entry, replaced by each such prompt; a compaction of another
 conversation, a request without that metadata (Codex before 0.140) or a restart renders the request as sent, and so does
 one that would not fit the context with the kept tools. Off by default: the prompt of a compaction differs from the
 one the client sent. The author measured, with Codex CLI 0.160.0 and an engine that only counts the shared prompt start,

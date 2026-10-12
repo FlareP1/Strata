@@ -500,6 +500,34 @@ else()
                               PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 endif()
+# AVX-VNNI (Alder Lake, Zen 5 and later): the AVX-2 expert kernels' vpdpwssd / vpdpbusd copies (q2_avx2.cpp,
+# iq_avx2.cpp; *_rows.inl), taken at run time where cpu_avxvnni_ok(); the same integer sums.  GCC and Clang compile
+# only those functions with target("avxvnni"), MSVC takes the intrinsics under /arch:AVX2.  A compiler without them
+# (GCC < 11, Clang < 12) builds the files without the copies.  (Upstream's, b211ba17.)
+include(CheckCXXSourceCompiles)
+if(MSVC)
+  set(CMAKE_REQUIRED_FLAGS "/arch:AVX2")
+else()
+  set(CMAKE_REQUIRED_FLAGS "-mavx2 -mfma -mf16c")
+endif()
+check_cxx_source_compiles([=[
+#include <immintrin.h>
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avxvnni")))
+#endif
+static __m256i dots(__m256i a, __m256i b) { return _mm256_dpbusd_avx_epi32(_mm256_dpwssd_avx_epi32(a, a, b), a, b); }
+int main() {
+    volatile int x = 1;
+    return _mm256_extract_epi32(dots(_mm256_set1_epi32(x), _mm256_set1_epi32(x)), 0) == 0;
+}
+]=] STRATA_HAVE_AVXVNNI_INTRINSICS)
+unset(CMAKE_REQUIRED_FLAGS)
+if(STRATA_HAVE_AVXVNNI_INTRINSICS)
+  set(_strata_avxvnni STRATA_AVXVNNI=1)
+else()
+  set(_strata_avxvnni STRATA_AVXVNNI=0)
+endif()
+set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 # The expert pool against serial runs; `--stress` needs no pack (synthetic experts, idle gaps that put the workers
@@ -567,8 +595,19 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp PROPERTIES COMPILE_OPTIONS
                                 "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c")
   endif()
+  set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+  # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp; with AVX-VNNI where the CPU has it) bit for bit
+  # against each other at 1..8 tokens and against ggml-cpu's dot, on random blocks; --bench: ms per expert on one
+  # thread, the weights streamed from DRAM
+  add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
+  target_link_libraries(iq_avx2_parity PRIVATE strata_kernels_cpu)
+  add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
+  # the AVX-2 Q8_K activation quantizer against ggml's, byte for byte (--bench: its time)
+  add_executable(q8k_quant_parity src/kernels/cpu/q8k_quant_parity.cpp)
+  target_link_libraries(q8k_quant_parity PRIVATE strata_kernels_cpu)
+  add_test(NAME q8k_quant_parity COMMAND q8k_quant_parity)
   if(STRATA_ENABLE_CUDA)
     # llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, from the same checkout as ggml: mmq.cuh's
     # instances for the expert types of ISTA-DASLab's and unsloth's files and the quantizer, with the few host

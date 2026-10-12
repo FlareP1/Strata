@@ -310,6 +310,7 @@ struct Options {
     /// conversation and not the effort.  -1: off.
     int64_t tail_role_token = -1;
     int adapt_swaps = 96;
+    float adapt_decay = 0.7f;   ///< --adapt-decay: the routing counts kept after each update (upstream's option)
 };
 
 void usage() {
@@ -413,6 +414,8 @@ void usage() {
                  "                       the main GPU\'s adaptive tier continues to replace experts\n"
                  "  --deterministic-adapt  fixed-epoch adaptive copies and stable equal-gain ordering; default async\n"
                  "                       adaptation remains unchanged (with --second-gpu, applies to both tiers)\n"
+                 "  --adapt-decay F      the share of the routing counts the adaptive tiers keep after each update\n"
+                 "                       (default 0.7; between 0 and 1)\n"
                  "  --head-split F       with --second-gpu: its share of the output head's rows (default 0.45;\n"
                  "                       each GPU streams its part after the last layer; 0 = all on the main GPU)\n"
                  "  --no-prompt-offload  with --second-gpu: the prompt path streams the experts the main GPU's cache\n"
@@ -990,6 +993,14 @@ int main(int argc, char** argv) {
             o.stop_eos = true;
         }
         else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
+        else if (a == "--adapt-decay") {
+            o.adapt_decay = (float) std::atof(next("--adapt-decay"));
+            // at 1 or more the usage counts grow without end and the swap gains turn NaN (upstream PR #591)
+            if (!(o.adapt_decay > 0.0f && o.adapt_decay < 1.0f)) {
+                std::fprintf(stderr, "--adapt-decay must be between 0 and 1 (exclusive)\n");
+                return 2;
+            }
+        }
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
@@ -2486,6 +2497,8 @@ int main(int argc, char** argv) {
     if (tier.on()) drive.tier1 = &tier;   // its copies in pieces, or at once without a second GPU (Drive::tier1)
     drive.burst = !tier2.on();
     tier.set_wait(drive.burst);
+    tier.set_decay(o.adapt_decay);
+    tier2.set_decay(o.adapt_decay);
     drive.n_layers = g.n_layers;
     drive.ring_us.assign((size_t) ((strata::kernels::kVerifyMaxT + 1) * g.n_layers), 0.0);
     if (!o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr &&

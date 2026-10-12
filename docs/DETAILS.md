@@ -1341,6 +1341,37 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 
 ---
 
+## Elastic K/V, experts only in VRAM and other switches (off by default)
+
+Measured on a Ryzen 7 9700X (DDR5-5600) with an RTX 3090 and an RTX 5070 Ti as the second expert tier, this fork's
+configs, fixed text (`--spec-follow`, 2 runs each in both orders; time per verify round against the default, code /
+thinking / after a 16K prompt / an edit quoting its prompt):
+
+- **`--kv-grow` (`--serve`): the K/V takes VRAM as the context grows.** Upstream 0.1.40's elastic K/V: the K/V pools
+  and the main GPU's expert cache are CUDA virtual-memory ranges; the K/V maps 16,384 cells at start and 8,192 more
+  whenever a request needs them, taking the chunks of the cache slots just below the prompt path's loan (a hotter
+  expert there moves into the loan region's coldest slot first); after two far shorter requests in a row it gives
+  them back and the slots refill from the profile. No address moves, so no graph is captured again, and
+  `--max-context` cells always fit. At 200,192 cells the RTX 3090's cache holds 8,787 slots instead of 7,835 with IQ3_S
+  (k8v4) and 5,330 instead of 4,602 with UD-Q4_K_XL (INT8) while a conversation is short. The configs at
+  `--max-context 24576`, which gives the cache the same room, took UD-Q4_K_XL -4.8 / -2.4 / -2.5 / -5.6% time a round
+  and IQ3_S -1.5 / -0.4 / -0.2 / -1.8%. Under `--expert-math exact` (where residency cannot change the output) a
+  multi-turn session with forced small steps, a trim, a regrow and stash round trips gave the same tokens as without
+  it. Off with `--disable-hit` and `--mmap-experts`; a growth or trim that fails stops the engine (the server starts
+  it again).
+- **`--vram-pin-gib G`, `--second-gpu-pin-gib G`: experts only in VRAM.** The profile's hottest experts, up to G GiB,
+  stay in the main GPU's lowest cache slots for good (the second option: the next ones in the second GPU's), and the
+  RAM arena leaves them out, so a model whose experts outgrow the RAM or the pinning limit can fit. The adaptive tiers
+  never evict them, so less of the cache follows the text: with 4 GiB on the RTX 3090, IQ3_S -0.8 / -2.3 / -2.9 / -2.2%
+  (the tier copied 4-7x fewer MB over the 3090's link), UD-Q4_K_XL -0.6 / -2.5 / -4.7 / +13.2% (on the edit text its
+  hits fell from 80% to 61%); 8 GiB the same. Needs `--expert-profile`, a native pack read from its GGUF and the
+  token graph's GPU hits.
+- **`STRATA_POOL_FUSED=1`: a native layer's gate/up and down rows in one CPU pool phase** (an expert's down rows start
+  once its own hidden row is quantized, no barrier between the halves; the same bytes). IQ3_S -0.8 / -0.5 / -0.3 / -0.7%,
+  UD-Q4_K_XL +2.2 / -0.2 / +0.6 / 0.0%.
+- **`--adapt-decay F`: the share of the routing counts the adaptive tiers keep after each update** (default 0.7;
+  between 0 and 1). 0.85 and 0.92 were within -1.3 / +2.2% of 0.7 on both models.
+
 ## GPU expert math (`--expert-math`)
 
 The experts the GPUs hold in VRAM and the ones the CPU computes in RAM are the same weights, but the two can round

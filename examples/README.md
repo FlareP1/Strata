@@ -8,8 +8,8 @@ The configs this fork runs with on a PC with an RTX 3090, an RTX 5070 Ti and 160
 
 This branch's engine leaves out some of upstream's options, which [DETAILS.md](../docs/DETAILS.md) describes and
 setup may write into its own configs: the layer split and the helper GPUs' caches (`--peer-device`; the second GPU
-here is `--second-gpu`), KV streaming (`--kv-resident`: the KV cache stays in VRAM), elastic K/V and the VRAM resize
-(`--kv-grow`, `--vram-elastic`), the low-RAM modes, the file tier and the RAM budget (`--resident-budget-gib`), the
+here is `--second-gpu`), KV streaming (`--kv-resident`: the KV cache stays in VRAM), the VRAM resize
+(`--vram-elastic`), the low-RAM modes, the file tier and the RAM budget (`--resident-budget-gib`), the
 experimental speed projection (control vectors), upstream's conversation cache (`--conversation-cache-mib`; the
 prompt cache here keeps replaced conversations in RAM), session files, parallel requests (`--batch`), token biases,
 prompt lookup chained after the drafts (`--lookup-chain`), the learned expert profile (`--expert-profile-save`), rope

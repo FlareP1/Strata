@@ -24,7 +24,9 @@ constexpr int64_t ROWS = 4096;
 constexpr int SLOTS = 2;                 // batches in staging: the copies of one overlap the work on the other
 constexpr size_t GEMM_WS = 32u << 20;    // cuBLAS workspace
 constexpr int NPTR = 7;                  // per-expert device pointers: blob, xs, gate/up, gu, h, down, d
-constexpr int PRE_GROUP = 16;            // prefetched blobs per copy event
+// a prefetch piece: ~1 ms of copies, so an input queued behind two of them waits little (a GPU's copy engine runs
+// copies in submission order, whatever their stream)
+constexpr uint64_t PIECE_REMOTE = 32ull << 20, PIECE_LOCAL = 4ull << 20;   // its x16 link, the first GPU's x4
 constexpr size_t MMQ_TAIL = 4096;        // zeroed after a batch's gathered experts: MMQ reads past the last one
 
 struct OnDevice {   // a remote runner's GPU current for one call, the main one again afterwards
@@ -102,12 +104,16 @@ struct ExpertRunner::Impl {
     cudaEvent_t up_done = nullptr;   // the previous layer's uploads have been read
     bool up_live = false;
     uint16_t *h_input = nullptr, *h_sum = nullptr;
-    // a layer's blobs copied ahead: at pre_off[e] in `pre` (-1: not there), covered by event pre_ev[pre_grp[e]]
+    // a layer's blobs copied ahead: at pre_off[e] in `pre` (-1: not there), covered by event pre_ev[pre_grp[e]] (its
+    // piece); pre_list the experts to copy in order, pre_next the next one, pre_at the area's next free byte
     uint8_t* pre = nullptr;
-    uint64_t pre_cap = 0;
+    uint64_t pre_cap = 0, pre_end = 0, pre_at = 0, piece_bytes = 0;   // pre_end: this layer's bound
     int64_t pre_layer = -1;
     std::vector<int64_t> pre_off;
-    std::vector<int32_t> pre_grp;
+    std::vector<int32_t> pre_grp, pre_list;
+    size_t pre_next = 0;
+    int32_t pre_pieces = 0;
+    bool pre_gate = false;            // the layer's first piece waits for the area's last reader
     std::vector<cudaEvent_t> pre_ev;
     cudaEvent_t pre_used = nullptr;   // the last read of the area
     bool pre_live = false;
@@ -186,6 +192,7 @@ bool ExpertRunner::init(int device, int main_device, void* stream, core::ExpertS
     m.main = main_device;
     m.remote = stream == nullptr;
     m.streams = streams;
+    m.piece_bytes = m.remote ? PIECE_REMOTE : PIECE_LOCAL;
     m.src = src;
     m.cache = cache;
     m.res = res;
@@ -205,7 +212,7 @@ bool ExpertRunner::init(int device, int main_device, void* stream, core::ExpertS
         for (int i = 0; ok && i < SLOTS; ++i)
             ok = cudaEventCreateWithFlags(&m.copied[i], cudaEventDisableTiming) == cudaSuccess &&
                  cudaEventCreateWithFlags(&m.used[i], cudaEventDisableTiming) == cudaSuccess;
-        m.pre_ev.assign((size_t) ((n_expert + PRE_GROUP - 1) / PRE_GROUP), nullptr);
+        m.pre_ev.assign((size_t) n_expert, nullptr);   // a piece holds at least one expert
         for (auto& e : m.pre_ev) ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
         ok = ok && cudaEventCreateWithFlags(&m.pre_used, cudaEventDisableTiming) == cudaSuccess;
         m.pre_off.assign((size_t) n_expert, -1);
@@ -267,7 +274,15 @@ bool ExpertRunner::bind(void* region, uint64_t bytes, int64_t chunk, std::string
 
 uint64_t ExpertRunner::bytes_for(int64_t chunk, const int32_t* skip) const {
     const Impl& m = *impl_;
-    return bytes_needed(chunk, m.n_expert, m.remote, m.streams) + (chunk >= kPrefetchMin ? prefetch_need(skip) : 0);
+    return bytes_needed(chunk, m.n_expert, m.remote, m.streams) + prefetch_area(chunk, skip);
+}
+
+uint64_t ExpertRunner::area_cap(int64_t chunk, bool remote) {
+    return (uint64_t) chunk * (remote ? 300000ull : 30000ull);
+}
+
+uint64_t ExpertRunner::prefetch_area(int64_t chunk, const int32_t* skip) const {
+    return std::min(prefetch_need(skip), area_cap(chunk, impl_->remote));
 }
 
 uint64_t ExpertRunner::prefetch_need(const int32_t* skip) const {
@@ -287,49 +302,92 @@ uint64_t ExpertRunner::prefetch_need(const int32_t* skip) const {
     return most + most / 10;   // the slots lent for the prompt make a few more experts stream
 }
 
-bool ExpertRunner::prefetch(int64_t layer, const std::vector<int32_t>& experts, std::string& err) {
+bool ExpertRunner::prefetch_begin(int64_t layer, int64_t chunk, const std::vector<int32_t>& experts, std::string& err) {
     Impl& m = *impl_;
+    m.pre_list.clear();
+    m.pre_next = 0;
+    m.pre_at = 0;
+    m.pre_pieces = 0;
+    m.pre_layer = -1;
     if (m.pre_cap == 0) return true;
+    std::fill(m.pre_off.begin(), m.pre_off.end(), -1);
+    m.pre_layer = layer;
+    m.pre_end = std::min(m.pre_cap, area_cap(chunk, m.remote));
+    const int32_t* res = m.res && m.cache ? m.res + (size_t) layer * (size_t) m.n_expert : nullptr;
+    for (int32_t e : experts)
+        if (!(res && res[e] >= 0)) m.pre_list.push_back(e);
+    m.pre_gate = m.pre_live;
+    if (m.remote) return true;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t stride = ((uint64_t) lay.blob_bytes(layer) + 255) & ~255ull;
+    m.pre_list.resize(std::min<size_t>(m.pre_list.size(), (size_t) (m.pre_end / stride)));
+    std::sort(m.pre_list.begin(), m.pre_list.end());
+    while (prefetch_left())
+        if (!prefetch_next(err)) return false;
+    return true;
+}
+
+bool ExpertRunner::prefetch_left() const {
+    const Impl& m = *impl_;
+    if (m.pre_layer < 0 || m.pre_next >= m.pre_list.size()) return false;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    return m.pre_at + (((uint64_t) lay.blob_bytes(m.pre_layer) + 255) & ~255ull) <= m.pre_end;
+}
+
+int ExpertRunner::prefetch_pending() const {
+    const Impl& m = *impl_;
+    int n = 0;
+    for (int32_t k = m.pre_pieces - 1; k >= 0; --k, ++n)   // pieces land in order
+        if (cudaEventQuery(m.pre_ev[(size_t) k]) == cudaSuccess) break;
+    return n;
+}
+
+bool ExpertRunner::prefetch_next(std::string& err) {
+    Impl& m = *impl_;
+    if (!prefetch_left()) return true;
     OnDevice on(m.dev, m.main, m.remote);
+    const int64_t layer = m.pre_layer;
     const auto& lay = strata::kernels::cpu::expert_layout();
     const size_t bb = (size_t) lay.blob_bytes(layer);
     const size_t stride = (bb + 255) & ~(size_t) 255;
-    std::fill(m.pre_off.begin(), m.pre_off.end(), -1);
-    m.pre_layer = layer;
-    if (m.pre_live) cudaStreamWaitEvent(m.copy, m.pre_used, 0);   // the previous layer has read the area
-    uint64_t at = 0;
-    int32_t grp = 0, in_grp = 0;
-    const size_t n = experts.size();
-    for (size_t j = 0; j < n;) {
-        const int32_t e = experts[j];
-        const bool held = m.res && m.cache && m.res[(size_t) layer * (size_t) m.n_expert + (size_t) e] >= 0;
-        if (held) { ++j; continue; }
-        if (at + stride > m.pre_cap) break;
-        // a run: the next experts' blobs follow this one in the arena, and fit
-        const uint8_t* b0 = m.src->blob(layer, e);
-        if (b0 == nullptr) { err = "prompt experts: the expert source has no blob"; return false; }
-        size_t k = j + 1;
-        if (m.src->pinned(layer, e) && stride == bb)
-            while (k < n && experts[(size_t) k] == e + (int32_t) (k - j) && at + (k - j + 1) * stride <= m.pre_cap &&
-                   !(m.res && m.cache && m.res[(size_t) layer * (size_t) m.n_expert + (size_t) experts[k]] >= 0) &&
-                   m.src->pinned(layer, experts[k]) && m.src->blob(layer, experts[k]) == b0 + (k - j) * bb &&
-                   in_grp + (int32_t) (k - j) < PRE_GROUP) ++k;
-        cudaMemcpyAsync(m.pre + at, b0, (k - j) * bb, cudaMemcpyHostToDevice, m.copy);   // pageable blobs: staged
-        for (size_t i = j; i < k; ++i) {
-            m.pre_off[(size_t) experts[i]] = (int64_t) (at + (i - j) * stride);
-            m.pre_grp[(size_t) experts[i]] = grp;
-        }
-        at += (k - j) * stride;
-        experts_prefetched += (int64_t) (k - j);
-        experts_streamed += (int64_t) (k - j);
-        in_grp += (int32_t) (k - j);
-        j = k;
-        if (in_grp >= PRE_GROUP) {
-            cudaEventRecord(m.pre_ev[(size_t) grp++], m.copy);
-            in_grp = 0;
-        }
+    if (m.pre_gate) {   // the previous layer's batches have read the area
+        cudaStreamWaitEvent(m.copy, m.pre_used, 0);
+        m.pre_gate = false;
     }
-    if (in_grp > 0) cudaEventRecord(m.pre_ev[(size_t) grp], m.copy);
+    std::vector<void*> dst;
+    std::vector<const void*> srcs;
+    std::vector<size_t> bytes;
+    bool pinned = true;
+    for (uint64_t piece = 0;
+         m.pre_next < m.pre_list.size() && piece < m.piece_bytes && m.pre_at + stride <= m.pre_end;) {
+        const int32_t e = m.pre_list[m.pre_next++];
+        const uint8_t* b = m.src->blob(layer, e);
+        if (b == nullptr) { err = "prompt experts: the expert source has no blob"; return false; }
+        uint8_t* d = m.pre + m.pre_at;
+        pinned = pinned && m.src->pinned(layer, e);
+        // a blob that follows the previous one in the arena and in the area extends its copy
+        if (!dst.empty() && stride == bb && (const uint8_t*) srcs.back() + bytes.back() == b &&
+            (uint8_t*) dst.back() + bytes.back() == d)
+            bytes.back() += bb;
+        else {
+            dst.push_back(d);
+            srcs.push_back(b);
+            bytes.push_back(bb);
+        }
+        m.pre_off[(size_t) e] = (int64_t) m.pre_at;
+        m.pre_grp[(size_t) e] = m.pre_pieces;
+        m.pre_at += stride;
+        piece += stride;
+        ++experts_prefetched;
+        ++experts_streamed;
+    }
+    if (!(pinned && core::copy_blobs(dst.data(), srcs.data(), bytes.data(), dst.size(), m.copy))) {
+        (void) cudaGetLastError();   // a batch the runtime refused goes one copy at a time
+        for (size_t i = 0; i < dst.size(); ++i)   // pageable blobs: staged by the driver
+            cudaMemcpyAsync(dst[i], srcs[i], bytes[i], cudaMemcpyHostToDevice, m.copy);
+    }
+    cudaEventRecord(m.pre_ev[(size_t) m.pre_pieces++], m.copy);
+    (void) cudaStreamQuery(m.copy);   // submitted now, not at the next driver call
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { err = std::string("prompt experts: prefetch: ") + cudaGetErrorString(e); return false; }
     return true;

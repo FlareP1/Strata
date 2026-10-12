@@ -69,6 +69,10 @@ public:
     /// (once).  Before the first chunk of every prompt that uses a region.
     bool bind(void* region, uint64_t bytes, int64_t chunk, std::string& err);
 
+    /// The order the experts a layer streams are copied ahead in: per layer (n_layers x n_expert) its experts, the
+    /// likeliest to be routed first (the expert profile's ranking).  Empty: by id.
+    void set_order(std::vector<int32_t> order);
+
     /// Positions [pos0, pos0 + n) holding `tokens`, in chunks of the bound length; `ss.ple_prev` must be the two
     /// tokens before pos0 (oldest first, -1 for none) and is advanced to the last two of these.  With a `draft`
     /// layer tokens[n], the token after the last position, is read too.

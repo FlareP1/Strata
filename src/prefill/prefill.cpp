@@ -176,8 +176,9 @@ struct Prefill::Impl {
     cudaStream_t cs = nullptr;
     // the second GPU's share, a sub-chunk at a time: the input goes out on `xfer`, the sums come back on `xsum`
     cudaStream_t xfer = nullptr, xsum = nullptr;
-    cudaEvent_t ev_mixed = nullptr;
+    cudaEvent_t ev_mixed = nullptr, ev_routed = nullptr;   // ev_routed: a layer's routing is in host memory
     std::vector<cudaEvent_t> ev_in, ev_piece;   // a sub-chunk's input is in host memory, its sums on this GPU
+    std::vector<int32_t> order;                 // per layer its experts, the likeliest first (set_order)
     Gemm gemm;
     void* owned = nullptr;   // the buffers' own allocation (no region)
     Bufs b;
@@ -201,6 +202,7 @@ Prefill::~Prefill() {
     if (m.xfer) cudaStreamSynchronize(m.xfer);
     if (m.xsum) cudaStreamSynchronize(m.xsum);
     if (m.ev_mixed) cudaEventDestroy(m.ev_mixed);
+    if (m.ev_routed) cudaEventDestroy(m.ev_routed);
     for (cudaEvent_t e : m.ev_in) if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : m.ev_piece) if (e) cudaEventDestroy(e);
     if (m.xfer) cudaStreamDestroy(m.xfer);
@@ -232,6 +234,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     if (!pieces || cudaStreamCreateWithFlags(&m.xfer, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&m.xsum, cudaStreamNonBlocking) != cudaSuccess ||
         cudaEventCreateWithFlags(&m.ev_mixed, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&m.ev_routed, cudaEventDisableTiming) != cudaSuccess ||
         cudaHostAlloc((void**) &m.ids_host, (size_t) max_chunk * K * 4, cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &m.w_host, (size_t) max_chunk * K * 4, cudaHostAllocDefault) != cudaSuccess) {
         err = "prefill: streams, events and pinned routing buffers";
@@ -255,6 +258,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
            m.local.init(dev, dev, stream, src, cache, host_res, NE, max_chunk, offload == nullptr, err);
 }
 
+void Prefill::set_order(std::vector<int32_t> order) { impl_->order = std::move(order); }
+
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool offload) {
     const strata::kernels::QsaShapes s = shapes_of(g);
     Alloc a;
@@ -266,7 +271,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
 uint64_t Prefill::bytes_for(int64_t chunk) const {
     const Impl& m = *impl_;
     return bytes_needed(*m.g, *m.ss, chunk, m.offload != nullptr) +
-           (m.offload == nullptr && chunk >= ExpertRunner::kPrefetchMin ? m.local.prefetch_need(nullptr) : 0);
+           (m.offload == nullptr ? m.local.prefetch_area(chunk, nullptr) : 0);
 }
 
 bool Prefill::bind(void* region, uint64_t bytes, int64_t chunk, std::string& err) {
@@ -496,14 +501,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             const core::LayerView v(*m.wt, l);
             const bool qsa = core::is_qsa_layer(g, l);
             new_layer();
-            // a long chunk uses nearly every expert: the ones this GPU's cache lacks are copied ahead, here while
-            // the dense steps run, or on the second GPU
-            if (T >= ExpertRunner::kPrefetchMin) {
-                m.ex1.clear();
-                for (int32_t e = 0; e < NE; ++e)
-                    if (!(m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0)) m.ex1.push_back(e);
-                if (!(m.offload ? m.offload : &m.local)->prefetch(l, m.ex1, err)) return false;
+            // the experts this GPU's cache lacks stream to the second GPU (or here): the likeliest are copied ahead
+            // while the dense steps run (the second GPU's a piece at a time, below)
+            ExpertRunner* const streamer = m.offload ? m.offload : &m.local;
+            m.ex1.clear();
+            for (int32_t i = 0; i < NE; ++i) {
+                const int32_t e = m.order.empty() ? i : m.order[(size_t) l * NE + i];
+                if (!(m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0)) m.ex1.push_back(e);
             }
+            if (!streamer->prefetch_begin(l, T, m.ex1, err)) return false;
             mark(kPsPle);
             // ---- the PLE block at layer 1: the key and value projections, then the decode path's per-token
             // arithmetic (the conv reads the previous tokens' normalized rows)
@@ -666,8 +672,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     cudaStreamWaitEvent(m.xfer, m.ev_mixed, 0);
                     cudaMemcpyAsync(m.offload->host_input() + t0 * N, mixed_h, (size_t) P * N * 2,
                                     cudaMemcpyDeviceToHost, m.xfer);
-                    cudaEventRecord(m.ev_in[(size_t) (t0 / SUB)], m.xfer);
-                    m.offload->stage_input(t0, P, m.ev_in[(size_t) (t0 / SUB)]);
+                    cudaEventRecord(m.ev_in[(size_t) (t0 / SUB)], m.xfer);   // on to the second GPU below
                 }
                 // ---- the router, and the shared expert (its gated output starts the MoE sum)
                 mark(kPsRouter);
@@ -685,6 +690,28 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             pending = false;
             if (!qsa) ++gdn_index;
             else ++qsa_index;
+            // ---- until the routing is in host memory: each sub-chunk's input on to the second GPU once it is in host
+            // memory (queued ahead, its copy would hold up that GPU's copy engine, which runs copies in submission
+            // order, whatever their stream), and the copies ahead, at most two pieces queued
+            cudaEventRecord(m.ev_routed, m.cs);
+            const int64_t n_sub = (T + SUB - 1) / SUB;
+            int64_t k_in = m.offload ? 0 : n_sub;
+            for (;;) {
+                cudaError_t q = cudaSuccess;
+                while (k_in < n_sub && (q = cudaEventQuery(m.ev_in[(size_t) k_in])) == cudaSuccess) {
+                    m.offload->stage_input(k_in * SUB, std::min(SUB, T - k_in * SUB), m.ev_in[(size_t) k_in]);
+                    ++k_in;
+                }
+                const cudaError_t r = cudaEventQuery(m.ev_routed);
+                if ((r == cudaSuccess && k_in == n_sub) || (r != cudaSuccess && r != cudaErrorNotReady) ||
+                    (q != cudaSuccess && q != cudaErrorNotReady))
+                    break;   // done, or an error the synchronization below reports
+                if (r != cudaSuccess && streamer->prefetch_left() && streamer->prefetch_pending() < 2) {
+                    if (!streamer->prefetch_next(err)) return false;
+                } else {
+                    std::this_thread::yield();
+                }
+            }
             // ================ the routed experts of the whole chunk ================
             if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
                 err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());

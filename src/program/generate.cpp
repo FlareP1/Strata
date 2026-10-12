@@ -2758,6 +2758,21 @@ int main(int argc, char** argv) {
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, off ? &offload : nullptr, e))
             return false;
+        if (!profile.empty()) {   // the experts a layer streams are copied ahead in the profile's order
+            const size_t ne = (size_t) g.n_expert;
+            std::vector<int32_t> order((size_t) g.n_layers * ne);
+            std::vector<size_t> at((size_t) g.n_layers, 0);
+            std::vector<uint8_t> seen(order.size(), 0);
+            for (const auto& [l, x] : profile)
+                if (!seen[(size_t) l * ne + (size_t) x]) {
+                    seen[(size_t) l * ne + (size_t) x] = 1;
+                    order[(size_t) l * ne + at[(size_t) l]++] = x;
+                }
+            for (size_t l = 0; l < (size_t) g.n_layers; ++l)
+                for (size_t x = 0; x < ne; ++x)
+                    if (!seen[l * ne + x]) order[l * ne + at[l]++] = (int32_t) x;
+            prefill.set_order(std::move(order));
+        }
         pbuf.prefill = &prefill;
         pbuf.offload = off ? &offload : nullptr;
         pbuf.g = &g;
@@ -2797,10 +2812,9 @@ int main(int argc, char** argv) {
             miss1 = std::max<int64_t>(miss1, g.n_expert - held1[(size_t) l]);
             miss12 = std::max<int64_t>(miss12, g.n_expert - held12[(size_t) l]);
         }
-        auto pre_area = [&](int64_t miss) {
-            if (o.prefill_chunk < strata::prefill::ExpertRunner::kPrefetchMin) return (uint64_t) 0;
+        auto pre_area = [&](int64_t miss, bool remote) {
             const uint64_t b = (uint64_t) miss * stride;
-            return b + b / 10;
+            return std::min(b + b / 10, strata::prefill::ExpertRunner::area_cap(o.prefill_chunk, remote));
         };
         auto check = [&](bool lent, strata::core::ExpertCache& cache, int64_t keep, uint64_t worst, const char* gpu,
                          const char* flag) {
@@ -2818,13 +2832,14 @@ int main(int argc, char** argv) {
         };
         if (!o.no_prefill_borrow && !pin1.empty() &&
             !check(pbuf.lend, xcache, (int64_t) pin1.size(),
-                   strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk, off) + (off ? 0 : pre_area(miss1)),
+                   strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk, off) +
+                       (off ? 0 : pre_area(miss1, false)),
                    "main GPU's", "--vram-pin-gib"))
             return false;
         if (!o.no_prefill_borrow && !pin2.empty() &&
             !check(pbuf.lend2, gpu2.cache(), (int64_t) pin2.size(),
                    strata::prefill::ExpertRunner::bytes_needed(o.prefill_chunk, g.n_expert, true, true) +
-                       pre_area(miss12), "second GPU's", "--second-gpu-pin-gib"))
+                       pre_area(miss12, true), "second GPU's", "--second-gpu-pin-gib"))
             return false;
         return true;
     };

@@ -4,9 +4,9 @@
 // batch one staging copy for each run of adjacent arena blobs among the experts the GPU's cache does not hold, one
 // dequantization launch, one gather of the batch's rows, the two GEMMs of each expert with a SwiGLU between them, and
 // one ordered add of every row, times its routing weight, into its token's sum.  A token's experts add up in ascending
-// id order, whatever the batches.  A chunk of a few hundred tokens or more uses nearly every expert, so the blobs a
-// layer will stream can be copied ahead (`prefetch`), while the prompt path's dense work runs and before the routing
-// is known; experts that do not fit there stream batch by batch.
+// id order, whatever the batches.  A chunk uses many of the experts a layer streams, so they are copied ahead
+// (`prefetch_*`), the likeliest first, while the prompt path's dense work runs and before the routing is known; the
+// ones the routing picks that did not make it stream batch by batch.
 //
 // Local: on the prompt path's own GPU and stream, reading the chunk's MoE input and adding into its MoE output there.
 // Remote: on a second GPU.  The first GPU (the 3090) sits on a PCIe 4.0 x4 link, over which an expert its cache lacks
@@ -42,15 +42,17 @@ public:
     /// whether experts its cache does not hold come its way (staging buffers).
     bool init(int device, int main_device, void* stream, core::ExpertSource* src, const core::ExpertCache* cache,
               const int32_t* res, int64_t n_expert, int64_t max_chunk, bool streams, std::string& err);
-    /// Chunks of at least this many tokens prefetch: they use nearly every expert, and their dense steps last long
-    /// enough to hide the copies (a 521-token chunk prefetching was 2.2 s slower on IQ3_XXS: routing is skewed, so
-    /// many of the experts no cache holds go unused in a short chunk).
-    static constexpr int64_t kPrefetchMin = 4096;
-
     /// Device bytes of the buffers for chunks of `chunk` tokens.
     static uint64_t bytes_needed(int64_t chunk, int64_t n_expert, bool remote, bool streams);
-    /// The same with its prefetch area, for the residency `skip` (see prefetch_need) and its own as they are now.
+    /// The same with its prefetch area (prefetch_area).
     uint64_t bytes_for(int64_t chunk, const int32_t* skip) const;
+    /// The prefetch area for chunks of `chunk` tokens, for the residency `skip` (see prefetch_need) and its own as
+    /// they are now: at most what the chunk's dense steps leave time to copy ahead (area_cap), at most prefetch_need.
+    /// A larger area lends more cache slots, refilled after the prompt.
+    uint64_t prefetch_area(int64_t chunk, const int32_t* skip) const;
+    /// ~0.3 MB a token on a second GPU (its link takes ~50 GB/s while the main GPU spends ~5.6 us a token on a
+    /// layer's dense steps and the transfers of its input and sums), ~0.03 MB on the main GPU (its x4 link, ~6 GB/s).
+    static uint64_t area_cap(int64_t chunk, bool remote);
     /// The buffers for chunks of up to `chunk` tokens, carved from `region` (`bytes` long, e.g. lent cache slots), or
     /// with a null region allocated for `max_chunk` tokens (once).  Before the first layer of every prompt that
     /// uses a region.  `area`: device memory for the prefetched blobs; null: what the region has left.
@@ -59,9 +61,18 @@ public:
     /// Bytes of prefetch area that hold a layer's streamed experts: the largest layer's experts that neither its
     /// cache nor `skip` (another GPU's residency, n_layers x n_expert, or null) holds, and a margin.
     uint64_t prefetch_need(const int32_t* skip) const;
-    /// Before a layer's routing: copies the blobs of `experts` (ascending ids) its cache does not hold into the
-    /// prefetch area, as many as fit, on its copy stream; run_layer of that layer reads them there.
-    bool prefetch(int64_t layer, const std::vector<int32_t>& experts, std::string& err);
+    /// Copies ahead while the dense steps run.  `prefetch_begin`, before the routing of a layer of a chunk of `chunk`
+    /// tokens: the experts to copy, the likeliest first (those its cache holds are skipped), up to the area's bytes
+    /// and the chunk's area_cap.  A second GPU's runner then takes them a piece at a time in that order:
+    /// `prefetch_next` queues the next piece (~1 ms of copies) into the prefetch area on its copy stream,
+    /// `prefetch_pending` counts the pieces that have not landed, `prefetch_left` whether experts remain that fit.
+    /// The main GPU's queues the ones that fit at once, in id order (its host thread can sit in a full launch queue
+    /// through the dense steps; its batches run in id order and wait only for their own copies).  run_layer of that
+    /// layer reads them there and streams the rest.
+    bool prefetch_begin(int64_t layer, int64_t chunk, const std::vector<int32_t>& experts, std::string& err);
+    bool prefetch_next(std::string& err);
+    int prefetch_pending() const;
+    bool prefetch_left() const;
 
     /// Remote: pinned [max_chunk, n_embd]: the MoE input goes in here, the sums come out here (both FP16).
     uint16_t* host_input() const;

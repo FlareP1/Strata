@@ -314,7 +314,7 @@ bool AdaptiveTier::adapt(std::vector<float>& usage, std::string& err, bool decay
         pending_.emplace_back((int32_t) (m.layer * n_expert_ + m.in), m.slot);
     }
     if (decay)
-        for (float& v : usage) v *= 0.7f;
+        for (float& v : usage) v *= decay_;
     if (deterministic_) {
         std::string submit_err;
         bool submitted = false;

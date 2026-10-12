@@ -22,6 +22,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <sys/mman.h>
 #endif
 
 namespace strata::kernels {
@@ -440,7 +442,38 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         impl_->bytes_read += (uint64_t) n * impl_->row_bytes;
         return true;
     }
-    for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
+    // A mapped table not in the file cache serves this loop as serial demand faults, a random page at a time (16 a
+    // token), with only layer 0 to hide a prompt's first chunk behind: the next window's pages are asked for in one
+    // go while this window is read (upstream 62497bff; a hint, an unfetched page is faulted by the read).
+    constexpr size_t kWin = 4096;   // rows a window
+    const bool mapped = impl_->data != nullptr && !impl_->from_ram() && g_ple_prefetch;
+    auto hint = [&](size_t a, size_t b) {
+        if (!mapped) return;
+#if defined(_WIN32)
+        WIN32_MEMORY_RANGE_ENTRY ranges[kWin];
+        ULONG_PTR k = 0;
+        for (size_t i = a; i < b; ++i) {
+            if (rows[i] >= impl_->n_rows) continue;
+            ranges[k].VirtualAddress = (PVOID) (impl_->data + (size_t) rows[i] * impl_->row_bytes);
+            ranges[k].NumberOfBytes = impl_->row_bytes;
+            ++k;
+        }
+        if (k > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), k, ranges, 0);
+#else
+        for (size_t i = a; i < b; ++i) {
+            if (rows[i] >= impl_->n_rows) continue;
+            const uintptr_t r0 = (uintptr_t) (impl_->data + (size_t) rows[i] * impl_->row_bytes);
+            const uintptr_t p0 = r0 & ~(uintptr_t) 4095;
+            (void) madvise((void*) p0, (size_t) (r0 + impl_->row_bytes - p0), MADV_WILLNEED);
+        }
+#endif
+    };
+    hint(0, std::min(n, kWin));
+    for (size_t w = 0; w < n; w += kWin) {
+        if (w + kWin < n) hint(w + kWin, std::min(n, w + 2 * kWin));
+        const size_t e = std::min(n, w + kWin);
+        for (size_t i = w; i < e; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
+    }
     return true;
 }
 

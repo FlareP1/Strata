@@ -127,6 +127,9 @@ struct Options {
     bool native_ple_postops = false;  // pinned PLE postprojection arithmetic
     bool native_router = false;       // pinned fused 512-expert top-10 router
     bool cpu_oracle_q8_0 = false;      // pinned x86 activation scales/codes at both expert stages
+    bool disable_hit = false;          // every routed expert on the CPU (exact's reference)
+    std::string expert_math = "fast";  // the GPU's native expert arithmetic: fast (llama.cpp q8_1) or exact (CPU ggml)
+    bool verify_cache = false;         // diagnostic: read back every profile-filled slot and compare source bytes
     std::string native_head_gguf;      // native output.weight experiment; same model shard as the pack
     std::vector<std::string> native_dense_gguf; // repeat for native GDN/QSA projection shards
     /// Plan v0.3 P1: the whole native arithmetic set as ONE switch (model shard 1). It enables exactly the
@@ -353,6 +356,14 @@ void usage() {
                  "  --native-head-gguf PATH  native head from the model with this first shard; requires --stream-token\n"
                  "  --native-dense-gguf PATH native GDN/QSA/shared projections; repeat for each source model shard\n"
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
+                 "  --expert-math M      native packs: how the GPU computes the experts it holds. fast (default):\n"
+                 "                       llama.cpp's CUDA q8_1 arithmetic. exact (K-quant files): the CPU pool's ggml\n"
+                 "                       arithmetic (Q8_K/Q8_0 activations, ggml's x86 summation order, one expf on\n"
+                 "                       both sides), so a GPU hit is bit-identical to the CPU's and the output does\n"
+                 "                       not depend on which experts are resident (a prompt's experts stay on the\n"
+                 "                       main GPU); slower, for regression tests\n"
+                 "  --disable-hit        every routed expert on the CPU (the cache stays allocated): exact's reference\n"
+                 "  --verify-cache       compare every profile-filled cache slot with its source bytes\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
                  "  --greedy             argmax (the default)\n"
@@ -910,6 +921,9 @@ int main(int argc, char** argv) {
         else if (a == "--native-ple-postops") o.native_ple_postops = true;
         else if (a == "--native-router") o.native_router = true;
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
+        else if (a == "--disable-hit") o.disable_hit = true;
+        else if (a == "--expert-math") o.expert_math = next("--expert-math");
+        else if (a == "--verify-cache") o.verify_cache = true;
         else if (a == "--native") o.native_preset = next("--native");
         else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
         else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
@@ -1021,6 +1035,25 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --kv must be fp16, int8, k8v4 or q4_0\n");
         return 2;
     }
+    if (o.expert_math != "fast" && o.expert_math != "exact") {
+        std::fprintf(stderr, "strata generate: --expert-math must be fast or exact\n");
+        return 2;
+    }
+    // exact: a prompt's experts on the main GPU, whatever it holds (llama.cpp's MMQ kernels round them differently on
+    // the second GPU, so a residency would show in the output)
+    if (o.expert_math == "exact") o.no_prompt_offload = true;
+    // every routed expert on the CPU: no tier may bring one back to a GPU
+    if (o.disable_hit && (o.second_gpu >= 0 || o.adapt_every > 0)) {
+        std::fprintf(stderr, "strata generate: --disable-hit: no second GPU, no adaptive tier\n");
+        o.second_gpu = -1;
+        o.adapt_every = 0;
+    }
+    // before anything builds an expert layout or runs an expert: the GPU's kernels and the CPU pool's SwiGLU
+    strata::kernels::set_expert_math(o.expert_math == "exact" ? strata::kernels::ExpertMath::Exact
+                                                              : strata::kernels::ExpertMath::Fast);
+    strata::kernels::cpu::set_native_exact_swiglu(o.expert_math == "exact");
+    const int q5k_mins = strata::kernels::cpu::ggml_q5_K_mins_rounding();
+    strata::kernels::set_exact_q5_K_fma(q5k_mins == 1);
     // every CUDA call from here on uses this device; the adaptive tier sets it on its own thread too
     int n_dev = 0;
     if (cudaGetDeviceCount(&n_dev) != cudaSuccess || o.main_gpu < 0 || o.main_gpu >= n_dev ||
@@ -1148,7 +1181,22 @@ int main(int argc, char** argv) {
                              (long long) l, f.gu_type, f.d_type);
                 return 1;
             }
+            // exact's kernels cover the K-quant files' formats: refuse others here rather than at the first hit
+            if (strata::kernels::expert_math() == strata::kernels::ExpertMath::Exact &&
+                (!strata::kernels::native_expert_exact_supported(f.gu_type, f.d_type, f.gu_act, f.d_act) ||
+                 ((f.gu_type == 13 || f.d_type == 13) && q5k_mins < 0))) {
+                std::fprintf(stderr, "strata generate: --expert-math exact has no bit-exact GPU kernels for layer "
+                                     "%lld's experts (GGML types %d / %d, activations %d / %d; Q5_K needs this build's "
+                                     "ggml rounding known); use --expert-math fast\n",
+                             (long long) l, f.gu_type, f.d_type, f.gu_act, f.d_act);
+                return 2;
+            }
         }
+    if (!native_pack && o.disable_hit) {
+        std::fprintf(stderr, "strata generate: --disable-hit needs a native pack (its verify windows take the hits from "
+                             "the residency table)\n");
+        return 2;
+    }
     if (!native_pack && (o.kv == "k8v4" || o.kv == "q4_0")) {
         std::fprintf(stderr, "strata generate: --kv %s needs a native pack (--native): the 4-bit formats run in its "
                              "verify windows\n", o.kv.c_str());
@@ -1638,8 +1686,13 @@ int main(int argc, char** argv) {
                      (long long) xcache.slots(), xcache.gib());
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
-        // The GPU computes its experts from q8_1 activations, the CPU pool from ggml's: a run with the cache can part
-        // from a cache-off run at a near tie (rounding; the next-token distributions agree with llama.cpp's).
+        // fast: the GPU computes its experts from q8_1 activations, the CPU pool from ggml's, so a run with the cache
+        // can part from a cache-off run at a near tie (rounding; the next-token distributions agree with llama.cpp's).
+        // exact: the CPU's activation formats and operations, so it cannot (--disable-hit is the cache-off run).
+        std::fprintf(stderr, "strata generate: GPU expert math %s%s\n", o.expert_math.c_str(),
+                     o.expert_math != "exact" ? " (llama.cpp q8_1; agrees with the CPU pool to rounding)"
+                     : q5k_mins == 1          ? " (bit-identical to the CPU pool; ggml's Q5_K mins summed by FMA)"
+                                              : " (bit-identical to the CPU pool; ggml's Q5_K mins: a product, then a sum)");
         if (o.expert_cache_per_layer) {
             int64_t lo = 0, hi = 0;
             xcache.layer_slot_range(0, lo, hi);
@@ -1678,6 +1731,21 @@ int main(int argc, char** argv) {
                                 (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        if (o.verify_cache) {
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            for (int64_t i = 0; i < prefilled; ++i) {
+                const auto pair = profile[(size_t) i];
+                const int32_t slot = xcache.slot_of(pair.first, pair.second);
+                if (!xcache.verify_slot(slot, srcp->blob(pair.first, pair.second), err,
+                                        (int64_t) lay.blob_bytes(pair.first))) {
+                    std::fprintf(stderr, "strata generate: cache verification failed at profile pair %lld (%d,%d), slot %d: %s\n",
+                                 (long long) i, pair.first, pair.second, slot, err.c_str());
+                    return 1;
+                }
+            }
+            std::fprintf(stderr, "strata generate: verified %lld/%lld profile-filled cache slots byte-for-byte\n",
+                         (long long) prefilled, (long long) want);
         }
         mem_mark("the profile fill");
         std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
@@ -2257,7 +2325,8 @@ int main(int argc, char** argv) {
         int64_t resident = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
-                const int32_t slot = xcache.slot_of(l, e);
+                // --disable-hit: the cache stays filled, the table holds none of it, so every expert goes to the CPU
+                const int32_t slot = o.disable_hit ? strata::core::kNotResident : xcache.slot_of(l, e);
                 host_res[(size_t) (l * g.n_expert + e)] = slot;
                 if (slot != strata::core::kNotResident) ++resident;
             }
@@ -2279,8 +2348,8 @@ int main(int argc, char** argv) {
         thits.scratch = drive.d.hit_scratch;
         thits.hit_out = drive.d.hit_out;
         drive.d.host_res = host_res.data();
-        std::fprintf(stderr, "strata generate: token graph hit path: %lld resident experts, decided on the device\n",
-                     (long long) resident);
+        std::fprintf(stderr, "strata generate: token graph hit path: %lld resident experts, decided on the device%s\n",
+                     (long long) resident, o.disable_hit ? " (--disable-hit)" : "");
     }
     // plan v0.3 P6: the VRAM tier follows the conversation in both decode loops (--serve and the speculative loop):
     // moves every --adapt-every rounds on the adapt thread, admitted once their copies have landed

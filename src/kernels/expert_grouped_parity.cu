@@ -404,8 +404,8 @@ void run(bool reference, const strata::kernels::NativeExpertLayout& L, const Dev
     if (reference)
         strata::kernels::ref::grouped(L, d.ptr, d.start, d.n, d.dst, d.tok, cap, cap, d.xq, d.scratch_ref, d.out_ref, s);
     else
-        strata::kernels::native_expert_grouped(L, d.ptr, d.start, d.n, d.dst, d.tok, cap, cap, d.xq, d.scratch_new,
-                                               d.out_new, s);
+        strata::kernels::native_expert_grouped(L, d.ptr, d.start, d.n, d.dst, d.tok, cap, cap, d.xq, (L.n_embd / 32) * 36,
+                                               d.scratch_new, d.out_new, s);
 }
 
 // microseconds per call, inside a graph of `reps` calls

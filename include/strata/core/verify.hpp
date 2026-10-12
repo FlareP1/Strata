@@ -346,6 +346,7 @@ private:
     static constexpr int64_t kStagingBlobs = 16;
     uint8_t* hit_xq_ = nullptr;
     uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
+    uint8_t* xk_dev_ = nullptr;   // --expert-math exact: the window's Q8_K rows for the hits (their own allocation)
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;

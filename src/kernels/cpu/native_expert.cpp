@@ -8,12 +8,14 @@
 #include "strata/kernels/cpu/iq_avx1.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/expf_contract.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 namespace strata::kernels::cpu {
@@ -98,7 +100,48 @@ bool q8k_avx1(int type) {
     static const bool on = !cpu_avx2_ok() && cpu_avx1_ok() && std::getenv("STRATA_NO_Q8K_AVX1") == nullptr;
     return on && type == (int) GGML_TYPE_Q8_K;
 }
+
+bool g_exact_swiglu = false;
 }  // namespace
+
+void set_native_exact_swiglu(bool on) noexcept { g_exact_swiglu = on; }
+bool native_exact_swiglu() noexcept { return g_exact_swiglu; }
+// the GPU's exact kernels' operations in their order: expf_contract(-g), 1 + it, g over that, times u
+float native_swiglu_exact(float g, float u) noexcept { return (g / (1.f + expf_contract(-g))) * u; }
+
+int ggml_q5_K_mins_rounding() {
+    init_once();
+    // block_q5_K: d, dmin (fp16), 12 bytes of 6-bit scales and mins, qh[32], qs[128]; block_q8_K: d (float), qs[256],
+    // bsums[16].  Quants 0, scale bytes 0 but byte 4 (block min 0 = m): the dot is the blocks' dmin * m * bsums[0].
+    constexpr size_t QB = 176, YB = 292;
+    const auto* tr = traits((int) GGML_TYPE_Q5_K);
+    const float yd[] = {0.7310586f, 1.2345678f, 0.913f, 1.0571f, 0.3318f, 1.7779f, 0.6211f, 1.4142135f};
+    for (int k = 0; k + 1 < (int) (sizeof yd / sizeof yd[0]); ++k) {
+        uint8_t x[2 * QB] = {}, y[2 * YB] = {};
+        const float dm[2] = {0.0137f, 0.00931f};
+        const int m[2] = {37, 53}, bsum[2] = {1500, -1789};
+        float dmin[2];
+        for (int b = 0; b < 2; ++b) {
+            const ggml_fp16_t h = ggml_fp32_to_fp16(dm[b]);
+            std::memcpy(x + b * QB + 2, &h, 2);
+            x[b * QB + 4 + 4] = (uint8_t) m[b];
+            std::memcpy(y + b * YB, &yd[k + b], 4);
+            const int16_t s = (int16_t) bsum[b];
+            std::memcpy(y + b * YB + 4 + 256, &s, 2);
+            dmin[b] = -(yd[k + b] * ggml_fp16_to_fp32(h));
+        }
+        const float t0 = (float) (m[0] * bsum[0]), t1 = (float) (m[1] * bsum[1]);
+        const float s0 = dmin[0] * t0;
+        const float fused = std::fma(dmin[1], t1, s0);
+        const float p1 = dmin[1] * t1;
+        const float separate = s0 + p1;
+        if (fused == separate) continue;   // these values round alike either way: the next pair
+        float got = 0.f;
+        tr->vec_dot(512, &got, 0, x, 0, y, 0, 1);
+        return got == fused ? 1 : got == separate ? 0 : -1;
+    }
+    return -1;
+}
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
@@ -184,6 +227,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
+    const bool exact = g_exact_swiglu;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
@@ -191,7 +235,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
             dot(n, &u, 0, ur, 0, act[t], 0, 1);
-            ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            ff[t][r] = exact ? native_swiglu_exact(g, u) : (g / (1.f + std::exp(-g))) * u;
         }
     }
 }

@@ -52,12 +52,10 @@ public:
         return -1;
     }
 
-    /// One layer's share: group g is the expert in slot `slots[g]`, serving the routed entries
-    /// `entries[starts[g] .. starts[g+1])` (entry i = token i/k).  `x` holds the window's n_tok activations as q8_1
-    /// rows (n_embd / 32 blocks each).  Entry i's row goes to row i of `out` (n_embd floats, mapped host memory), and
-    /// then `*flag` (mapped) is set to `ring`.  Waits for the last share's graphs first (the plan and staging are
-    /// theirs until then).
-    bool submit(int64_t layer, const uint8_t* x, int n_tok, int64_t k, const int32_t* slots, const int32_t* starts,
+    /// One layer's share: `x` holds the window's native gate/up activation rows and `x_stride` is the source row
+    /// stride.  Native K layers use Q8_K rows; legacy layers use q8_1 rows.  Entry i's row goes to row i of `out`
+    /// (n_embd floats, mapped host memory), and then `*flag` is set to `ring`.
+    bool submit(int64_t layer, const uint8_t* x, int64_t x_stride, int n_tok, int64_t k, const int32_t* slots, const int32_t* starts,
                 const int32_t* entries, int n_groups, float* out, uint32_t* flag, uint32_t ring, std::string& err);
     /// False, with the reason, when its work so far failed; does not wait.
     bool healthy(std::string& err) const;
@@ -68,7 +66,8 @@ public:
     int64_t prefetch_copied = 0, prefetch_used = 0;   ///< experts copied ahead / of those, computed here
 
 private:
-    bool graph_for(int gu_type, int d_type, int groups, int part, bool prep, cudaGraphExec_t& exec, std::string& err);
+    bool graph_for(int gu_type, int d_type, int gu_act, int d_act, int groups, int part, bool prep,
+                   cudaGraphExec_t& exec, std::string& err);
 
     int dev_ = -1, main_ = 0, max_t_ = 0;
     int64_t n_embd_ = 0, n_ff_ = 0, cap_ = 0;
@@ -83,7 +82,7 @@ private:
     unsigned* d_count_ = nullptr;    // the rows-out kernel's block counter
     // part 0: the experts in its cache, launched at once; part 1: the prefetched ones, after their copies.  `prep`: the
     // graph copies the plan and the activations in (the first launch of a layer)
-    struct Graph { int gu, d, groups, part; bool prep; cudaGraphExec_t exec; };
+    struct Graph { int gu, d, gu_act, d_act, groups, part; bool prep; cudaGraphExec_t exec; };
     std::vector<Graph> graphs_;
     // prefetch slots, their copy stream, and the event of the last copies
     static constexpr int kPrefetchMax = 16;

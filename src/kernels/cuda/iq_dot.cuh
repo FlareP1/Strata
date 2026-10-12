@@ -12,6 +12,7 @@
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
 #include "ggml-common.h"
+#include <type_traits>
 
 namespace strata::kernels {
 namespace {
@@ -594,6 +595,71 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
+// The --expert-math exact dots below each compute ONE ROW PER EIGHT-LANE GROUP: lane l = lane & 7 of a group owns
+// AVX2 accumulator l, and the group reduces its eight accumulators with width-8 shuffles.  A warp's four groups
+// therefore take four rows at once (the callers pass each group its own row), and every group performs exactly the
+// operations of the one-row-per-warp form, so the values are bitwise unchanged.  Every lane receives its own group's
+// result.  All 32 lanes must call together (the shuffles are warp-wide); a caller with one row passes it to all four.
+
+// Match ggml's x86 implementation (its AVX2 branch).  ggml keeps
+// eight independent float accumulators, with each accumulator receiving the
+// integer dot for four bytes in the qx/qy vectors.  The qx vector is ordered
+// as q5_1 low nibbles [0..15], then high nibbles [0..15].  It applies the
+// d*d product with a fused multiply-add, horizontally reduces the eight
+// accumulators in hsum_float_8 order, and adds the separately accumulated
+// m*s term afterward.
+__device__ __forceinline__ float row_dot_q5_1_q8_1_cpu_avx2(const uint8_t* row, const block_q8_1* x,
+                                                             int nb, int lane) {
+    const int l = lane & 7;
+    float acc = 0.0f;
+    float summs = 0.0f;
+    {
+        const block_q5_1* w = (const block_q5_1*) row;
+        const int qbase = l * 4;
+        for (int ib = 0; ib < nb; ++ib) {
+            const uint32_t qh = (uint32_t) get_int_b4(w[ib].qh, 0);
+            int sumi = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = qbase + j;
+                const int qbyte = p < 16 ? p : p - 16;
+                const int qshift = p < 16 ? 0 : 4;
+                const int q = ((int) w[ib].qs[qbyte] >> qshift & 0x0f) | (((qh >> p) & 1) << 4);
+                sumi += q * (int) ((const int8_t *) x[ib].qs)[p];
+            }
+            const float2 dm5 = __half22float2(w[ib].dm);
+            const float2 ds8 = __half22float2(x[ib].ds);
+            const float d5d8 = __fmul_rn(dm5.x, ds8.x);
+            acc = __fmaf_rn((float) sumi, d5d8, acc);
+            if (l == 0) {
+                summs = __fadd_rn(summs, __fmul_rn(dm5.y, ds8.y));
+            }
+        }
+    }
+    const unsigned mask = 0xffffffffu;
+    // Every lane must execute the same shuffle instructions.  Having only
+    // lane 0 issue these shuffles would read undefined values because lanes
+    // 1..7 would be at a different shuffle instruction.
+    const float a0 = __shfl_sync(mask, acc, 0, 8);
+    const float a1 = __shfl_sync(mask, acc, 1, 8);
+    const float a2 = __shfl_sync(mask, acc, 2, 8);
+    const float a3 = __shfl_sync(mask, acc, 3, 8);
+    const float a4 = __shfl_sync(mask, acc, 4, 8);
+    const float a5 = __shfl_sync(mask, acc, 5, 8);
+    const float a6 = __shfl_sync(mask, acc, 6, 8);
+    const float a7 = __shfl_sync(mask, acc, 7, 8);
+    float result = 0.0f;
+    if (l == 0) {
+        const float lo0 = __fadd_rn(a0, a4);
+        const float lo1 = __fadd_rn(a1, a5);
+        const float lo2 = __fadd_rn(a2, a6);
+        const float lo3 = __fadd_rn(a3, a7);
+        const float left = __fadd_rn(__fadd_rn(lo0, lo2), __fadd_rn(lo1, lo3));
+        result = __fadd_rn(left, summs);
+    }
+    return __shfl_sync(mask, result, 0, 8);
+}
+
 // One row against one q8_1 activation, the whole warp: call k = (block, part) is lane-strided.
 template<int TY>
 __device__ __forceinline__ float row_dot(const uint8_t* row, const block_q8_1* x, int nb, int lane) {
@@ -604,6 +670,179 @@ __device__ __forceinline__ float row_dot(const uint8_t* row, const block_q8_1* x
         s += F::dot(row, x + kbx * (F::qk / 32), kbx, iqs);
     }
     return warp_sum(s);
+}
+
+// ---------------------------------------------------------------- native activation-contract dots
+// The native CPU path uses ggml's vec_dot_type, not the CUDA q8_1 convenience format.  UD-Q4_K_XL has
+// Q4_K/Q5_K -> Q8_K for gate/up and Q5_1 -> Q8_1 or Q8_0 -> Q8_0 for down.  These helpers mirror ggml's
+// generic integer formulas.  Each lane owns eight values of every Q8_K superblock; the warp then sums the
+// integer partials in FP32.  This keeps the quantized codes and scale/min terms identical to the CPU contract.
+__device__ __forceinline__ void unpack_k_scales_mins(const uint8_t* src, uint8_t (&sc)[8], uint8_t (&mn)[8]) {
+    constexpr uint32_t kmask1 = 0x3f3f3f3f;
+    constexpr uint32_t kmask2 = 0x0f0f0f0f;
+    constexpr uint32_t kmask3 = 0x03030303;
+    const uint32_t* p = (const uint32_t*) src;
+    uint32_t u[4] = {p[0], p[1], p[2], 0};
+    u[3] = ((u[2] >> 4) & kmask2) | (((u[1] >> 6) & kmask3) << 4);
+    const uint32_t aux = u[1] & kmask1;
+    u[1] = (u[2] & kmask2) | (((u[0] >> 6) & kmask3) << 4);
+    u[2] = aux;
+    u[0] &= kmask1;
+    const uint8_t* b = (const uint8_t*) u;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { sc[i] = b[i]; mn[i] = b[8 + i]; }
+}
+
+// ggml's x86 Q4_K/Q5_K x Q8_K dots (their AVX2 branch).  A lane-strided form, mathematically
+// equivalent, sums every block's floats in another order.  So: eight persistent main accumulators and four persistent min accumulators, exactly
+// as ggml_vec_dot_q4_K_q8_K / q5_K_q8_K do, then reproduce hsum_float_8 and its
+// final min reduction.  Lanes 0..7 of each eight-lane group own the main
+// accumulators and its lanes 0..3 the min accumulators; the result is broadcast
+// to the group so the caller can still consume the group's lane zero.  Q5_K's
+// `summs += dmin * total` is C, not an intrinsic: one FMA where GCC or Clang
+// compiled ggml, a product then a sum where MSVC did (`fma_mins`, probed by
+// cpu::ggml_q5_K_mins_rounding).
+template<bool Q5>
+__device__ __forceinline__ float row_dot_k_q8_k_cpu_avx2(const uint8_t* row, size_t block_stride,
+                                                         const block_q8_K* x, int nb, int lane, bool fma_mins) {
+    using W = typename std::conditional<Q5, block_q5_K, block_q4_K>::type;
+    const int l = lane & 7;
+    float acc = 0.0f;
+    float acc_m = 0.0f;
+    float summs = 0.0f;
+    for (int kbx = 0; kbx < nb; ++kbx) {
+        const W* w = (const W*) (row + (size_t) kbx * block_stride);
+        const block_q8_K* a = x + kbx;
+        uint8_t sc[8], mn[8];
+        unpack_k_scales_mins(w->scales, sc, mn);
+
+        // This is the integer grouping produced by AVX2 maddubs/madd in ggml:
+        // each output lane sums four adjacent q4/q5 bytes, with the low and high
+        // nibbles occupying the two 32-value halves of the super-block.
+        {
+            int32_t si = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                int32_t lo = 0, hi = 0;
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    const int qi = 4 * l + p;
+                    int qlo = (int) (w->qs[j * 32 + qi] & 0x0f);
+                    int qhi = (int) (w->qs[j * 32 + qi] >> 4);
+                    if constexpr (Q5) {
+                        qlo |= ((int) (w->qh[qi] >> (2 * j + 0)) & 1) << 4;
+                        qhi |= ((int) (w->qh[qi] >> (2 * j + 1)) & 1) << 4;
+                    }
+                    lo += qlo * (int) a->qs[j * 64 + qi];
+                    hi += qhi * (int) a->qs[j * 64 + 32 + qi];
+                }
+                si += (int32_t) sc[2 * j + 0] * lo + (int32_t) sc[2 * j + 1] * hi;
+            }
+            const float2 dm = __half22float2(w->dm);
+            const float d = __fmul_rn(a->d, dm.x);
+            acc = fmaf(d, (float) si, acc);
+        }
+
+        // ggml's q8sums/hadd/madd path forms four signed-int32 min products.
+        int32_t mi = 0;
+        if (l < 4) {
+            const int group = l * 4;
+            const int qsum0 = (int) a->bsums[group + 0] + (int) a->bsums[group + 1];
+            const int qsum1 = (int) a->bsums[group + 2] + (int) a->bsums[group + 3];
+            mi = (int32_t) mn[2 * l + 0] * qsum0 +
+                 (int32_t) mn[2 * l + 1] * qsum1;
+        }
+        if constexpr (Q5) {
+            // AVX2 Q5_K reduces the four signed integer min products inside
+            // each 256-element block, then performs one scalar FP32 FMA into
+            // a persistent summs value. Q4_K intentionally keeps its existing
+            // four-lane packed min accumulator below.
+            const int32_t mi0 = __shfl_sync(0xffffffffu, mi, 0, 8);
+            const int32_t mi1 = __shfl_sync(0xffffffffu, mi, 1, 8);
+            const int32_t mi2 = __shfl_sync(0xffffffffu, mi, 2, 8);
+            const int32_t mi3 = __shfl_sync(0xffffffffu, mi, 3, 8);
+            if (l == 0) {
+                const int32_t t01 = mi0 + mi1;
+                const int32_t t23 = mi2 + mi3;
+                const int32_t total = t01 + t23;
+                const float2 dm = __half22float2(w->dm);
+                const float dmin = -__fmul_rn(a->d, dm.y);
+                summs = fma_mins ? fmaf(dmin, (float) total, summs)
+                                 : __fadd_rn(summs, __fmul_rn(dmin, (float) total));
+            }
+        } else if (l < 4) {
+            const float2 dm = __half22float2(w->dm);
+            const float dmin = -__fmul_rn(a->d, dm.y);
+            acc_m = fmaf(dmin, (float) mi, acc_m);
+        }
+    }
+    const unsigned mask = 0xffffffffu;
+    const float v = acc;
+    // Every lane executes every shuffle.  Keeping the shuffles out of the
+    // lane-zero branch is required by CUDA's warp-synchronous contract.
+    const float a0 = __shfl_sync(mask, v, 0, 8);
+    const float a1 = __shfl_sync(mask, v, 1, 8);
+    const float a2 = __shfl_sync(mask, v, 2, 8);
+    const float a3 = __shfl_sync(mask, v, 3, 8);
+    const float a4 = __shfl_sync(mask, v, 4, 8);
+    const float a5 = __shfl_sync(mask, v, 5, 8);
+    const float a6 = __shfl_sync(mask, v, 6, 8);
+    const float a7 = __shfl_sync(mask, v, 7, 8);
+    const float m0 = __shfl_sync(mask, l < 4 ? acc_m : 0.0f, 0, 8);
+    const float m1 = __shfl_sync(mask, l < 4 ? acc_m : 0.0f, 1, 8);
+    const float m2 = __shfl_sync(mask, l < 4 ? acc_m : 0.0f, 2, 8);
+    const float m3 = __shfl_sync(mask, l < 4 ? acc_m : 0.0f, 3, 8);
+    float result = 0.0f;
+    if (l == 0) {
+        // Same sequence as hsum_float_8: high+low, movehl pair, then scalar add.
+        const float r0 = __fadd_rn(a0, a4);
+        const float r1 = __fadd_rn(a1, a5);
+        const float r2 = __fadd_rn(a2, a6);
+        const float r3 = __fadd_rn(a3, a7);
+        const float main = __fadd_rn(__fadd_rn(r0, r2), __fadd_rn(r1, r3));
+        if constexpr (Q5) result = __fadd_rn(main, summs);
+        else {
+            const float minsum = __fadd_rn(__fadd_rn(m0, m2), __fadd_rn(m1, m3));
+            result = __fadd_rn(main, minsum);
+        }
+    }
+    return __shfl_sync(mask, result, 0, 8);
+}
+
+// Row-stride-aware versions.  The caller supplies the block stride so this remains valid if ggml changes padding.
+template<bool Q5>
+__device__ __forceinline__ float row_dot_k_q8_k_stride(const uint8_t* row, size_t block_stride,
+                                                       const block_q8_K* x, int nb, int lane, bool fma_mins) {
+    return row_dot_k_q8_k_cpu_avx2<Q5>(row, block_stride, x, nb, lane, fma_mins);
+}
+
+__device__ __forceinline__ float row_dot_q8_0_q8_0(const uint8_t* row, size_t row_stride,
+                                                   const block_q8_0* x, int nb, int lane) {
+    const int l = lane & 7;
+    float acc = 0.0f;
+    for (int kbx = 0; kbx < nb; ++kbx) {
+        const auto* w = (const block_q8_0*) (row + (size_t) kbx * row_stride);
+        const block_q8_0* a = x + kbx;
+        int32_t si = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            si += (int32_t) w->qs[4 * l + j] * (int32_t) a->qs[4 * l + j];
+        const float d = __fmul_rn(__half2float(w->d), __half2float(a->d));
+        acc = fmaf(d, (float) si, acc);
+    }
+    const unsigned mask = 0xffffffffu;
+    const float v = acc;
+    const float a0 = __shfl_sync(mask, v, 0, 8), a1 = __shfl_sync(mask, v, 1, 8);
+    const float a2 = __shfl_sync(mask, v, 2, 8), a3 = __shfl_sync(mask, v, 3, 8);
+    const float a4 = __shfl_sync(mask, v, 4, 8), a5 = __shfl_sync(mask, v, 5, 8);
+    const float a6 = __shfl_sync(mask, v, 6, 8), a7 = __shfl_sync(mask, v, 7, 8);
+    float result = 0.0f;
+    if (l == 0) {
+        const float r0 = __fadd_rn(a0, a4), r1 = __fadd_rn(a1, a5);
+        const float r2 = __fadd_rn(a2, a6), r3 = __fadd_rn(a3, a7);
+        result = __fadd_rn(__fadd_rn(r0, r2), __fadd_rn(r1, r3));
+    }
+    return __shfl_sync(mask, result, 0, 8);
 }
 
 }  // namespace

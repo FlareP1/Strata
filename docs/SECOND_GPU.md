@@ -80,9 +80,12 @@ To try 262K on 64 GB, choose Q2_0 or IQ2_XS instead and check that CUDA0 still
 has enough free VRAM after loading. Benchmark long prompts separately from
 short decode requests.
 
-The existing warning about the CUDA0 expert-cache GPU hit path still applies:
-its outputs diverge from cache-off runs. Treat performance as experimental
-until the generated tokens have been validated.
+GPU expert hits (on CUDA0 and here) use `--expert-math fast` by default:
+llama.cpp's CUDA arithmetic, which agrees with the CPU pool to rounding but not
+bit for bit, so greedy output can change with which experts are resident. Use
+`--expert-math exact` (K-quant files) when output must match a run with every
+expert on the CPU (`--disable-hit`) exactly; see "GPU expert math" in
+docs/DETAILS.md.
 
 ## Optional helper decode optimization
 

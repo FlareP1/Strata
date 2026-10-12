@@ -8,6 +8,7 @@
 #include "strata/platform/memory.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 
 #include <cuda_runtime.h>
@@ -498,8 +499,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     void (*submit2)(void*) = [](void* p) {
         Submit2& s = *(Submit2*) p;
         GpuPlanSink& S = *s.d->plan;
-        s.ok = s.d->gpu2->submit(s.d->layers, S.x1, s.n_tok, s.k, s.slots, s.starts, s.entries, s.n_groups, s.out,
-                                 S.gpu2_flag, S.ring, s.d->gpu2_err);
+        // the layer's gate/up activations as the second GPU's kernels take them: Q8_K rows under --expert-math exact
+        // on a K-quant layer, else q8_1
+        const auto& nf = strata::kernels::cpu::expert_layout().fmt[(size_t) s.d->layers];
+        const bool xk = strata::kernels::gpu_expert_act(nf.gu_act) == 15;
+        const uint8_t* xa = xk ? S.xk : S.x1;
+        const int64_t xs = xk ? S.xk_stride : (int64_t) (strata::kernels::cpu::H / 32) * 36;
+        s.ok = xa != nullptr && s.d->gpu2->submit(s.d->layers, xa, xs, s.n_tok, s.k, s.slots, s.starts, s.entries,
+                                                   s.n_groups, s.out, S.gpu2_flag, S.ring, s.d->gpu2_err);
         if (s.ok) S.gpu2_ring = S.ring;
     };
     if (n2g <= 0) submit2 = nullptr;

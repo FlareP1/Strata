@@ -594,6 +594,11 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
     target_include_directories(native_expert_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(native_expert_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact CUDA::cudart)
+    add_test(NAME native_expert_parity_k_quants COMMAND native_expert_parity --synthetic q4_K/q5_1 q5_K/q8_0)
+    # --expert-math exact's expf: the CPU pool's (strata_kernels_cpu) against the GPU's, over every float
+    add_executable(swiglu_expf_parity src/kernels/swiglu_expf_parity.cu)
+    target_link_libraries(swiglu_expf_parity PRIVATE strata_kernels_cpu CUDA::cudart)
+    add_test(NAME swiglu_expf_parity COMMAND swiglu_expf_parity)
     # The grouped native expert kernels against the ones they replaced, kept in the test: bitwise (synthetic experts).
     add_executable(expert_grouped_parity src/kernels/expert_grouped_parity.cu)
     target_include_directories(expert_grouped_parity PRIVATE third_party/ggml src/kernels/cuda)

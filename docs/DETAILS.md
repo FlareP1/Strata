@@ -1341,6 +1341,34 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 
 ---
 
+## GPU expert math (`--expert-math`)
+
+The experts the GPUs hold in VRAM and the ones the CPU computes in RAM are the same weights, but the two can round
+differently. `--expert-math` chooses how the GPUs compute theirs (native packs; the CPU always runs ggml's kernels):
+
+- **`fast` (default)**: llama.cpp's CUDA arithmetic (q8_1 activations, lane-parallel sums). A GPU expert agrees with
+  the CPU computing the same expert to rounding, not bit for bit, so greedy output can change with which experts happen
+  to be in VRAM.
+- **`exact`**: the GPUs compute an expert bit for bit as the CPU pool does: each layer's ggml activation formats (Q8_K,
+  Q8_0, Q8_1), the order in which ggml's x86 dot products sum, the one place where that order is the compiler's (Q5_K's
+  sum of the mins: one FMA from GCC or Clang, a product then a sum from MSVC, probed at start), and one `expf` in the
+  SwiGLU on both sides (`expf_contract`, the algorithm of glibc's: the C runtimes' differ, MSVC's at 193,922 of the
+  2^32 floats). A prompt's experts stay on the main GPU (llama.cpp's MMQ kernels round them differently on the second).
+  The output then does not depend on which experts are resident: it is the output of a run with every expert on the CPU
+  (`--disable-hit`, which also turns off the second GPU and the adaptive tiers). For regression tests and A/B
+  comparisons. Its kernels cover the K-quant files' formats (Q4_K / Q5_K gate/up, Q5_1 / Q8_0 down: UD-Q4_K_XL); the
+  engine refuses `exact` for others at start. The MTP draft layer's experts keep the fast kernels (drafts are verified).
+
+Measured with UD-Q4_K_XL on an RTX 3090 + RTX 5070 Ti, Ryzen 7 9700X (AVX-512; ggml's x86 dots for these formats have
+no AVX-512 branches), fixed text (`--spec-follow`, `--window-hashes`): two runs with the config's adaptive tiers
+on both GPUs and a run with every expert on the CPU wrote identical window hashes, 633 windows of thinking text and 108
+after a 16K-token prompt; `fast` parts from the CPU run at the first window. Generation about 84 against 108 tok/s on
+the thinking text, 88 against 122 after the 16K prompt. `native_expert_parity` compares every gate, up and down dot of
+the exact kernels with ggml's `vec_dot`, the hidden rows' bytes and the outputs; `swiglu_expf_parity` the SwiGLU over
+every float. The PR's measurements on an i5-14600K (AVX2): `bench/results/2026-10-04-expert-math/`.
+
+---
+
 ## Troubleshooting
 
 | Symptom | What to do |

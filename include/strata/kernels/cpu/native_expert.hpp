@@ -42,6 +42,16 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 /// From how many tokens native_gu_rows gives this gate/up type to a multi-token kernel (#152; ggml-cpu's per-token dot
 /// below that).  1: a token's rows are the same alone and in any group.
 int native_gu_mt_min(int gu_type);
+/// --expert-math exact: the SwiGLU of the formats the GPU's exact kernels cover (the K-quant gate/up rows) takes
+/// `expf_contract`, as those kernels do, instead of the C runtime's expf.  Set once, before any expert work.
+void set_native_exact_swiglu(bool on) noexcept;
+bool native_exact_swiglu() noexcept;
+/// silu(g) * u through `expf_contract`: the exact SwiGLU (swiglu_expf_parity checks it against the GPU's).
+float native_swiglu_exact(float g, float u) noexcept;
+/// How this build's ggml rounds ggml_vec_dot_q5_K_q8_K's `summs += dmin * total` (C, so the compiler decides): 1 one
+/// FMA, 0 a product then a sum, -1 neither.  Probed on two blocks whose quants are zero; --expert-math exact's GPU
+/// dots follow it (`set_exact_q5_K_fma`).
+int ggml_q5_K_mins_rounding();
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]) for rows r in [r0, r1), `nt` tokens.
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1);

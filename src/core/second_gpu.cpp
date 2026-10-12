@@ -62,7 +62,7 @@ bool SecondGpu::init(int device, int main_device, int64_t n_embd, int64_t n_ff, 
     n_ff_ = n_ff;
     cap_ = (int64_t) max_t * k;
     DeviceScope scope(dev_, main_);
-    const size_t xb = (size_t) max_t * (size_t) (n_embd / 32) * 36;   // q8_1 rows
+    const size_t xb = (size_t) max_t * (std::max)((size_t) (n_embd / 32) * 36, (size_t) (n_embd / 256) * 292);
     const size_t ob = (size_t) cap_ * (size_t) n_embd * sizeof(float);
     const size_t pb = PlanLayout(cap_).bytes;
     const unsigned pm = cudaHostAllocPortable | cudaHostAllocMapped;
@@ -137,14 +137,17 @@ bool SecondGpu::prefetch(int64_t layer, const int32_t* ids, const uint8_t* const
     return true;
 }
 
-bool SecondGpu::graph_for(int gu_type, int d_type, int groups, int part, bool prep, cudaGraphExec_t& exec,
+bool SecondGpu::graph_for(int gu_type, int d_type, int gu_act, int d_act, int groups, int part, bool prep,
+                          cudaGraphExec_t& exec,
                           std::string& err) {
     for (const auto& gr : graphs_)
-        if (gr.gu == gu_type && gr.d == d_type && gr.groups == groups && gr.part == part && gr.prep == prep) {
+        if (gr.gu == gu_type && gr.d == d_type && gr.gu_act == gu_act && gr.d_act == d_act &&
+            gr.groups == groups && gr.part == part && gr.prep == prep) {
             exec = gr.exec;
             return true;
         }
-    const strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(gu_type, d_type, n_embd_, n_ff_);
+    const strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(
+        gu_type, d_type, n_embd_, n_ff_, gu_act, d_act);
     const PlanLayout P(cap_);
     const auto* pi = (const int32_t*) d_plan_;
     const auto* p64 = (const unsigned long long*) (pi + P.ptr);
@@ -159,10 +162,12 @@ bool SecondGpu::graph_for(int gu_type, int d_type, int groups, int part, bool pr
             // read the group count from the plan and skip the groups past it
             strata::kernels::copy_i32_from_mapped((int32_t*) d_plan_, (const int32_t*) m_plan_, (int64_t) P.bytes / 4,
                                                   s_);
-            strata::kernels::copy_from_mapped((float*) d_xq_, (const float*) m_x_, max_t_ * (n_embd_ / 32) * 9, s_);
+            const int64_t act_bytes = L.gu_act == 15 ? (n_embd_ / 256) * 292 : (n_embd_ / 32) * 36;
+            strata::kernels::copy_from_mapped((float*) d_xq_, (const float*) m_x_, max_t_ * act_bytes / 4, s_);
         }
+        const int64_t xq_stride = L.gu_act == 15 ? (n_embd_ / 256) * 292 : (n_embd_ / 32) * 36;
         strata::kernels::native_expert_grouped(L, p64 + part * cap_, pi + P.starts[part], pi + part, pi + P.dst,
-                                               pi + P.tok, groups, cap_, d_xq_, d_scratch_, d_rows_, s_);
+                                               pi + P.tok, groups, cap_, d_xq_, xq_stride, d_scratch_, d_rows_, s_);
         strata::kernels::native_expert_rows_out(d_rows_, pi + part, pi + P.starts[part], pi + P.dst, n_embd_, cap_,
                                                 (float* const*) (p64 + 2 * cap_),
                                                 (uint32_t* const*) (p64 + 2 * cap_ + 1 + part), pi + 2, d_count_, s_);
@@ -181,11 +186,11 @@ bool SecondGpu::graph_for(int gu_type, int d_type, int groups, int part, bool pr
     cudaGraphDestroy(graph);
     cudaGraphUpload(exec, s_);
     cudaStreamSynchronize(s_);
-    graphs_.push_back({gu_type, d_type, groups, part, prep, exec});
+    graphs_.push_back({gu_type, d_type, gu_act, d_act, groups, part, prep, exec});
     return true;
 }
 
-bool SecondGpu::submit(int64_t layer, const uint8_t* x, int n_tok, int64_t k, const int32_t* slots,
+bool SecondGpu::submit(int64_t layer, const uint8_t* x, int64_t x_stride, int n_tok, int64_t k, const int32_t* slots,
                        const int32_t* starts, const int32_t* entries, int n_groups, float* out, uint32_t* flag,
                        uint32_t ring, std::string& err) {
     const int n = starts[n_groups];
@@ -222,12 +227,15 @@ bool SecondGpu::submit(int64_t layer, const uint8_t* x, int n_tok, int64_t k, co
     p64[2 * cap_] = (unsigned long long) out;
     p64[2 * cap_ + 1] = ng[1] == 0 ? (unsigned long long) flag : 0;   // the last launch raises it
     p64[2 * cap_ + 2] = ng[1] > 0 ? (unsigned long long) flag : 0;
-    std::memcpy(h_x_, x, (size_t) n_tok * (size_t) (n_embd_ / 32) * 36);
     const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) layer];
+    const int gu_act = strata::kernels::gpu_expert_act(f.gu_act), d_act = strata::kernels::gpu_expert_act(f.d_act);
+    const int64_t act_bytes = gu_act == 15 ? (n_embd_ / 256) * 292 : (n_embd_ / 32) * 36;
+    for (int t = 0; t < n_tok; ++t)
+        std::memcpy(h_x_ + (size_t) t * act_bytes, x + (size_t) t * x_stride, (size_t) act_bytes);
     DeviceScope scope(dev_, main_);
     cudaGraphExec_t own = nullptr, pre = nullptr;
-    if ((ng[0] > 0 && !graph_for(f.gu_type, f.d_type, bucket(ng[0]), 0, true, own, err)) ||
-        (ng[1] > 0 && !graph_for(f.gu_type, f.d_type, bucket(ng[1]), 1, ng[0] == 0, pre, err)))
+    if ((ng[0] > 0 && !graph_for(f.gu_type, f.d_type, gu_act, d_act, bucket(ng[0]), 0, true, own, err)) ||
+        (ng[1] > 0 && !graph_for(f.gu_type, f.d_type, gu_act, d_act, bucket(ng[1]), 1, ng[0] == 0, pre, err)))
         return false;
     if ((own != nullptr && cudaGraphLaunch(own, s_) != cudaSuccess) ||
         (pre != nullptr &&

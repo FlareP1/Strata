@@ -113,6 +113,7 @@ Verifier::~Verifier() {
                           sgjoin_})
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
+    if (xk_dev_) cudaFree(xk_dev_);
     if (stamps_) cudaFree(stamps_);
     void* hosts[] = {h_tok_, h_val_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_,
                      h_ymiss_, h_bad_,
@@ -323,6 +324,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
+    if (lay.native && strata::kernels::expert_math() == strata::kernels::ExpertMath::Exact &&
+        cudaMalloc((void**) &xk_dev_, (size_t) T * (size_t) (N / 256) * 292) != cudaSuccess) {
+        err = "verify: the exact hits' Q8_K rows";
+        return false;
+    }
     {
         const int32_t one = 1;
         if (cudaMemcpy(one_, &one, sizeof one, cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -909,13 +915,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         };
         float* hit_out = hit_out_ + (size_t) tb * K * N;
         const auto& lay = strata::kernels::cpu::expert_layout();
+        bool xk_ready = false;   // --expert-math exact: this group's Q8_K rows quantized for the hits
         auto grouped = [&](const Plan& p, const unsigned long long* gp, const int32_t* gs, const int32_t* gn) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
-                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-                native_expert_grouped(L, gp, gs, gn, p.dst, p.tok, cap, cap,
-                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
+                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff,
+                                                                  gpu_expert_act(f.gu_act), gpu_expert_act(f.d_act));
+                // --expert-math exact on a K-quant layer: the CPU's Q8_K rows, quantized here from the FFN input
+                // (quantize_q8_K is bitwise ggml's quantize_row_q8_K, as the router kernel's rows for the pool are)
+                const uint8_t* xa = nat_xq_ + (size_t) tb * (N / 32) * 36;
+                int64_t xs = (int64_t) (N / 32) * 36;
+                if (L.gu_act == 15) {
+                    xs = (int64_t) (N / 256) * 292;
+                    xa = xk_dev_ + (size_t) tb * (size_t) xs;
+                    if (!xk_ready) quantize_q8_K(mixed_ + (size_t) tb * N, xk_dev_ + (size_t) tb * (size_t) xs,
+                                                 (int64_t) n * N, cs);
+                    xk_ready = true;
+                }
+                native_expert_grouped(L, gp, gs, gn, p.dst, p.tok, cap, cap, xa, xs, hit_scratch_, hit_out, cs);
             } else {
                 moe_grouped_s2(gp, gs, gn, p.dst, p.tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);

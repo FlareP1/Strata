@@ -148,6 +148,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                 err = "mtp: experts.txt names formats the GPU expert kernels lack";
                 return false;
             }
+            // the fast kernels under either --expert-math: drafts are verified, and both runs of a comparison
+            // compute them here
             nat_ = strata::kernels::native_expert_layout(gu, dn, g.n_embd, g.n_ff);
             blob_ = nat_.bytes;
         }
@@ -466,7 +468,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         if (nat_.gu_type >= 0) {
             if (!xq1) quantize_q8_1_rows(mixed_, T, N, nat_xq_, cs);
             native_expert_grouped(nat_, grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K,
-                                  (int64_t) T * K, nat_xq_, hit_scratch_, parts_, cs);
+                                  (int64_t) T * K, nat_xq_, (int64_t) (N / 32) * 36, hit_scratch_, parts_, cs);
         } else {
             quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
             moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K,

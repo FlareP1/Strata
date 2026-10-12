@@ -818,13 +818,13 @@ LoadStats load_experts_gguf(const std::vector<std::string>& shards, const std::v
                 const uint64_t total = per[r] * (uint64_t) lay.n_expert;
                 const uint64_t chunk = per[r] * 16;           // 16 experts per read
                 buf.resize((size_t) chunk);
-                for (uint64_t done = 0; done < total; done += chunk) {
-                    const uint64_t n = std::min<uint64_t>(chunk, total - done);
-                    f.seekg((std::streamoff) (src + done));
+                for (uint64_t pos = 0; pos < total; pos += chunk) {
+                    const uint64_t n = std::min<uint64_t>(chunk, total - pos);
+                    f.seekg((std::streamoff) (src + pos));
                     f.read((char*) buf.data(), (std::streamsize) n);
                     if ((uint64_t) f.gcount() != n) { bad = true; return; }
                     for (uint64_t k = 0; k < n / per[r]; ++k) {
-                        const uint64_t e = done / per[r] + k;
+                        const uint64_t e = pos / per[r] + k;
                         std::memcpy(layer_base[(size_t) l] + e * blob + at[r], buf.data() + k * per[r], (size_t) per[r]);
                     }
                 }

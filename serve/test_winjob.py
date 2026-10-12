@@ -28,8 +28,9 @@ time.sleep(120)
 
 
 def running(pid: int) -> bool:
-    out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True).stdout
-    return str(pid) in out
+    # bytes: tasklist writes the console's code page, which a localized Windows does not share with UTF-8
+    out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True).stdout
+    return str(pid).encode() in out
 
 
 @unittest.skipUnless(os.name == "nt", "job objects are Windows-only")

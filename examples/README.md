@@ -14,7 +14,8 @@ experimental speed projection (control vectors), upstream's conversation cache (
 prompt cache here keeps replaced conversations in RAM), session files, parallel requests (`--batch`), token biases,
 prompt lookup chained after the drafts (`--lookup-chain`), the learned expert profile (`--expert-profile-save`), rope
 scaling past the trained 262K context (`--rope-scaling`), upstream's routing approximations (the route tail skip,
-on by default in upstream's CUDA server), and the AMD, Intel, Turing, Volta and Pascal builds. A server config with
+on by default in upstream's CUDA server), the adaptive tier's overlapped copies (`STRATA_ADAPT_OVERLAP`), the
+engine's own watchdog and stall report, the PLE read probe, and the AMD, Intel, Turing, Volta and Pascal builds. A server config with
 `parallel`, `vram_elastic` or `expert_profile_save` passes the engine a flag it refuses; with `slot_save_path`, a
 save request ends the engine.
 

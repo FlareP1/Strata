@@ -8,7 +8,7 @@
 # written against sm_120 (RTX 5000 / Blackwell) and silently building for an older arch would produce a
 # binary that runs and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 0.1.43 LANGUAGES CXX)
+project(strata VERSION 0.1.43.1 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 
 # The prebuilt release (setup.py downloads it, so users need no compiler): ggml's CPU backend for any AVX2 CPU

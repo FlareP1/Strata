@@ -996,6 +996,9 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        score = sampling.get("score")                    # POST /v1/choose: the engine's `LP` line for these ids
+        if score:
+            keys += " score=" + ":".join(str(int(t)) for t in score)
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -1637,6 +1640,7 @@ class StrataEngine:
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
+        scores = None                                    # score=: the `LP` line, {id: log-probability}
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -1710,8 +1714,12 @@ class StrataEngine:
                         read_to = self.reused = int(line.split()[1])
                     except (IndexError, ValueError):
                         pass
+                elif line.split()[:1] == ["LP"]:          # score=: before the first token (alone: the row was unread)
+                    scores = {int(k): float(v) for k, v in (f.split(":") for f in line.split()[1:])}
                 elif line.startswith("DONE"):
                     self._parse_done(line)
+                    if scores is not None:
+                        self.last["scores"] = scores
                     done = True
                     if self.last.get("finish") == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
@@ -3629,6 +3637,53 @@ class Service:
             return {}
         return {"tokens": n}
 
+    def choose(self, req: dict, cancel: threading.Event) -> dict:
+        """POST /v1/choose: one decision in one forward pass, nothing generated.  The chat (and its tools, if any) is
+        rendered as /v1/chat/completions renders it with thinking off, so it shares a conversation's cached prompt;
+        `answer_prefix` follows the assistant header, and the engine reads each option's log-probability there from the
+        head's logits (classify, route, pick a letter).  -> "probs" renormalized over the options, "logprobs", "mass"
+        (the options' share of everything the model could have said there: low means it wanted to say something
+        else), "choice", "confidence", "prompt_tokens", "reused", "seconds"."""
+        options = req.get("options")
+        if not isinstance(options, list) or not options or not all(isinstance(o, str) and o for o in options):
+            raise ValueError("choose: `options` must be a non-empty list of strings")
+        if len(set(options)) != len(options):
+            raise ValueError("choose: `options` repeat")
+        cand = []
+        for o in options:
+            t = self.tok.encode(o, parse_special=False)
+            if len(t) != 1:
+                raise ValueError(f"choose: option {o!r} is {len(t)} tokens; options must be single tokens (A, B, ...)")
+            cand.append(int(t[0]))
+        prefix = req.get("answer_prefix") or ""
+        if not isinstance(prefix, str):
+            raise ValueError("choose: `answer_prefix` must be a string")
+        messages, tools, _ = openai_to_messages(req)
+        self.load()
+        ids, _, _ = self.prepare(messages, tools, {"enable_thinking": False}, 1)
+        ids = ids + self.tok.encode(prefix, parse_special=False)
+        if len(ids) + 1 + CTX_SLACK > self.engine.max_context:
+            self.drop_embeddings()
+            raise ValueError(f"choose: the prompt ({len(ids)} tokens) does not fit the context "
+                             f"({self.engine.max_context})")
+        t0, done = time.time(), {}
+        for kind, value in self.run(ids, False, None, 1, {"score": cand}, cancel):
+            if kind == "done":
+                done = value
+        lp = done.get("scores") or {}
+        if done.get("finish") == "cancel" or any(c not in lp for c in cand):
+            raise ValueError("choose: the engine returned no log-probabilities for the options"
+                             + (" (cancelled)" if done.get("finish") == "cancel" else ""))
+        logprobs = {o: lp[c] for o, c in zip(options, cand)}
+        top = max(logprobs.values())
+        ex = {o: math.exp(v - top) for o, v in logprobs.items()}
+        total = sum(ex.values())
+        probs = {o: ex[o] / total for o in options}
+        choice = max(probs, key=probs.get)
+        return {"probs": probs, "logprobs": logprobs, "mass": sum(math.exp(v) for v in logprobs.values()),
+                "choice": choice, "confidence": probs[choice], "prompt_tokens": len(ids),
+                "reused": done.get("reused"), "seconds": round(time.time() - t0, 3)}
+
     def drop_embeddings(self) -> None:
         """Delete the combined image file prepare() wrote when no run() took it over (a run deletes its own as it
         ends): a request can end before its answer starts - its client gone, anything raised after prepare() - and
@@ -3691,7 +3746,8 @@ class Service:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
-        if defaults:                   # the request's own fields win (explicit 0 stays greedy)
+        if defaults and not (sampling or {}).get("score"):   # the request's own fields win (explicit 0 stays greedy);
+            #                                                  a scored one (/v1/choose) reads the model's own logits
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
@@ -4131,6 +4187,8 @@ class Service:
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                 "timings": timings, "reasoning_tokens": thinking_n,
                 "reasoning_recoveries": recovery_count}
+        if segments and "scores" in segments[-1]:
+            done["scores"] = segments[-1]["scores"]
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
         yield "done", done
@@ -5083,7 +5141,7 @@ def make_handler(svc: Service):
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
-                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/choose"):
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
@@ -5102,6 +5160,8 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
+                elif path == "/v1/choose":
+                    self._choose(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
@@ -5351,6 +5411,12 @@ def make_handler(svc: Service):
                     yield item
             finally:
                 items.close()
+
+        def _choose(self, req):
+            self._no_local_images(openai_to_messages(req)[0])
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            self._json(200, svc.choose(req, cancel))
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")

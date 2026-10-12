@@ -123,11 +123,15 @@ public:
     const float* final_R_host() const { return h_rows_; }
     /// The head's logits of the last window's first `T` tokens, T * n_vocab floats, copied to host memory `out`.
     bool copy_logits(int T, float* out, std::string& err) const;
+    /// Log-probabilities (a log-softmax over the whole vocabulary) of `n` candidate token ids after the last window's
+    /// first token: a choice among a few options read off one forward pass, without generating.  The head's logits
+    /// before any sampling or penalty; a split head needs `set_logits_wanted`, as copy_logits.
+    bool candidate_logprobs(const int32_t* cand, int n, float* out, std::string& err) const;
     /// The head's rows [split, n_vocab) on another GPU (`head` then holds rows [0, split)): the window hands the head's
     /// input over, and `run` keeps each token's larger pick.  Set before `init`.
     void set_split_head(SplitHead* sh) { shead_ = sh; }
-    /// Whole logits rows after every window (copy_logits, --window-logits): with a split head the second GPU's part
-    /// then copies its rows back.  Set before `init`.
+    /// Whole logits rows after every window from the next one on (copy_logits, --window-logits, score=): with a split
+    /// head the second GPU's part then copies its rows back.
     void set_logits_wanted(bool on) { logits_wanted_ = on; }
 
     /// Where the pool publishes each layer's PCIe share of the misses; give it to the dispatch

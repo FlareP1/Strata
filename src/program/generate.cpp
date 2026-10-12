@@ -2683,7 +2683,8 @@ int main(int argc, char** argv) {
             char* endp = nullptr;
             const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
             // optional keys between max_new and the ids: temperature=F, top_p=F, top_k=N, min_p=F, penalty_last_n=N,
-            // penalty_repeat=F, penalty_freq=F, penalty_present=F, seed=N, spec_min_p=F (this request's draft floor);
+            // penalty_repeat=F, penalty_freq=F, penalty_present=F, seed=N, spec_min_p=F (this request's draft floor),
+            // score=ID:ID:... (an `LP` line with those ids' log-probabilities after the prompt, before the first `T`);
             // unknown keys (cvec, pcie_frac) are skipped.  Absent keys: greedy, no penalties.
             float req_temperature = 0.0f, req_top_p = 1.0f, req_min_p = 0.0f;
             int req_top_k = 20;   // the sampled path keeps 1..64 candidates
@@ -2691,6 +2692,7 @@ int main(int argc, char** argv) {
             float req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
             double req_spec_min_p = o.spec_min_p;
+            std::vector<int32_t> req_score;   // score=ID:ID:...: see the first window
             if (endp != nullptr) {
                 for (;;) {
                     while (*endp == ' ') ++endp;
@@ -2713,6 +2715,15 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(v, nullptr, 10);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "score") {
+                        for (const char* q = v; *q != '\0';) {
+                            char* qe = nullptr;
+                            const long id = std::strtol(q, &qe, 10);
+                            if (qe == q) break;
+                            req_score.push_back((int32_t) id);
+                            q = (*qe == ':') ? qe + 1 : qe;
+                        }
+                    }
                 }
             }
             std::string emb_path;
@@ -3019,6 +3030,7 @@ int main(int argc, char** argv) {
             mtp.on_draft = [&](int j, int32_t tok, float prob) {   // the drafts the next window will verify
                 if (lk == 0 && prob >= (float) req_spec_min_p) ver.ple_ahead(j + 1, tok);
             };
+            ver.set_logits_wanted(!req_score.empty());   // score=: a split head's first row whole
             while (poison_at < 0 && produced_n < max_new) {
                 if (stop_req.load()) { finish = "cancel"; break; }   // the client went away
                 int T = S;
@@ -3067,6 +3079,20 @@ int main(int argc, char** argv) {
                     finish = "nonfinite";
                     break;
                 }
+                // score=: the first window's row is the distribution right after the prompt; the candidates'
+                // log-probabilities go out as one `LP id:logprob ...` line before the first `T` (an `LP` alone when
+                // the row cannot be read: the request fails, the engine goes on)
+                if (first_window && !req_score.empty()) {
+                    std::vector<float> lp(req_score.size());
+                    std::printf("LP");
+                    if (ver.candidate_logprobs(req_score.data(), (int) req_score.size(), lp.data(), err))
+                        for (size_t i = 0; i < req_score.size(); ++i)
+                            std::printf(" %d:%.6g", (int) req_score[i], lp[i]);
+                    else
+                        std::fprintf(stderr, "strata serve: score=: %s\n", err.c_str());
+                    std::printf("\n");
+                    ver.set_logits_wanted(false);
+                }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (!ver.commit(a + 1, err, false)) {   // beside the draft
@@ -3114,6 +3140,7 @@ int main(int argc, char** argv) {
                 p += a + 1;
             }
             mtp.on_draft = nullptr;
+            ver.set_logits_wanted(false);
             if (poison_at >= 0) {
                 std::fprintf(stderr, "strata serve: non-finite logits at position %lld: the request ends, and the next "
                                      "one reads its prompt from the start\n", (long long) poison_at);

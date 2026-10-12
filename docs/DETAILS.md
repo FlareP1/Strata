@@ -519,6 +519,7 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
 | OpenAI Responses (stream and non-stream, tools; stateless, [below](#the-responses-api-and-codex-cli)) | `POST /v1/responses` |
+| A choice among single-token options in one forward pass, nothing generated ([below](#one-pass-choices)) | `POST /v1/choose` |
 | Model list / health | `GET /v1/models`, `GET /models`, `GET /health` |
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
 | What the model is doing right now | `GET /status`, `GET /slots` (busy or idle, with `n_prompt_tokens`; one entry per slot with `--batch`) |
@@ -1429,6 +1430,28 @@ and **404** for an unknown model. Existing `/load` and `/unload` behavior is pre
 Unloading and shutdown close the native engine's stdin after sending `QUIT`, allowing Windows' detached
 stdin reader to see EOF. Cleanup waits for process exit before releasing handles; if forced shutdown still
 times out, the server keeps ownership and reports an error rather than claiming the model was unloaded.
+
+### One-pass choices
+
+`POST /v1/choose` answers a multiple-choice question without generating: the chat (and its `tools`, if any) is
+rendered as `/v1/chat/completions` renders it with thinking off, so it shares a conversation's cached prompt;
+`answer_prefix` (optional) follows the assistant header, and the engine reads the probability of each option's token
+there from the head's logits, before any sampling setting. Options must be single tokens (letters are; after a
+prefix ending in a word, `" A"` is one token and `"A"` another). It suits classifiers and routers in agent loops: a
+decision costs one prompt read, and the probabilities double as a confidence to act on or to fall back from.
+
+```bash
+curl http://127.0.0.1:8080/v1/choose -H "Content-Type: application/json" -d '{
+  "messages": [{"role": "user", "content": "Is Paris the capital of France? A) yes B) no. Answer with the letter."}],
+  "options": ["A", "B"] }'
+# {"probs": {"A": 0.99988, "B": 0.00012}, "logprobs": {"A": -0.0009, "B": -9.005}, "mass": 0.9992, "choice": "A",
+#  "confidence": 0.99988, "prompt_tokens": 31, "reused": 0, "seconds": 0.71}
+```
+
+`probs` are renormalized over the options; `mass` is the probability the options got out of everything the model could
+have said there (low: it wanted to answer something else, and the choice means little). Through the engine's own
+protocol the same is a `score=ID:ID:...` key on `GEN`, which prints `LP id:logprob ...` before the first `T` (with the
+output head split across two GPUs, that window joins the whole rows).
 
 ### JSON response formats
 

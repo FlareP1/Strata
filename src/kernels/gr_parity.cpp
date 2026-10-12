@@ -368,7 +368,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
     fused_gr_read_multi(args.data(), T, d_xn, stream);
     check(cudaStreamSynchronize(stream), "multi max-T sync");
     const Snapshot multi = snapshot();
-    for (int t = 0; t < T; ++t) fused_gr_read(args[t], stream);
+    for (int t = 0; t < T; ++t) fused_gr_read_multi(&args[t], 1, d_xn, stream);
     check(cudaStreamSynchronize(stream), "single reference sync");
     const Snapshot single = snapshot();
     int bad = 0;
@@ -405,7 +405,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
         std::printf("  fused GR graph replay ignored changed inputs\n");
         ++bad;
     }
-    for (int t = 0; t < T; ++t) fused_gr_read(args[t], stream);
+    for (int t = 0; t < T; ++t) fused_gr_read_multi(&args[t], 1, d_xn, stream);
     check(cudaStreamSynchronize(stream), "changed single reference sync");
     if (!same(replay, snapshot())) {
         std::printf("  fused GR changed graph replay differs from single-token calls\n");

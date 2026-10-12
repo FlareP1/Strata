@@ -143,8 +143,9 @@ StressStats stress_run(cpu::ExpertPool& pool, std::mt19937& rng, int iters) {
 }
 
 #if defined(STRATA_NATIVE_EXPERTS)
-/// `run_split_multi_native`: one layer's experts in GGUF formats, split by rows, several tokens per expert.
-StressStats stress_native(cpu::ExpertPool& pool, std::mt19937& rng, int iters, ggml_type gu, ggml_type dn,
+/// `run_split_multi_native` (or `run_fused_native`: both halves in one phase): one layer's experts in GGUF formats,
+/// split by rows, several tokens per expert.
+StressStats stress_native(cpu::ExpertPool& pool, std::mt19937& rng, int iters, ggml_type gu, ggml_type dn, bool fused,
                           std::string& err) {
     StressStats s;
     cpu::NativeFmt f;
@@ -192,7 +193,8 @@ StressStats stress_native(cpu::ExpertPool& pool, std::mt19937& rng, int iters, g
             }
         }
         const double t0 = now_ms();
-        pool.run_split_multi_native(f, jobs.data(), n);
+        if (fused) pool.run_fused_native(f, jobs.data(), n);
+        else pool.run_split_multi_native(f, jobs.data(), n);
         const double ms = now_ms() - t0;
         if (tiny) (slept ? s.ms_after_sleep : s.ms_spinning).push_back(ms);
         // the same kernels and token groups on this thread, every row at once
@@ -233,14 +235,16 @@ int stress(int iters) {
         std::printf("  run(): SKIPPED, the CPU lacks %s\n", cpu::cpu_features().reason());
     }
 #if defined(STRATA_NATIVE_EXPERTS)
-    const struct { ggml_type gu, dn; const char* name; } fmts[] = {
-        {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, "native rows, Q4_K / Q5_1"},             // ggml-cpu's dot products
-        {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, "native rows, IQ3_XXS / IQ4_NL"},   // + the AVX-512 i-quant kernel
+    const struct { ggml_type gu, dn; bool fused; const char* name; } fmts[] = {
+        {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, false, "native rows, Q4_K / Q5_1"},             // ggml-cpu's dot products
+        {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, false, "native rows, IQ3_XXS / IQ4_NL"},   // + the AVX-512 i-quant kernel
+        {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, true, "fused native phase, Q4_K / Q5_1"},
+        {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, true, "fused native phase, IQ3_XXS / IQ4_NL"},
     };
     for (const auto& ft : fmts) {
         std::string err;
         const uint32_t z0 = pool.sleeps();
-        const StressStats s = stress_native(pool, rng, iters, ft.gu, ft.dn, err);
+        const StressStats s = stress_native(pool, rng, iters, ft.gu, ft.dn, ft.fused, err);
         if (!err.empty()) {
             std::printf("  %s: %s\n", ft.name, err.c_str());
             ++bad;

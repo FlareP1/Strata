@@ -27,6 +27,7 @@
     "200192",
     "--kv",
     "k8v4",
+    "--kv-grow",
     "--pcie-mode",
     "kernel",
     "--pcie-frac",

@@ -30,9 +30,11 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <tuple>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -92,6 +94,19 @@ bool native_of(const WeightRef* w, const std::string& name, std::string& err) {
 }
 
 }  // namespace
+
+// The verify window's dense projections at 7-8 tokens through llama.cpp's MMQ (int8 tensor cores, the activations in
+// its q8_1 layout) where they are faster than the dp4a kernels (scratch/aq_bench.cu ai): the large shapes (n_embd in and
+// out or more) of every type but Q8_0 (even), Q6_K's down-sized output projection from 8 tokens.
+namespace {
+constexpr int kMmqMinT = 7, kQ8_0 = 8, kQ6_K = 14;
+bool mmq_takes(int type, int64_t n, int64_t n_in, int64_t n_out, int64_t n_embd) {
+    return n >= kMmqMinT && n_in >= n_embd && n_out >= n_embd && type != kQ8_0 &&
+           strata::prefill::mmq::supported(type) && (n >= 8 || type != kQ6_K || n_out >= n_in);
+}
+}  // namespace
+
+Verifier::Verifier() = default;
 
 Verifier::~Verifier() {
     if (cs_) cudaStreamSynchronize(cs_);
@@ -275,6 +290,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         grs_ = (float*) b.take<uint8_t>(strata::kernels::fused_gr_scratch_bytes());
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
         xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, (int) T));
+        for (auto& x : xqm_) x = b.take<uint8_t>(strata::prefill::mmq::q8_bytes((int64_t) T, max_in));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
         z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
@@ -599,8 +615,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         auto mm = [&](int type, const void* w, float* y, int64_t n_in, int64_t n_out, cudaStream_t ps) {
             native_mmvq_il(type, w, xq_, xil_, y, (int) n_in, (int) n_out, n, ps);
         };
-        auto proj = [&](const WeightRef* w, float* y, int64_t n_in, int64_t n_out, cudaStream_t ps) {
-            mm(w->native_type, w->native_data, y, n_in, n_out, ps);
+        auto proj = [&](const WeightRef* w, const float* x, float* y, int64_t n_in, int64_t n_out, cudaStream_t ps) {
+            if (mmq_takes(w->native_type, n, n_in, n_out, N)) {   // x from FP32 into MMQ's q8_1 layout
+                const int s = ps == shs_ ? 1 : 0;
+                strata::prefill::mmq::quantize(x, nullptr, xqm_[s], w->native_type, n_in, n_in, n, ps);
+                mmq_[s]->run_dense(w->native_data, w->native_type, n_out, n_in, xqm_[s], n, y, n_out, ps);
+            } else {
+                mm(w->native_type, w->native_data, y, n_in, n_out, ps);
+            }
         };
         if (l == 1 && ple_on) {
             if (grp == 0 && ple_beside) {
@@ -681,8 +703,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!mark(side_, bjoin_)) return false;
                 quant(xm, N);
                 if (!fork(shs_, pfork_)) return false;
-                proj(wqkv, qkv + (size_t) tb * C, N, C, cs);
-                proj(wg, z_ + (size_t) tb * ZV, N, ZV, shs_);
+                proj(wqkv, xm, qkv + (size_t) tb * C, N, C, cs);
+                proj(wg, xm, z_ + (size_t) tb * ZV, N, ZV, shs_);
                 if (!mark(shs_, pjoin_)) return false;
                 // a one-token window keeps its token: it advances the conv history and the state itself (commit)
                 gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
@@ -692,7 +714,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
                                     (int) HV, te, T == 1 ? one_ : nullptr, cs, tb);
                 quant(y_ + (size_t) tb * ZV, ZV);
-                proj(wout, bo_ + tb * N, ZV, N, cs);
+                proj(wout, y_ + (size_t) tb * ZV, bo_ + tb * N, ZV, N, cs);
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -742,11 +764,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     err = "verify: a branch could not fork";
                     return false;
                 }
-                proj(wk, kcur_ + tb * NKV * HD, N, NKV * HD, kst_);
+                proj(wk, xm, kcur_ + tb * NKV * HD, N, NKV * HD, kst_);
                 norm_rope(kcur_ + tb * NKV * HD, (int) HD, kcur_ + tb * NKV * HD, wkn, (int) NKV, (int) HD, kst_);
                 if (!mark(kst_, kjoin_)) return false;
-                proj(wv, vcur_ + tb * NKV * HD, N, NKV * HD, cs);
-                proj(wq, qfull_ + tb * NH * 2 * HD, N, NH * 2 * HD, shs_);
+                proj(wv, xm, vcur_ + tb * NKV * HD, N, NKV * HD, cs);
+                proj(wq, xm, qfull_ + tb * NH * 2 * HD, N, NH * 2 * HD, shs_);
                 // the query halves of every token's heads (rows of 2 * HD: query, then gate)
                 norm_rope(qfull_ + tb * NH * 2 * HD, (int) (2 * HD), qcur_ + tb * NH * HD, wqn, (int) NH, (int) HD,
                           shs_);
@@ -759,7 +781,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn32_ + tb * NH * HD,
                                       n, cs, qfull_ + tb * NH * 2 * HD);
                 quant(attn32_ + tb * NH * HD, NH * HD);
-                proj(wo, bo_ + tb * N, NH * HD, N, cs);
+                proj(wo, attn32_ + tb * NH * HD, bo_ + tb * N, NH * HD, N, cs);
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
@@ -1061,6 +1083,48 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     return true;
 }
 
+bool Verifier::warm_mmq(std::string& err) {
+    // every shape a window of 7-8 tokens multiplies through MMQ, once uncaptured on each context: its stream-k scratch
+    // comes from a pool that may not allocate inside a capture
+    namespace mmq = strata::prefill::mmq;
+    const ModelGeometry& g = *g_;
+    const int64_t N = g.n_embd, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
+    const int64_t QD = (int64_t) g.n_head * 2 * g.head_dim, OD = (int64_t) g.n_head * g.head_dim;
+    for (int s = 0; s < 2; ++s)
+        if (!mmq_[s]) mmq_[s] = std::make_unique<mmq::Context>();
+    std::vector<std::tuple<int, const void*, int64_t, int64_t>> shapes;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        const LayerView v(*wt_, l);
+        const char* names[3] = {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight"};
+        const char* qnames[2] = {"attn_q.weight", "attn_output.weight"};
+        const bool qsa = is_qsa_layer(g, l);
+        for (int i = 0; i < (qsa ? 2 : 3); ++i) {
+            const WeightRef* w = v.get(qsa ? qnames[i] : names[i]);
+            if (w == nullptr || w->native_data == nullptr) continue;
+            const int64_t n_in = qsa ? (i == 0 ? N : OD) : (i == 2 ? ZV : N);
+            const int64_t n_out = qsa ? (i == 0 ? QD : N) : (i == 0 ? C : i == 1 ? ZV : N);
+            bool seen = false;
+            for (const auto& [t, d, a, o] : shapes) seen = seen || (t == w->native_type && a == n_in && o == n_out);
+            if (!seen) shapes.emplace_back(w->native_type, w->native_data, n_in, n_out);
+        }
+    }
+    for (int s = 0; s < 2; ++s) {
+        cudaStream_t ps = s ? shs_ : cs_;
+        for (const auto& [t, d, n_in, n_out] : shapes)
+            for (int64_t n = kMmqMinT; n <= max_t_; ++n) {
+                if (!mmq_takes(t, n, n_in, n_out, N)) continue;
+                mmq::quantize(y_, nullptr, xqm_[s], t, n_in, n_in, n, ps);
+                mmq_[s]->run_dense(d, t, n_out, n_in, xqm_[s], n, qfull_, n_out, ps);
+            }
+        if (cudaStreamSynchronize(ps) != cudaSuccess) {
+            err = std::string("verify: MMQ warm-up: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+    }
+    mmq_warm_ = true;
+    return true;
+}
+
 bool Verifier::capture(int T, std::string& err) {
     if (exec_[T] != nullptr) return true;
     if (profile_ && stamps_ == nullptr &&
@@ -1069,6 +1133,7 @@ bool Verifier::capture(int T, std::string& err) {
         err = "verify: the profile's stamp buffer does not fit";
         return false;
     }
+    if (T >= kMmqMinT && !mmq_warm_ && !warm_mmq(err)) return false;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin capture failed";
         return false;

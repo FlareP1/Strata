@@ -634,6 +634,7 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     target_link_libraries(strata_mmq PUBLIC ggml-base CUDA::cudart)
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
+    target_link_libraries(strata_engine PUBLIC strata_mmq)   # the verify window's projections at 7-8 tokens
     add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
     target_include_directories(native_expert_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(native_expert_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact CUDA::cudart)

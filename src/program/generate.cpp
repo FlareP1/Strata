@@ -753,6 +753,36 @@ int argmax(const std::vector<float>& v) {
     return best;
 }
 
+// The CUDA stack reservation: a context keeps cudaLimitStackSize bytes (1 KiB by default) for every thread its SMs
+// can hold, 122 MiB on the 3090 and 104 MiB on the 5070 Ti.  The engine's kernels need at most kStackBytes (cuobjdump
+// -res-usage of the build: llama.cpp's MMQ tiles, 104 bytes on sm_120 and 88 on sm_86, past a tuning-only instance;
+// from a limit of 0, requests of both models raised it to 64 on either GPU, cuBLAS's GEMMs included), so each GPU gets
+// that before the caches size themselves from the free VRAM.  Not 0: a kernel with a larger frame than the limit makes
+// the driver grow the reservation at its first launch, mid-request (a resize can wait for the device's queued work).
+constexpr size_t kStackBytes = 104;
+static size_t g_stack_set[64] = {};   // the limit each GPU took (the driver rounds it up to 16 bytes)
+static bool set_stack_limit(int dev, int main_dev) {
+    cudaSetDevice(dev);
+    const bool ok = cudaDeviceSetLimit(cudaLimitStackSize, kStackBytes) == cudaSuccess &&
+                    (dev < 0 || dev >= 64 || cudaDeviceGetLimit(&g_stack_set[dev], cudaLimitStackSize) == cudaSuccess);
+    cudaSetDevice(main_dev);
+    return ok;
+}
+// Says once a GPU's limit was grown by a kernel's frame: raise kStackBytes past that kernel's (cuobjdump -res-usage).
+static void check_stack_limit(int dev, int main_dev) {
+    static bool warned[64] = {};
+    cudaSetDevice(dev);
+    size_t now = 0;
+    if (dev >= 0 && dev < 64 && cudaDeviceGetLimit(&now, cudaLimitStackSize) == cudaSuccess && now > g_stack_set[dev] &&
+        !warned[dev]) {
+        warned[dev] = true;
+        std::fprintf(stderr, "strata generate: warning: a kernel grew GPU %d's CUDA stack limit from %zu to %zu "
+                             "bytes a thread (the driver resizes it at that kernel's first launch)\n", dev,
+                     g_stack_set[dev], now);
+    }
+    cudaSetDevice(main_dev);
+}
+
 // Uploads the expert residency table. Kernels on non-blocking streams read it, which do not wait for the legacy
 // stream this copy runs on, and a copy from pageable memory can return before its DMA has landed: so it waits for it.
 static cudaError_t res_put(int32_t* dst, const std::vector<int32_t>& res) {
@@ -1106,6 +1136,10 @@ int main(int argc, char** argv) {
     }
     if (o.second_gpu >= 0 && (o.second_gpu == o.main_gpu || o.second_gpu >= n_dev)) {
         std::fprintf(stderr, "strata generate: --second-gpu %d is not another visible CUDA device\n", o.second_gpu);
+        return 2;
+    }
+    if (!set_stack_limit(o.main_gpu, o.main_gpu)) {   // the second GPU's before its tier sizes itself
+        std::fprintf(stderr, "strata generate: cannot set the CUDA stack limit\n");
         return 2;
     }
     strata::core::qsa_set_kv_format(o.kv == "int8"   ? strata::core::KvFormat::Int8
@@ -2585,6 +2619,12 @@ int main(int argc, char** argv) {
         for (int64_t l = 0; l < g.n_layers; ++l) min_blob = std::min<uint64_t>(min_blob, lay0.blob_bytes(l));
         const uint64_t pf_bytes = (uint64_t) (std::max(0.0, o.second_gpu_prefetch_mb) * 1048576.0);
         drive.d.gpu2_prefetch_bytes = pf_bytes;
+        // its context made here (or by the head's rows): one made at startup took the RAM the pinned arena gets,
+        // and the CPU pool read IQ3_S's experts 5-10% slower
+        if (!set_stack_limit(o.second_gpu, main_dev)) {
+            std::fprintf(stderr, "strata generate: cannot set the second GPU's CUDA stack limit\n");
+            return 2;
+        }
         bool ok = gpu2.init(o.second_gpu, main_dev, g.n_embd, g.n_ff, o.max_window(), ss.k, err) &&
                   gpu2.init_prefetch((int) std::min<uint64_t>(pf_bytes / min_blob, 64), lay0.max_blob, err);
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -3866,6 +3906,8 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * fresh / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0);
             if (pcache.enabled()) std::fprintf(stderr, "strata serve: prompt cache: %s\n", pcache.summary().c_str());
+            check_stack_limit(o.main_gpu, o.main_gpu);
+            if (o.second_gpu >= 0) check_stack_limit(o.second_gpu, o.main_gpu);
         }
         return 0;
     }
@@ -4664,6 +4706,8 @@ int main(int argc, char** argv) {
     }
 
     if (dump != nullptr) std::printf("%-24s %s\n", "logits dumped", o.dump_logits.c_str());
+    check_stack_limit(o.main_gpu, o.main_gpu);
+    if (o.second_gpu >= 0) check_stack_limit(o.second_gpu, o.main_gpu);
 
     strata::core::session_graphs_free(gr);
     strata::core::doorbell_free(db);

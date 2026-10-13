@@ -19,6 +19,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <thread>
@@ -812,7 +814,100 @@ LoadStats load_experts_gguf(const std::vector<std::string>& shards, const std::v
             if (fd >= 0) ::close(fd);
     };
 #else
-    auto worker = [&]() {
+    // the file cache holds the experts (a warm restart): buffered reads; else unbuffered ones, without the copy through
+    // the cache (a partly cached file read buffered ran at 2.8 GiB/s, unbuffered at 3.5).  32 timed random 64 KiB reads
+    // of the expert tensors decide: all but one from the cache (~30 us; the drive ~500).
+    bool buffered = true;
+    {
+        std::mt19937_64 rng(12345);
+        std::vector<double> us;
+        std::vector<char> probe(64u << 10);
+        for (int i = 0; i < 32; ++i) {
+            const int64_t l = (int64_t) (rng() % (uint64_t) lay.n_layers);
+            const int r = (int) (rng() % 3);
+            const auto& fm = lay.fmt[(size_t) l];
+            const uint64_t per = r < 2 ? fm.up_off : lay.bytes[(size_t) l] - fm.down_off;
+            const uint64_t span = per * (uint64_t) lay.n_expert;
+            const GgufSpan& sp = spans[(size_t) (3 * l + r)];
+            const uint64_t at = sp.offset + (span > probe.size() ? rng() % (span - probe.size()) : 0);
+            std::ifstream f(shards[sp.shard], std::ios::binary);
+            const auto t0 = std::chrono::steady_clock::now();
+            f.seekg((std::streamoff) at);
+            f.read(probe.data(), (std::streamsize) probe.size());
+            us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+        }
+        std::sort(us.begin(), us.end());
+        const int cached = (int) (std::lower_bound(us.begin(), us.end(), 100.0) - us.begin());
+        buffered = cached >= (int) us.size() - 1;
+        const char* v = std::getenv("STRATA_UNBUFFERED_LOAD");   // 1 / 0 forces either, as upstream's
+        if (v != nullptr && v[0] != '\0') buffered = v[0] == '0';
+        std::fprintf(stderr, "strata: the expert arena read %s (%d of %d probe reads cached, median %.0f us)\n",
+                     buffered ? "through the file cache" : "unbuffered", cached, (int) us.size(), us[us.size() / 2]);
+    }
+    // a role tensor's runs of 16 experts read unbuffered (no copy through the file cache) into a sector-aligned
+    // buffer, the window around them aligned to 4 KiB, then scattered into the blobs
+    constexpr uint64_t SECTOR = 4096;
+    auto unbuffered_worker = [&]() {
+        std::vector<HANDLE> files(shards.size(), INVALID_HANDLE_VALUE);
+        uint8_t* buf = nullptr;
+        uint64_t cap = 0;
+        for (;;) {
+            const int64_t l = next.fetch_add(1);
+            if (l >= lay.n_layers || bad) break;
+            const auto& fm = lay.fmt[(size_t) l];
+            const uint64_t blob = lay.bytes[(size_t) l];
+            const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+            const uint64_t at[3] = {0, fm.up_off, fm.down_off};
+            const int32_t* ix = idx.empty() ? nullptr : idx.data() + (size_t) l * (size_t) lay.n_expert;
+            for (int r = 0; r < 3 && !bad; ++r) {
+                const GgufSpan& sp = spans[(size_t) (3 * l + r)];
+                HANDLE& h = files[sp.shard];
+                if (h == INVALID_HANDLE_VALUE) {
+                    const std::wstring w = std::filesystem::path(shards[sp.shard]).wstring();
+                    h = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                    FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                }
+                if (h == INVALID_HANDLE_VALUE) { bad = true; break; }
+                const uint64_t total = per[r] * (uint64_t) lay.n_expert, chunk = per[r] * 16;   // 16 experts a read
+                for (uint64_t pos = 0; pos < total && !bad; pos += chunk) {
+                    const uint64_t n = std::min<uint64_t>(chunk, total - pos);
+                    const uint64_t a0 = (sp.offset + pos) / SECTOR * SECTOR;
+                    const uint64_t a1 = (sp.offset + pos + n + SECTOR - 1) / SECTOR * SECTOR;
+                    if (a1 - a0 > cap) {
+                        if (buf) VirtualFree(buf, 0, MEM_RELEASE);
+                        cap = a1 - a0;
+                        buf = (uint8_t*) VirtualAlloc(nullptr, (size_t) cap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                        if (buf == nullptr) { bad = true; break; }
+                    }
+                    for (uint64_t got = 0; got < a1 - a0 && a0 + got < sp.offset + pos + n;) {   // a short read at the end
+                        OVERLAPPED ov{};
+                        ov.Offset = (DWORD) (a0 + got);
+                        ov.OffsetHigh = (DWORD) ((a0 + got) >> 32);
+                        DWORD k = 0;
+                        if (!ReadFile(h, buf + got, (DWORD) std::min<uint64_t>(a1 - a0 - got, 1ull << 30), &k, &ov) ||
+                            k == 0) {
+                            bad = true;
+                            break;
+                        }
+                        got += k;
+                    }
+                    if (bad) break;
+                    const uint8_t* src = buf + (sp.offset + pos - a0);
+                    for (uint64_t k = 0; k < n / per[r]; ++k) {
+                        const uint64_t e = pos / per[r] + k;
+                        if (ix != nullptr && ix[e] < 0) continue;   // only in VRAM
+                        const uint64_t at_e = ix != nullptr ? (uint64_t) ix[e] : e;
+                        std::memcpy(layer_base[(size_t) l] + at_e * blob + at[r], src + k * per[r], (size_t) per[r]);
+                    }
+                }
+            }
+            if (!bad && done) done(l);
+        }
+        for (HANDLE h : files)
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        if (buf) VirtualFree(buf, 0, MEM_RELEASE);
+    };
+    auto buffered_worker = [&]() {
         std::vector<std::ifstream> files(shards.size());
         std::vector<uint8_t> buf;
         for (;;) {
@@ -848,6 +943,8 @@ LoadStats load_experts_gguf(const std::vector<std::string>& shards, const std::v
             if (done) done(l);
         }
     };
+    const std::function<void()> worker = buffered ? std::function<void()>(buffered_worker)
+                                                  : std::function<void()>(unbuffered_worker);
 #endif
     std::vector<std::thread> pool;
     for (int i = 1; i < threads; ++i) pool.emplace_back(worker);

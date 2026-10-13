@@ -359,6 +359,9 @@ void usage() {
                  "                       so switching back to them continues where they were (default 16384)\n"
                  "  --feed-max N         --serve: new prompt parts and last prompt chunks of up to N tokens run\n"
                  "                       through verify windows instead of the batched prompt path (default 128)\n"
+                  "  STRATA_LOGPOS=1      --serve: environment variable; every prompt token a verify window reads then\n"
+                  "                       prints `LOGPOS <pos> <target id> <log prob> <next id> <log prob> <argmax id>\n"
+                  "                       <log prob>` (the two-ahead id and argmax probe a row shift) before the DONE\n"
                  "  --spec T             verify windows of up to T tokens: the last one and T-1 MTP drafts (2..8)\n"
                  "  --spec-min-p P       a draft enters the window only while it and the drafts before it have at\n"
                  "                       least probability P under the draft layer (default 0: always T-1 drafts)\n"
@@ -2558,6 +2561,11 @@ int main(int argc, char** argv) {
         vh.slots = xcache.slots();
         vh.blob = thits.blob;
         ver.set_split_head(split_head.get());
+        // STRATA_LOGPOS: the host log probs of the prompt positions the verify windows read (tools/ppl_bench.py).
+        // Read here because a split head joins its rows into the copyable buffer during `init`.
+        const char* lp_env = std::getenv("STRATA_LOGPOS");
+        const bool logpos = lp_env != nullptr && lp_env[0] != '\0' && std::strcmp(lp_env, "0") != 0;
+        ver.set_logits_wanted(logpos);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.max_window(), err) ||
             !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -2915,6 +2923,7 @@ int main(int argc, char** argv) {
             }
             // prompt tokens through verify windows as wide as the verifier's: each window is committed whole, and the
             // draft layer catches up on the same cells (its drafts are not used, so its chain stops at the first)
+            std::vector<float> lp(logpos ? (size_t) W * (size_t) n_vocab : 0);   // STRATA_LOGPOS: the window's rows
             auto feed = [&](int64_t from, int64_t to) -> bool {
                 mtp.set_max_drafts(1);
                 for (int64_t j = from; j < to;) {
@@ -2928,6 +2937,33 @@ int main(int argc, char** argv) {
                     if (!ver.run(T, window.data(), j, &drive_pool_multi, &drive, outv.data(), err) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) err = drive.d.fail;
                         return false;
+                    }
+                    // STRATA_LOGPOS: every token of a prompt window is ground truth, so row i of the window's logits
+                    // is the distribution the engine saw at position j + i and ids[j + i + 1] is its teacher target.
+                    // ids[j + i + 2] and the row's argmax ride along so tools/ppl_bench.py can tell whether a row is
+                    // really the next cell's distribution (the row-shift probe).
+                    // Emitted before the next window (the head's rows live in one arena buffer).
+                    if (logpos) {
+                        if (!ver.copy_logits(T, lp.data(), err)) return false;
+                        for (int i = 0; i < T; ++i) {
+                            const int64_t p = j + i;
+                            if (p + 1 >= n) continue;   // the last prompt position scores the first generated token
+                            const float* l = lp.data() + (size_t) i * (size_t) n_vocab;
+                            const int64_t tgt = ids[(size_t) (p + 1)];
+                            const int64_t nxt = (p + 2 < n) ? ids[(size_t) (p + 2)] : -1;   // -1: past the prompt
+                            double m = l[0];
+                            int64_t am = 0;
+                            for (int64_t v = 1; v < n_vocab; ++v)
+                                if ((double) l[v] > m) { m = (double) l[v]; am = v; }   // first index of the row max
+                            double s = 0;
+                            for (int64_t v = 0; v < n_vocab; ++v) s += std::exp((double) l[v] - m);
+                            const double lse = m + std::log(s);
+                            std::printf("LOGPOS %lld %lld %.9f %lld %.9f %lld %.9f\n", (long long) p,
+                                        (long long) tgt, (double) l[(size_t) tgt] - lse, (long long) nxt,
+                                        nxt >= 0 ? (double) l[(size_t) nxt] - lse : 0.0, (long long) am,
+                                        (double) l[(size_t) am] - lse);
+                        }
+                        std::fflush(stdout);
                     }
                     if (!ver.commit(T, err, false)) return false;   // beside the draft
                     for (int i = 0; i < T; ++i) outv[(size_t) i] = (int32_t) ids[(size_t) (j + i + 1)];

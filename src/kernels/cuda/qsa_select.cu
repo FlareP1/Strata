@@ -26,6 +26,7 @@ constexpr int kBatchMinQueries = 12;                       // fewer (decode wind
 constexpr int TOPK_T = 1024, TOPK_W = TOPK_T / 32;
 constexpr int TOPK_ROWS = 32;                              // rows of TOPK_T blocks held in registers
 constexpr int TOPK_MAX_ROWS = 64;                          // 65536 blocks: 262144 cells
+static_assert((int64_t) TOPK_MAX_ROWS * TOPK_T * R == qsa_select_max_cells, "the selection's capacity");
 
 __device__ __forceinline__ uint32_t order_key(float s) {
     const float v = s + 0.0f;

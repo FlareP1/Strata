@@ -340,14 +340,17 @@ __global__ void rms_rows_kernel(float* __restrict__ x, const float* __restrict__
     __syncthreads();
     for (int64_t c = threadIdx.x; c < cols; c += blockDim.x) r[c] = s * r[c] * w[c];
 }
+template <int MODE>
 __global__ void rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
-                            float theta_scale, const int32_t* __restrict__ mtab) {
+                            float theta_scale, const int32_t* __restrict__ mtab, strata::kernels::RopeKernelArgs k,
+                            strata::kernels::RopeTab rt) {
     const int64_t row = blockIdx.x;             // t * heads + h
     const int pair = threadIdx.x;               // 0..31
     const int64_t t = row / heads, h = row % heads;
     float* p = x + t * ld + h * dim;
-    const float theta = (float) strata::kernels::mrope_pos(mtab, (int) (pos0 + t), pair) * powf(theta_scale, (float) pair);
-    const float c = cosf(theta), s = sinf(theta);
+    float c, s;
+    strata::kernels::rope_cs<MODE>(rt, k, theta_scale, strata::kernels::mrope_pos(mtab, (int) (pos0 + t), pair), pair, c,
+                                   s);
     const float a = p[pair], b = p[pair + 32];
     p[pair] = a * c - b * s;
     p[pair + 32] = a * s + b * c;
@@ -959,9 +962,21 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
     rms_rows_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(x, w, cols, ld, eps);
     check("rms_rows");
 }
-void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0, float freq_base, void* stream) {
-    const float theta_scale = powf(freq_base, -2.0f / 64.0f);
-    rope_kernel<<<(unsigned) (T * heads), 32, 0, (cudaStream_t) stream>>>(x, heads, dim, ld, pos0, theta_scale, strata::kernels::mrope_table());
+void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
+          const strata::kernels::RopeScaling& scaling, void* stream) {
+    using namespace strata::kernels;
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / 64.0f);
+    const RopeKernelArgs k = scaling.kernel_args(64);
+    RopeTab rt;
+    const int mode = rope_mode(scaling, rt);
+    const unsigned grid = (unsigned) (T * heads);
+    const cudaStream_t st = (cudaStream_t) stream;
+    if (mode == ROPE_TABLE)
+        rope_kernel<ROPE_TABLE><<<grid, 32, 0, st>>>(x, heads, dim, ld, pos0, theta_scale, mrope_table(), k, rt);
+    else if (mode == ROPE_SCALED)
+        rope_kernel<ROPE_SCALED><<<grid, 32, 0, st>>>(x, heads, dim, ld, pos0, theta_scale, mrope_table(), k, rt);
+    else
+        rope_kernel<ROPE_PLAIN><<<grid, 32, 0, st>>>(x, heads, dim, ld, pos0, theta_scale, mrope_table(), k, rt);
     check("rope");
 }
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {

@@ -69,9 +69,10 @@ __global__ void norm(const float* input, const float* __restrict__ gamma, float*
 }
 // `norm<256>`, then native_rope.cu's `apply` on its output, one block a row of at most 256 columns: the normalized
 // row waits in shared memory.  Row r is read at input + r * in_stride.
+template <int MODE>
 __global__ void norm_rope(const float* input, int in_stride, const float* __restrict__ gamma, float* output,
                           int n_cols, float epsilon, int n_rot, float theta_scale, const int* __restrict__ positions,
-                          const int32_t* __restrict__ mtab, int heads, int pos_stride) {
+                          const int32_t* __restrict__ mtab, int heads, int pos_stride, RopeKernelArgs k, RopeTab rt) {
     constexpr int BlockSize = 256;
     const int tid = threadIdx.x, row = blockIdx.x;
     input += std::size_t(row) * in_stride;
@@ -102,8 +103,8 @@ __global__ void norm_rope(const float* input, int in_stride, const float* __rest
         return;
     }
     const int position = positions[(row / heads) * pos_stride + row % heads];
-    const float theta = mrope_pos(mtab, position, pair) * powf(theta_scale, float(pair));
-    const float c = cosf(theta), s = sinf(theta);
+    float c, s;
+    rope_cs<MODE>(rt, k, theta_scale, mrope_pos(mtab, position, pair), pair, c, s);
     const float a = values[pair], b = values[pair + n_rot / 2];
     output[pair] = a * c - b * s;
     output[pair + n_rot / 2] = a * s + b * c;
@@ -160,11 +161,11 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
     check_launch();
 }
 void native_qsa_norm_rope_tokens(const float* input, int in_stride, const float* gamma, float* output, int n_cols,
-                                 int n_rows, float epsilon, int n_rot, float freq_base, const int* positions, int heads,
-                                 int pos_stride, void* stream) {
+                                 int n_rows, float epsilon, int n_rot, const RopeScaling& scaling, const int* positions,
+                                 int heads, int pos_stride, void* stream) {
     const auto count = elements(n_cols, n_rows);
     if ((n_cols != 128 && n_cols != 256) || n_rot != 64 || in_stride < n_cols || heads < 1 || pos_stride < heads ||
-        !std::isfinite(epsilon) || epsilon < 0.0f || !std::isfinite(freq_base) || freq_base <= 1.0f || !positions)
+        !std::isfinite(epsilon) || epsilon < 0.0f || rope_scaling_invalid(scaling) != nullptr || !positions)
         throw std::invalid_argument("native QSA norm-rope requires 128 or 256 columns, 64 rotated, valid strides, "
                                     "epsilon and base");
     const std::size_t in_bytes = (std::size_t(n_rows - 1) * in_stride + n_cols) * 4;
@@ -174,10 +175,23 @@ void native_qsa_norm_rope_tokens(const float* input, int in_stride, const float*
         throw std::invalid_argument("native QSA norm-rope requires a stream, aligned spans, and disjoint buffers or an "
                                     "exact input/output alias");
     // pinned host-side float powf, as native_rope_apply_tokens
-    const float theta_scale = powf(freq_base, -2.0f / n_rot);
-    norm_rope<<<unsigned(n_rows), 256, 0, static_cast<cudaStream_t>(stream)>>>(
-        input, in_stride, gamma, output, n_cols, epsilon, n_rot, theta_scale, positions, mrope_table(), heads,
-        pos_stride);
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / n_rot);
+    const RopeKernelArgs k = scaling.kernel_args(n_rot);
+    RopeTab rt;
+    const int mode = rope_mode(scaling, rt);
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (mode == ROPE_TABLE)
+        norm_rope<ROPE_TABLE><<<unsigned(n_rows), 256, 0, st>>>(input, in_stride, gamma, output, n_cols, epsilon, n_rot,
+                                                               theta_scale, positions, mrope_table(), heads, pos_stride,
+                                                               k, rt);
+    else if (mode == ROPE_SCALED)
+        norm_rope<ROPE_SCALED><<<unsigned(n_rows), 256, 0, st>>>(input, in_stride, gamma, output, n_cols, epsilon, n_rot,
+                                                                theta_scale, positions, mrope_table(), heads, pos_stride,
+                                                                k, rt);
+    else
+        norm_rope<ROPE_PLAIN><<<unsigned(n_rows), 256, 0, st>>>(input, in_stride, gamma, output, n_cols, epsilon, n_rot,
+                                                               theta_scale, positions, mrope_table(), heads, pos_stride,
+                                                               k, rt);
     check_launch();
 }
 void native_qsa_gate_apply(const float* attn, const float* q_full, float* output,

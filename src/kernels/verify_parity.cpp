@@ -38,6 +38,15 @@
 #include <vector>
 
 namespace {
+// the rope tests' rotation: an unscaled base of 5e6
+const strata::kernels::RopeScaling kTestRope = [] {
+    strata::kernels::RopeScaling r;
+    r.freq_base = 5e6;
+    return r;
+}();
+}  // namespace
+
+namespace {
 
 void check(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
@@ -821,8 +830,8 @@ int test_rope_tokens(std::mt19937& rng, cudaStream_t s) {
                 up(d_pos, pos);
                 for (int t = 0; t < n_tok; ++t)
                     strata::kernels::native_rope_apply(d_a + (size_t) t * heads * head_dim, d_a + (size_t) t * heads * head_dim,
-                                                       heads, head_dim, 64, 5000000.0f, d_pos + t * NH, s);
-                strata::kernels::native_rope_apply_tokens(d_b, d_b, n_tok * heads, head_dim, 64, 5000000.0f, d_pos, heads,
+                                                       heads, head_dim, 64, kTestRope, d_pos + t * NH, s);
+                strata::kernels::native_rope_apply_tokens(d_b, d_b, n_tok * heads, head_dim, 64, kTestRope, d_pos, heads,
                                                           NH, s);
                 check(cudaStreamSynchronize(s), "rope");
                 bad += bitwise_diff(down(d_a, x.size()), down(d_b, x.size()), "rope_tokens");
@@ -867,12 +876,12 @@ int test_norm_rope(std::mt19937& rng, cudaStream_t s) {
                 up(d_x, x);
                 up(d_pos, pos);
                 strata::kernels::native_qsa_rms_norm_weighted(d_a, d_gamma, d_a, head_dim, rows, 1e-6f, s);
-                strata::kernels::native_rope_apply_tokens(d_a, d_a, rows, head_dim, 64, 5000000.0f, d_pos, heads, NH,
+                strata::kernels::native_rope_apply_tokens(d_a, d_a, rows, head_dim, 64, kTestRope, d_pos, heads, NH,
                                                           s);
                 strata::kernels::native_qsa_norm_rope_tokens(d_b, head_dim, d_gamma, d_b, head_dim, rows, 1e-6f, 64,
-                                                             5000000.0f, d_pos, heads, NH, s);
+                                                             kTestRope, d_pos, heads, NH, s);
                 strata::kernels::native_qsa_norm_rope_tokens(d_x, 2 * head_dim, d_gamma, d_c, head_dim, rows, 1e-6f, 64,
-                                                             5000000.0f, d_pos, heads, NH, s);
+                                                             kTestRope, d_pos, heads, NH, s);
                 check(cudaStreamSynchronize(s), "norm_rope");
                 const int b = bitwise_diff(down(d_a, half.size()), down(d_b, half.size()), "norm_rope") +
                               bitwise_diff(down(d_a, half.size()), down(d_c, half.size()), "norm_rope, strided");
@@ -1122,10 +1131,10 @@ int test_indexer_append(std::mt19937& rng, cudaStream_t s) {
                 const strata::kernels::QsaIndexerBuffers ib1{bufs[1][0], bufs[1][1], bufs[1][2], bp[1]};
                 for (int t = 0; t < n_tok; ++t)
                     strata::kernels::native_qsa_indexer_append(d_raw + (size_t) t * D, d_pos + t, 0, d_gamma, 1e-6f, ib0, sh,
-                                                               max_cells, 5000000.0f, s);
+                                                               max_cells, kTestRope, s);
                 float* d_snap = dev<float>(tail.size());
                 strata::kernels::native_qsa_indexer_append_multi(d_raw, d_pos, 1, n_tok, 0, d_gamma, 1e-6f, ib1, sh,
-                                                                 max_cells, 5000000.0f, s, d_snap);
+                                                                 max_cells, kTestRope, s, d_snap);
                 check(cudaStreamSynchronize(s), "indexer");
                 if (down(d_snap, tail.size()) != tail) {
                     std::fprintf(stderr, "indexer: n_tok %d start %d: the tail snapshot differs\n", n_tok, start);

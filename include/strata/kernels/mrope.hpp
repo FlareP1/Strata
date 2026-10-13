@@ -44,6 +44,11 @@ void rope_table_release(const float* cos_tab);
 /// The registered table when STRATA_ROPE_TABLE=1 and it was built with `scaling`; otherwise none (the default: the
 /// kernels compute the angle exactly as before).
 RopeTab rope_table_for(const RopeScaling& scaling);
+/// The form a launch takes (ROPE_PLAIN / ROPE_TABLE / ROPE_SCALED, see rope_cs) and its table.
+inline int rope_mode(const RopeScaling& scaling, RopeTab& rt) {
+    rt = rope_table_for(scaling);
+    return rt.cos != nullptr ? 1 : scaling.type != RopeScalingType::None ? 2 : 0;
+}
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
 /// ggml rope_multi, is_imrope, sections {11, 11, 10, 0}: sector = pair % 32; sector % 3 == 1 -> h (sector < 33),
@@ -58,6 +63,24 @@ __device__ __forceinline__ bool rope_tab_cs(const RopeTab& t, int p, int pair, f
     c = __ldg(t.cos + (size_t) p * 32 + pair);
     s = __ldg(t.sin + (size_t) p * 32 + pair);
     return true;
+}
+/// The rotation's cos and sin for `pair` at rotary position `p`, in one of three forms the host picks once
+/// (rope_mode): ROPE_PLAIN, p * theta_scale^pair through cosf / sinf (the unscaled default, the kernels' arithmetic as
+/// it always was); ROPE_TABLE, the session's float64 table (#280), past its end as ROPE_SCALED; ROPE_SCALED, the
+/// scaled analytic angle (rope_scaled_angle with `k`).  Each form is its own kernel instantiation, so the default's
+/// code does not change.
+enum : int { ROPE_PLAIN = 0, ROPE_TABLE = 1, ROPE_SCALED = 2 };
+template <int MODE>
+__device__ __forceinline__ void rope_cs(const RopeTab& rt, const RopeKernelArgs& k, float theta_scale, int p, int pair,
+                                        float& c, float& s) {
+    if (MODE == ROPE_TABLE && rope_tab_cs(rt, p, pair, c, s)) return;
+    const float theta = p * powf(theta_scale, float(pair));
+    if (MODE == ROPE_PLAIN) {
+        c = cosf(theta);
+        s = sinf(theta);
+        return;
+    }
+    rope_scaled_angle(theta, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, pair, c, s);
 }
 #endif
 

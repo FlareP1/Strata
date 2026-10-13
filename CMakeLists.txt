@@ -196,6 +196,7 @@ if(STRATA_ENABLE_CUDA)
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
+                          src/kernels/cuda/draft_proxy.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
@@ -217,6 +218,7 @@ if(STRATA_ENABLE_CUDA)
     src/kernels/cuda/native_flash_attn.cu
     src/kernels/cuda/native_qsa_indexer.cu
     src/kernels/cuda/native_qsa_score.cu
+    src/kernels/cuda/draft_proxy.cu
     PROPERTIES COMPILE_OPTIONS "--use_fast_math")
 
   set(STRATA_ORACLE_SOURCE_DIR "" CACHE PATH "Pinned llama.cpp source for independent CUDA parity tests")
@@ -307,6 +309,11 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(gr_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(gr_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME gr_parity COMMAND gr_parity --selftest)
+
+  add_executable(draft_proxy_parity src/kernels/draft_proxy_parity.cpp)
+  target_include_directories(draft_proxy_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(draft_proxy_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME draft_proxy_parity COMMAND draft_proxy_parity --selftest)
 
   add_executable(gdn_parity src/kernels/gdn_parity.cpp)
   target_include_directories(gdn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

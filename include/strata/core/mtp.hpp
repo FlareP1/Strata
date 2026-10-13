@@ -146,6 +146,8 @@ private:
     uint8_t* dhead_ = nullptr;
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
+    uint8_t* proxy_ = nullptr;   ///< the draft head's 2-bit copy (draft_proxy.hpp); null: the exact head over every row
+    void* proxy_scratch_ = nullptr;
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;

@@ -3,6 +3,7 @@
 
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/draft_proxy.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/fused_gr.hpp"
@@ -94,6 +95,8 @@ MtpDrafter::~MtpDrafter() {
     if (head_logits_) cudaFree(head_logits_);
     if (dhead_) cudaFree(dhead_);
     if (dvocab_) cudaFree(dvocab_);
+    if (proxy_) cudaFree(proxy_);
+    if (proxy_scratch_) cudaFree(proxy_scratch_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
 }
@@ -307,6 +310,21 @@ bool MtpDrafter::bind_head(const NativeHead* head, std::string& err) {
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
+            // its 2-bit copy finds each draft's row (STRATA_DRAFT_PROXY=0: the exact head over every row)
+            const char* px = std::getenv("STRATA_DRAFT_PROXY");
+            if ((px == nullptr || std::atoi(px) != 0) &&
+                strata::kernels::draft_proxy_supported(head->type(), (int) g_->n_embd)) {
+                const size_t pb = strata::kernels::draft_proxy_bytes(n_dvocab_);
+                const size_t sb = strata::kernels::draft_proxy_scratch_bytes(n_dvocab_);
+                if (cudaMalloc((void**) &proxy_, pb) != cudaSuccess || cudaMalloc(&proxy_scratch_, sb) != cudaSuccess) {
+                    err = "mtp: the draft head's 2-bit copy does not fit";
+                    return false;
+                }
+                cudaMemset(proxy_scratch_, 0, sb);
+                strata::kernels::draft_proxy_pack(head->type(), dhead_, n_dvocab_, proxy_, nullptr);
+                cudaDeviceSynchronize();
+                vram_ += pb + sb;
+            }
         }
     }
     return true;
@@ -497,10 +515,14 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
-        native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
-        argmax_rows(head_logits_, T, (int) nv, arg_scratch_, out_ids_, cs);
-        row_top_prob_split(head_logits_, T, (int) nv, out_ids_, probs_, top_scratch_, cs);
-        if (sub) map_ids(out_ids_, dvocab_, T, cs);
+        if (proxy_ != nullptr) {   // the draft head's copy finds the row, the rows near it rescored exactly
+            draft_proxy_top1(head_->type(), proxy_, dhead_, xq_, nv, dvocab_, out_ids_, probs_, proxy_scratch_, cs);
+        } else {
+            native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
+            argmax_rows(head_logits_, T, (int) nv, arg_scratch_, out_ids_, cs);
+            row_top_prob_split(head_logits_, T, (int) nv, out_ids_, probs_, top_scratch_, cs);
+            if (sub) map_ids(out_ids_, dvocab_, T, cs);
+        }
     } catch (const std::exception& e) {
         err = std::string("mtp: ") + e.what();
         return false;

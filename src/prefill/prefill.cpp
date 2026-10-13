@@ -125,6 +125,7 @@ Bufs layout(Alloc& a, int64_t T, int64_t cap, int64_t max_blocks, bool offload) 
     b.qkv = a.take<float>(p * C); b.z = a.take<float>(p * ZV); b.ab = a.take<float>(p * 2 * HV);
     b.gate = a.take<float>(p * HV); b.beta = a.take<float>(p * HV); b.hbuf = a.take<float>(p * C);
     b.y = a.take<float>(p * ZV); b.y_h = a.take<uint16_t>(p * ZV);
+    if (gdn_scan_scratch_bytes((int64_t) p) > p * C * sizeof(float)) throw std::runtime_error("prefill: GDN scratch");
     next();   // QSA
     b.Kc = a.take<float>(p * 512); b.Vc = a.take<float>(p * 512); b.Qf = a.take<float>(p * 12288);
     b.q = a.take<float>(p * ZV); b.idx_raw = a.take<float>(p * 128); b.q_idx = a.take<float>(p * 512);
@@ -640,7 +641,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         mark(kPsGdnConv);
                         gdn_conv(conv, b.qkv, (const float*) wc->data, b.hbuf, P, EPS, m.cs);
                         mark(kPsGdnScan);
-                        gdn_scan(state, b.hbuf, b.gate, b.beta, b.y, P, m.cs);
+                        gdn_scan(state, b.hbuf, b.gate, b.beta, b.y, P, b.qkv, m.cs);   // qkv: free after the conv
                         mark(kPsGdnNorm);
                         gdn_out_norm(b.y, b.z, (const float*) wnm->data, EPS, b.y_h, P, m.cs);
                         mark(kPsGdnOut);

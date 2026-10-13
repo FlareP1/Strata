@@ -38,9 +38,12 @@ void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate
 /// the L2 norm of the q and k heads of every token: the verify window's gdn_conv_l2_multi over all T tokens at once.
 /// h: [T, C].
 void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream);
-/// The recurrence over the chunk (state in registers): y[t] = o (before the norm).  With gdn_out_norm, bitwise
-/// gdn_step_norm_multi over the tokens.
-void gdn_scan(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T, void* stream);
+/// The recurrence over the chunk: y[t] = o (before the norm), in the gated delta rule's chunkwise form on the tensor
+/// cores (FP16 products, FP32 sums and state; gdn_step_norm_multi's values within FP16's rounding).  `scratch`:
+/// gdn_scan_scratch_bytes(T).
+void gdn_scan(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T, void* scratch,
+              void* stream);
+size_t gdn_scan_scratch_bytes(int64_t T);
 /// y16[t] = rmsnorm(o) * gamma * sigmoid(z) per head in FP16 (the out projection's input), o from y; `y32`: its FP32
 /// value too, in place over o (the parity test's).
 void gdn_out_norm(float* y, const float* z, const float* gamma, float eps, uint16_t* y16, int64_t T, void* stream,

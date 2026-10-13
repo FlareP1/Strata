@@ -1532,7 +1532,8 @@ int test_prefill_gdn(std::mt19937& rng, cudaStream_t s) {
     up(d_w, w);
     up(d_gamma, gamma);
     int bad = 0;
-    for (int T : {1, 2, 3, 5, 37}) {
+    double worst_y = 0, worst_s = 0;
+    for (int T : {1, 2, 3, 5, 37, 300}) {
         std::vector<float> qkv((size_t) T * C), gate((size_t) T * HV), beta((size_t) T * HV), z((size_t) T * ZV);
         for (auto& x : qkv) x = nd(rng);
         for (auto& x : hist) x = nd(rng);
@@ -1571,15 +1572,29 @@ int test_prefill_gdn(std::mt19937& rng, cudaStream_t s) {
         }
         // the prompt path, all T at once
         strata::prefill::gdn_conv(d_hist[1], d_qkv, d_w, d_h[1], T, eps, s);
-        strata::prefill::gdn_scan(d_state[1], d_h[1], d_gate, d_beta, d_y[1], T, s);
+        void* d_scratch = dev<uint8_t>(strata::prefill::gdn_scan_scratch_bytes(T));
+        strata::prefill::gdn_scan(d_state[1], d_h[1], d_gate, d_beta, d_y[1], T, d_scratch, s);
         strata::prefill::gdn_out_norm(d_y[1], d_z, d_gamma, eps, d_y16, T, s);   // the engine's: FP16 only
         strata::prefill::gdn_out_norm(d_y[1], d_z, d_gamma, eps, d_y16b, T, s, true);   // and FP32, in place
         check(cudaStreamSynchronize(s), "prefill gdn");
         const bool y16_same = down(d_y16, z.size()) == down(d_y16b, z.size());
         if (!y16_same) std::fprintf(stderr, "  FP16 y: the norm's two forms differ\n");
+        // the recurrence in FP16 products: within a bound of the decode steps (largest |difference| over largest
+        // |value|); the conv, its history and the norm's two forms bitwise
+        auto rel = [](const std::vector<float>& a, const std::vector<float>& r) {
+            double md = 0, mv = 0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                md = std::max(md, std::fabs((double) a[i] - r[i]));
+                mv = std::max(mv, std::fabs((double) r[i]));
+            }
+            return mv > 0 ? md / mv : md;
+        };
+        const double ey = rel(down(d_y[1], z.size()), down(d_y[0], z.size())),
+                     es = rel(down(d_state[1], state.size()), down(d_state[0], state.size()));
+        worst_y = std::max(worst_y, ey);
+        worst_s = std::max(worst_s, es);
         const int b = !y16_same + bitwise_diff(down(d_h[0], qkv.size()), down(d_h[1], qkv.size()), "conv output") +
-                      bitwise_diff(down(d_y[0], z.size()), down(d_y[1], z.size()), "y") +
-                      bitwise_diff(down(d_state[0], state.size()), down(d_state[1], state.size()), "state") +
+                      (ey > 4e-3) + (es > 4e-3) +
                       bitwise_diff(down(d_hist[0], hist.size()), down(d_hist[1], hist.size()), "conv history");
         if (b) std::fprintf(stderr, "prefill gdn: T %d differs\n", T);
         bad += b;
@@ -1592,11 +1607,13 @@ int test_prefill_gdn(std::mt19937& rng, cudaStream_t s) {
         for (float* p : {d_qkv, d_gate, d_beta, d_z}) cudaFree(p);
         cudaFree(d_y16);
         cudaFree(d_y16b);
+        cudaFree(d_scratch);
         cudaFree(d_counts);
     }
     cudaFree(d_w);
     cudaFree(d_gamma);
-    std::printf("prefill_gdn: %s\n", bad ? "MISMATCH" : "bitwise equal to the verify window's kernels (1-37 tokens)");
+    std::printf("prefill_gdn: %s (1-300 tokens; the recurrence within %.2g / %.2g of the decode steps' output / state)\n",
+                bad ? "MISMATCH" : "the conv bitwise", worst_y, worst_s);
     return bad;
 }
 

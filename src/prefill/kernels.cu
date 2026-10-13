@@ -198,162 +198,6 @@ __global__ void gdn_conv_hist_kernel(float* __restrict__ hist, const float* __re
         hist[c * 3 + r] = j >= 0 ? qkv[j * C + c] : old[r + T];
     }
 }
-// cp.async of one 4-byte word into shared memory (sm_80+), and its group bookkeeping.
-__device__ __forceinline__ void cp_async4(float* dst, const float* src) {
-    const unsigned d = (unsigned) __cvta_generic_to_shared(dst);
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(d), "l"(src));
-}
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
-
-// The recurrence over the chunk, the arithmetic of gdn_step_norm_multi: a thread per (CPT columns, group of 32
-// state rows) of the VPK value heads that share a key head (head % HK), a block per key head and CB columns.  A column's four row groups sit in adjacent lanes, so both sums
-// over the row groups are shuffles added in the decode kernels' order (group 0 + 1 + 2 + 3).  Each token's q, k, v,
-// gate and beta are copied (cp.async) into a ring of DEPTH token slots DEPTH - 1 tokens ahead, so the reads from memory
-// overlap the steps before them: one barrier per token.  Each thread reads its row group's 32 q and 32 k values into
-// registers with 16-byte loads once for its VPK x CPT columns; a row group is padded to 36 words, so the four groups a
-// warp reads at once sit in different banks.  Writes o (before the norm) to `out`; gdn_norm_kernel finishes each token.
-constexpr int RG = 4, RPG = S / RG, RP = RPG + 4, DEPTH = 8, SLOT = 2 * RG * RP, VPK = HV / HK;
-template <int CB, int CPT>
-__global__ void __launch_bounds__(CB / CPT * RG) gdn_scan_kernel(float* __restrict__ state,
-                                                                 const float* __restrict__ h,
-                                                                 const float* __restrict__ gate,
-                                                                 const float* __restrict__ beta,
-                                                                 float* __restrict__ out, int T) {
-    constexpr int NT = CB / CPT * RG, QL = (2 * S + NT - 1) / NT;   // threads; q/k values each thread copies
-    constexpr int NV = VPK * (CB + 2), VL = (NV + NT - 1) / NT;      // v, gate and beta values; each thread's
-    static_assert(CB % (8 * CPT) == 0 && VPK * HK == HV, "8 column groups a warp; HV / HK value heads a key head");
-    __shared__ __align__(16) float sqk[DEPTH * SLOT];   // per slot: q, then k, [row group][row]
-    __shared__ float sv[DEPTH * VPK * CB], sgb[DEPTH * 2 * VPK];   // per slot: v [head][column]; gate, beta [head]
-    const int tid = threadIdx.x, lane = tid & 31;
-    const int cl = ((tid >> 5) * 8 + (lane >> 2)) * CPT, rg = lane & 3, g0 = lane & ~3;   // first local column
-    // % HK although the grid has HK blocks in x: without the bound ptxas compiles the kernel to 182 registers instead
-    // of 226, 1.2x slower
-    const int qh = blockIdx.x % HK;
-    auto head = [&](int j) { return qh + j * HK; };
-    // what this thread copies for every token: q/k value i = tid + j * NT < 2S (row i & 127 of q or k), then item
-    // i = tid + j * NT < NV: v of head i / CB's local column i % CB (i < VPK * CB), else the gate or beta of a head
-    int qk_off[QL], qk_at[QL];
-#pragma unroll
-    for (int j = 0; j < QL; ++j) {
-        const int i = tid + j * NT;
-        qk_off[j] = i < 2 * S ? (i < S ? 0 : HK * S) + qh * S + (i & (S - 1)) : -1;
-        qk_at[j] = (i >> 7) * RG * RP + ((i & (S - 1)) / RPG) * RP + (i & (RPG - 1));
-    }
-    const float* it_src[VL];   // token 0's value; -1 offset: none
-    int it_ld[VL], it_at[VL];
-#pragma unroll
-    for (int j = 0; j < VL; ++j) {
-        const int i = tid + j * NT;
-        it_src[j] = nullptr;
-        if (i < VPK * CB) {
-            it_src[j] = h + 2 * HK * S + head(i / CB) * S + blockIdx.y * CB + i % CB;
-            it_ld[j] = C;
-            it_at[j] = i;
-        } else if (i < NV) {
-            const int k = i - VPK * CB;
-            it_src[j] = (k < VPK ? gate : beta) + head(k % VPK);
-            it_ld[j] = HV;
-            it_at[j] = DEPTH * VPK * CB + k;   // into sgb, which follows sv
-        }
-    }
-    float s[VPK][CPT][RPG];
-    const size_t rs = (size_t) HV * S;
-#pragma unroll
-    for (int j = 0; j < VPK; ++j) {
-        const float* base = state + ((size_t) (rg * RPG) * HV + head(j)) * S + blockIdx.y * CB + cl;
-#pragma unroll
-        for (int c = 0; c < CPT; ++c)
-#pragma unroll
-            for (int r = 0; r < RPG; ++r) s[j][c][r] = base[r * rs + c];
-    }
-    int next = 0;   // the next token to copy
-    auto issue = [&]() {
-        if (next < T) {
-            const int slot = next & (DEPTH - 1);
-            const float* ht = h + (size_t) next * C;
-#pragma unroll
-            for (int j = 0; j < QL; ++j)
-                if (qk_off[j] >= 0) cp_async4(&sqk[slot * SLOT + qk_at[j]], ht + qk_off[j]);
-#pragma unroll
-            for (int j = 0; j < VL; ++j)
-                if (it_src[j] != nullptr)
-                    cp_async4(it_at[j] < DEPTH * VPK * CB ? &sv[slot * VPK * CB + it_at[j]]
-                                                          : &sgb[slot * 2 * VPK + it_at[j] - DEPTH * VPK * CB],
-                              it_src[j] + (size_t) next * it_ld[j]);
-        }
-        cp_async_commit();
-        ++next;
-    };
-    for (int t = 0; t < DEPTH - 1; ++t) issue();
-    for (int t = 0; t < T; ++t) {
-        cp_async_wait<DEPTH - 2>();
-        __syncthreads();   // token t's slot is filled; every thread is done with token t - 1's slot
-        issue();
-        const int slot = t & (DEPTH - 1);
-        float qr[RPG], kr[RPG];
-        const float4* q4 = reinterpret_cast<const float4*>(&sqk[slot * SLOT + rg * RP]);
-        const float4* k4 = reinterpret_cast<const float4*>(&sqk[slot * SLOT + RG * RP + rg * RP]);
-#pragma unroll
-        for (int j = 0; j < RPG / 4; ++j) {
-            const float4 a = k4[j], b = q4[j];
-            kr[4 * j] = a.x; kr[4 * j + 1] = a.y; kr[4 * j + 2] = a.z; kr[4 * j + 3] = a.w;
-            qr[4 * j] = b.x; qr[4 * j + 1] = b.y; qr[4 * j + 2] = b.z; qr[4 * j + 3] = b.w;
-        }
-        float g[VPK], bt[VPK];
-#pragma unroll
-        for (int j = 0; j < VPK; ++j) g[j] = __expf(sgb[slot * 2 * VPK + j]), bt[j] = sgb[slot * 2 * VPK + VPK + j];
-        float kv[VPK][CPT], o[VPK][CPT];
-#pragma unroll
-        for (int j = 0; j < VPK; ++j)
-#pragma unroll
-            for (int c = 0; c < CPT; ++c) kv[j][c] = o[j][c] = 0.0f;
-#pragma unroll
-        for (int r = 0; r < RPG; ++r)
-#pragma unroll
-            for (int j = 0; j < VPK; ++j)
-#pragma unroll
-                for (int c = 0; c < CPT; ++c) kv[j][c] = fmaf(s[j][c][r], kr[r], kv[j][c]);
-        float delta[VPK][CPT];
-#pragma unroll
-        for (int j = 0; j < VPK; ++j)
-#pragma unroll
-            for (int c = 0; c < CPT; ++c) {
-                const float k0 = __shfl_sync(0xffffffffu, kv[j][c], g0), k1 = __shfl_sync(0xffffffffu, kv[j][c], g0 + 1),
-                            k2 = __shfl_sync(0xffffffffu, kv[j][c], g0 + 2), k3 = __shfl_sync(0xffffffffu, kv[j][c], g0 + 3);
-                const float kv_col = k0 + k1 + k2 + k3;
-                delta[j][c] = (sv[slot * VPK * CB + j * CB + cl + c] - g[j] * kv_col) * bt[j];
-            }
-#pragma unroll
-        for (int r = 0; r < RPG; ++r)
-#pragma unroll
-            for (int j = 0; j < VPK; ++j)
-#pragma unroll
-                for (int c = 0; c < CPT; ++c) {
-                    s[j][c][r] = fmaf(g[j], s[j][c][r], kr[r] * delta[j][c]);
-                    o[j][c] = fmaf(s[j][c][r], qr[r], o[j][c]);
-                }
-#pragma unroll
-        for (int j = 0; j < VPK; ++j) {
-            float* ot = out + (size_t) t * HV * S + head(j) * S + blockIdx.y * CB + cl;
-#pragma unroll
-            for (int c = 0; c < CPT; ++c) {
-                const float o0 = __shfl_sync(0xffffffffu, o[j][c], g0), o1 = __shfl_sync(0xffffffffu, o[j][c], g0 + 1),
-                            o2 = __shfl_sync(0xffffffffu, o[j][c], g0 + 2), o3 = __shfl_sync(0xffffffffu, o[j][c], g0 + 3);
-                if (rg == 0) ot[c] = (o0 + o1 + o2 + o3) * rsqrtf((float) S);
-            }
-        }
-    }
-    cp_async_wait<0>();
-#pragma unroll
-    for (int j = 0; j < VPK; ++j) {
-        float* base = state + ((size_t) (rg * RPG) * HV + head(j)) * S + blockIdx.y * CB + cl;
-#pragma unroll
-        for (int c = 0; c < CPT; ++c)
-#pragma unroll
-            for (int r = 0; r < RPG; ++r) base[r * rs + c] = s[j][c][r];
-    }
-}
 // y16 = rmsnorm(o) * gamma * sigmoid(z) per (token, head) in FP16 (the out projection's input), from o in y; with
 // Y32 its FP32 value too, in place over o
 template <bool Y32>
@@ -566,6 +410,251 @@ __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict
         y[i] = bf(x[i]);
 }
 
+// ---------------------------------------------------------------- GDN, the chunkwise form
+// Per value head, a chunk of GCL tokens from state S0 (rows: the key dimension, columns: the value dimension), with
+// g_t = exp(gate_t) and gamma_t the gates' sum from the chunk's start to t:
+//   A[t][i] = beta_t exp(gamma_t - gamma_i) k_t.k_i (i < t),   T = (I + A)^-1,
+//   B_t = beta_t (v_t - exp(gamma_t) S0^T k_t),   D = T B (the delta rule's corrections),
+//   o_t = exp(gamma_t) S0^T q_t + sum_{i <= t} exp(gamma_t - gamma_i) (q_t.k_i) D_i,
+//   S = exp(gamma_L) S0 + sum_t exp(gamma_L - gamma_t) k_t D_t^T.
+// gdn_chunk_prep_kernel: T, P (the decayed q.k) and the scales of every chunk (FP32, a block per chunk and key head);
+// gdn_chunk_walk_kernel: a block per key head and GCW value columns, a warp per value head and 16 columns, its state
+// slice S^T [16 x 128] in FP32 registers as mma accumulators, chunk after chunk; every product an m16n8k16 FP16 mma
+// with FP32 sums (an accumulator tile pair is the next mma's A operand; K and Q staged in FP32, rounded as loaded).
+constexpr int VPK = HV / HK;     // value heads a key head
+constexpr int GCL = 16;          // tokens a chunk
+constexpr int GCW = 32;          // value columns a walk block
+constexpr int GKP = S + 8;       // padded FP32 K / Q rows: a half-warp's 64-bit loads on distinct banks
+constexpr int GTP = GCL + 8;     // padded FP16 T / P rows
+constexpr int GVP = GCW + 4;     // padded V rows
+struct alignas(16) GdnTps {      // a (chunk, value head)
+    __half t[GCL][GTP], p[GCL][GTP];
+    float s[64];                 // exp(gamma_t), exp(gamma_L - gamma_t), beta_t, exp(gamma_L)
+};
+struct alignas(16) GdnStage {
+    float k[GCL][GKP], q[GCL][GKP];
+    GdnTps tp[VPK];
+    float v[VPK][GCL][GVP];
+};
+__device__ __forceinline__ uint32_t gh2(float lo, float hi) {
+    const __half2 v = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&v);
+}
+__device__ __forceinline__ uint32_t gld32(const __half* p) { return *reinterpret_cast<const uint32_t*>(p); }
+__device__ __forceinline__ void gmma(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void ga_of(const float (&x)[4], const float (&y)[4], uint32_t (&a)[4]) {
+    a[0] = gh2(x[0], x[1]);
+    a[1] = gh2(x[2], x[3]);
+    a[2] = gh2(y[0], y[1]);
+    a[3] = gh2(y[2], y[3]);
+}
+__device__ __forceinline__ void gcp16(void* dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src));
+}
+
+__global__ void __launch_bounds__(128) gdn_chunk_prep_kernel(const float* __restrict__ h, const float* __restrict__ gate,
+                                                             const float* __restrict__ beta, int T,
+                                                             GdnTps* __restrict__ tp) {
+    const int ch = blockIdx.x, kh = blockIdx.y, tid = threadIdx.x, j = tid >> 5, lane = tid & 31;
+    const int t0 = ch * GCL, n = min(GCL, T - t0);
+    __shared__ __align__(16) float sk[GCL][S + 4], sq[GCL][S + 4];
+    __shared__ float kk[GCL][GCL + 1], qk[GCL][GCL + 1];
+    __shared__ float a[VPK][GCL][GCL + 1], ti[VPK][GCL][GCL + 1], gm[VPK][GCL], bt[VPK][GCL];
+    for (int i = tid; i < 2 * GCL * (S / 4); i += blockDim.x) {
+        const int w = i / (GCL * (S / 4)), t = (i / (S / 4)) % GCL, r4 = (i % (S / 4)) * 4;
+        const float4 v = t < n ? *reinterpret_cast<const float4*>(h + (size_t) (t0 + t) * C + (w ? HK * S : 0) + kh * S + r4)
+                               : make_float4(0.f, 0.f, 0.f, 0.f);
+        *reinterpret_cast<float4*>(w ? &sk[t][r4] : &sq[t][r4]) = v;
+    }
+    __syncthreads();
+    for (int p = tid; p < 2 * GCL * GCL; p += blockDim.x) {
+        const int w = p / (GCL * GCL), t = (p / GCL) % GCL, i = p % GCL;
+        const float4* x = reinterpret_cast<const float4*>(w ? sq[t] : sk[t]);
+        const float4* y = reinterpret_cast<const float4*>(sk[i]);
+        float acc = 0.0f;
+#pragma unroll 8
+        for (int r = 0; r < S / 4; ++r) {
+            const float4 u = x[r], v = y[r];
+            acc = fmaf(u.x, v.x, acc);
+            acc = fmaf(u.y, v.y, acc);
+            acc = fmaf(u.z, v.z, acc);
+            acc = fmaf(u.w, v.w, acc);
+        }
+        (w ? qk : kk)[t][i] = acc;
+    }
+    __syncthreads();
+    if (j >= VPK) return;   // the fourth warp only helped with the loads and the dots
+    const int head = kh + j * HK;
+    float gv = lane < n ? gate[(size_t) (t0 + lane) * HV + head] : 0.0f;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        const float y = __shfl_up_sync(0xffffffffu, gv, d);
+        if (lane >= d) gv += y;
+    }
+    if (lane < GCL) {
+        gm[j][lane] = gv;
+        bt[j][lane] = lane < n ? beta[(size_t) (t0 + lane) * HV + head] : 0.0f;
+    }
+    __syncwarp();
+    for (int p = lane; p < GCL * GCL; p += 32) {
+        const int t = p / GCL, i = p % GCL;
+        a[j][t][i] = i < t ? bt[j][t] * expf(gm[j][t] - gm[j][i]) * kk[t][i] : 0.0f;
+        ti[j][t][i] = t == i ? 1.0f : 0.0f;
+    }
+    __syncwarp();
+    for (int t = 1; t < GCL; ++t) {   // T = (I + A)^-1, row t from the rows before it
+        if (lane < t) {
+            float acc = 0.0f;
+            for (int m = lane; m < t; ++m) acc = fmaf(a[j][t][m], ti[j][m][lane], acc);
+            ti[j][t][lane] = -acc;
+        }
+        __syncwarp();
+    }
+    GdnTps& w = tp[(size_t) ch * HV + head];
+    uint32_t* wt = reinterpret_cast<uint32_t*>(&w.t[0][0]);
+    uint32_t* wp = reinterpret_cast<uint32_t*>(&w.p[0][0]);
+    for (int p = lane; p < GCL * (GCL / 2); p += 32) {
+        const int t = p / (GCL / 2), i = 2 * (p % (GCL / 2));
+        wt[t * (GTP / 2) + i / 2] = gh2(ti[j][t][i], ti[j][t][i + 1]);
+        wp[t * (GTP / 2) + i / 2] = gh2(i <= t ? expf(gm[j][t] - gm[j][i]) * qk[t][i] : 0.0f,
+                                        i + 1 <= t ? expf(gm[j][t] - gm[j][i + 1]) * qk[t][i + 1] : 0.0f);
+    }
+    if (lane < GCL) {
+        w.s[lane] = expf(gm[j][lane]);
+        w.s[GCL + lane] = expf(gm[j][GCL - 1] - gm[j][lane]);
+        w.s[2 * GCL + lane] = bt[j][lane];
+    }
+    if (lane == 0) w.s[3 * GCL] = expf(gm[j][GCL - 1]);
+}
+
+__global__ void __launch_bounds__(32 * 2 * VPK) gdn_chunk_walk_kernel(float* __restrict__ state, const float* __restrict__ h,
+                                                                   const GdnTps* __restrict__ tp, float* __restrict__ out,
+                                                                   int T) {
+    extern __shared__ __align__(16) unsigned char gdn_smem[];
+    GdnStage* st = reinterpret_cast<GdnStage*>(gdn_smem);
+    const int kh = blockIdx.x, cs = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int g = lane >> 2, q = lane & 3, j = warp >> 1, head = kh + j * HK;
+    const int cl = (warp & 1) * 16, cb = cs * GCW + cl;   // the warp's first column, in the block and in the head
+    const int nch = (T + GCL - 1) / GCL;
+    float s[S / 8][4];   // S^T: tile nt covers rows 8 nt .. 8 nt + 7
+#pragma unroll
+    for (int nt = 0; nt < S / 8; ++nt) {
+        const int r = 8 * nt + 2 * q;
+        s[nt][0] = state[((size_t) r * HV + head) * S + cb + g];
+        s[nt][1] = state[((size_t) (r + 1) * HV + head) * S + cb + g];
+        s[nt][2] = state[((size_t) r * HV + head) * S + cb + g + 8];
+        s[nt][3] = state[((size_t) (r + 1) * HV + head) * S + cb + g + 8];
+    }
+    auto stage = [&](int ch) {
+        GdnStage& b = st[ch & 1];
+        const int t0 = ch * GCL, n = min(GCL, T - t0);
+        for (int i = tid; i < 2 * GCL * (S / 4); i += blockDim.x) {
+            const int w = i / (GCL * (S / 4)), t = (i / (S / 4)) % GCL, r4 = (i % (S / 4)) * 4;
+            float* d = w ? &b.k[t][r4] : &b.q[t][r4];
+            if (t < n) gcp16(d, h + (size_t) (t0 + t) * C + (w ? HK * S : 0) + kh * S + r4);
+            else *reinterpret_cast<float4*>(d) = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        for (int i = tid; i < VPK * (int) (sizeof(GdnTps) / 16); i += blockDim.x) {
+            const int jj = i / (int) (sizeof(GdnTps) / 16), p = i % (int) (sizeof(GdnTps) / 16);
+            gcp16(reinterpret_cast<char*>(&b.tp[jj]) + 16 * p,
+                  reinterpret_cast<const char*>(tp + (size_t) ch * HV + kh + jj * HK) + 16 * p);
+        }
+        for (int i = tid; i < VPK * GCL * (GCW / 4); i += blockDim.x) {
+            const int jj = i / (GCL * (GCW / 4)), t = (i / (GCW / 4)) % GCL, c4 = (i % (GCW / 4)) * 4;
+            float* d = &b.v[jj][t][c4];
+            if (t < n) gcp16(d, h + (size_t) (t0 + t) * C + 2 * HK * S + (kh + jj * HK) * S + cs * GCW + c4);
+            else *reinterpret_cast<float4*>(d) = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    stage(0);
+    for (int ch = 0; ch < nch; ++ch) {
+        if (ch + 1 < nch) stage(ch + 1);
+        else asm volatile("cp.async.commit_group;\n" ::);
+        asm volatile("cp.async.wait_group 1;\n" ::);
+        __syncthreads();
+        const GdnStage& b = st[ch & 1];
+        const int t0 = ch * GCL, n = min(GCL, T - t0);
+        const float* scj = b.tp[j].s;
+        // W^T = S^T K^T and S^T Q^T [16 columns x GCL tokens]
+        float w[GCL / 8][4] = {}, qs[GCL / 8][4] = {};
+#pragma unroll
+        for (int kt = 0; kt < S / 16; ++kt) {
+            uint32_t a[4];
+            ga_of(s[2 * kt], s[2 * kt + 1], a);
+#pragma unroll
+            for (int nt = 0; nt < GCL / 8; ++nt) {
+                const float2 k0 = *reinterpret_cast<const float2*>(&b.k[8 * nt + g][16 * kt + 2 * q]);
+                const float2 k1 = *reinterpret_cast<const float2*>(&b.k[8 * nt + g][16 * kt + 2 * q + 8]);
+                const float2 q0 = *reinterpret_cast<const float2*>(&b.q[8 * nt + g][16 * kt + 2 * q]);
+                const float2 q1 = *reinterpret_cast<const float2*>(&b.q[8 * nt + g][16 * kt + 2 * q + 8]);
+                gmma(w[nt], a, gh2(k0.x, k0.y), gh2(k1.x, k1.y));
+                gmma(qs[nt], a, gh2(q0.x, q0.y), gh2(q1.x, q1.y));
+            }
+        }
+        // B^T = beta (V^T - exp(gamma) W^T); element e of tile nt: column g + 8 (e >> 1), token 8 nt + 2 q + (e & 1)
+        float bt[GCL / 8][4];
+#pragma unroll
+        for (int nt = 0; nt < GCL / 8; ++nt)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int t = 8 * nt + 2 * q + (e & 1);
+                bt[nt][e] = scj[2 * GCL + t] * (b.v[j][t][cl + g + 8 * (e >> 1)] - scj[t] * w[nt][e]);
+            }
+        // D^T = B^T T^T, O^T = exp(gamma) S^T Q^T + D^T P^T
+        uint32_t ab[4], ad[4];
+        ga_of(bt[0], bt[1], ab);
+        float d[GCL / 8][4] = {}, o[GCL / 8][4];
+#pragma unroll
+        for (int nt = 0; nt < GCL / 8; ++nt) {
+            const __half* tr = &b.tp[j].t[8 * nt + g][2 * q];
+            gmma(d[nt], ab, gld32(tr), gld32(tr + 8));
+        }
+        ga_of(d[0], d[1], ad);
+        const float rs = rsqrtf((float) S);
+#pragma unroll
+        for (int nt = 0; nt < GCL / 8; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) o[nt][e] = scj[8 * nt + 2 * q + (e & 1)] * qs[nt][e];
+            const __half* pr = &b.tp[j].p[8 * nt + g][2 * q];
+            gmma(o[nt], ad, gld32(pr), gld32(pr + 8));
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int t = 8 * nt + 2 * q + (e & 1);
+                if (t < n) out[(size_t) (t0 + t) * HV * S + head * S + cb + g + 8 * (e >> 1)] = o[nt][e] * rs;
+            }
+        }
+        // S^T = exp(gamma_L) S^T + (exp(gamma_L - gamma) D^T) K
+#pragma unroll
+        for (int nt = 0; nt < GCL / 8; ++nt)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) d[nt][e] *= scj[GCL + 8 * nt + 2 * q + (e & 1)];
+        ga_of(d[0], d[1], ad);
+        const float eL = scj[3 * GCL];
+#pragma unroll
+        for (int nt = 0; nt < S / 8; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) s[nt][e] *= eL;
+            const int r = 8 * nt + g;
+            gmma(s[nt], ad, gh2(b.k[2 * q][r], b.k[2 * q + 1][r]), gh2(b.k[2 * q + 8][r], b.k[2 * q + 9][r]));
+        }
+        __syncthreads();   // every warp is done with this stage before the next one fills it
+    }
+#pragma unroll
+    for (int nt = 0; nt < S / 8; ++nt) {
+        const int r = 8 * nt + 2 * q;
+        state[((size_t) r * HV + head) * S + cb + g] = s[nt][0];
+        state[((size_t) (r + 1) * HV + head) * S + cb + g] = s[nt][1];
+        state[((size_t) r * HV + head) * S + cb + g + 8] = s[nt][2];
+        state[((size_t) (r + 1) * HV + head) * S + cb + g + 8] = s[nt][3];
+    }
+}
+
 }  // namespace
 
 void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
@@ -643,11 +732,23 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
     gdn_conv_hist_kernel<<<C / 256, 256, 0, (cudaStream_t) stream>>>(history, qkv, T);
     check("gdn_conv");
 }
-void gdn_scan(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T, void* stream) {
-    // 16 columns a block, 1 a thread (0.65 us a token at 16K on the 3090: 1.2x a block per value head, 32 columns, 2 a
-    // thread; 8 or 32 columns, 1 a thread: 0.87x / 0.92x; 16 columns, 2 a thread spill)
-    constexpr int CB = 16, CPT = 1;
-    gdn_scan_kernel<CB, CPT><<<dim3(HK, S / CB), CB / CPT * RG, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, (int) T);
+size_t gdn_scan_scratch_bytes(int64_t T) { return (size_t) ((T + GCL - 1) / GCL) * HV * sizeof(GdnTps); }
+void gdn_scan(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T, void* scratch,
+              void* stream) {
+    if (T <= 0) return;
+    static const bool smem_set = [] {   // the walk's two stages: 58 KB
+        return cudaFuncSetAttribute(gdn_chunk_walk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    (int) (2 * sizeof(GdnStage))) == cudaSuccess;
+    }();
+    if (!smem_set) {
+        std::fprintf(stderr, "gdn_scan: the walk's shared memory\n");
+        std::exit(1);
+    }
+    auto* tp = (GdnTps*) scratch;
+    gdn_chunk_prep_kernel<<<dim3((unsigned) ((T + GCL - 1) / GCL), HK), 128, 0, (cudaStream_t) stream>>>(h, gate, beta,
+                                                                                                       (int) T, tp);
+    gdn_chunk_walk_kernel<<<dim3(HK, S / GCW), 32 * 2 * VPK, 2 * sizeof(GdnStage), (cudaStream_t) stream>>>(state, h, tp,
+                                                                                                         y, (int) T);
     check("gdn_scan");
 }
 void gdn_out_norm(float* y, const float* z, const float* gamma, float eps, uint16_t* y16, int64_t T, void* stream,

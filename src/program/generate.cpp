@@ -851,6 +851,66 @@ struct SlotLoan {
     }
 };
 
+/// The prompt's counts into the tiers' usage, each layer's scaled to kPromptUsage: about a conversation's settled
+/// counts a layer (~30 routed entries a round kept at 0.7 an update), so the answer's own rounds soon outweigh
+/// them, while the prompt's most-routed experts pass the tiers' threshold (2) for their first updates.  (400 a
+/// layer: the first answer on new content as fast on average, IQ3_S's slower.)
+constexpr float kPromptUsage = 120.0f;
+static void add_prompt_usage(std::vector<float>& usage, const std::vector<uint32_t>& routed, int64_t n_expert) {
+    const float total = kPromptUsage;
+    if (usage.size() != routed.size()) return;
+    for (size_t l0 = 0; l0 < routed.size(); l0 += (size_t) n_expert) {
+        double sum = 0;
+        for (size_t e = 0; e < (size_t) n_expert; ++e) sum += routed[l0 + e];
+        if (sum > 0)
+            for (size_t e = 0; e < (size_t) n_expert; ++e) usage[l0 + e] += (float) (total * routed[l0 + e] / sum);
+    }
+}
+
+/// What a loan's slots take back after a prompt, (layer, expert, slot) each: per layer the lent slots' own experts,
+/// except that with `routed` (the prompt's counts) a missing expert routed clearly more often (twice as often and
+/// twice more) takes the place of the least-routed of them.  `taken` (n_layers x n_expert): the experts another GPU
+/// holds or takes back; this loan's are added to it.
+static std::vector<std::array<int32_t, 3>> refill_plan(const SlotLoan& loan, const std::vector<uint32_t>* routed,
+                                                       std::vector<uint8_t>& taken, int64_t n_expert,
+                                                       strata::core::ExpertSource& src) {
+    std::vector<std::array<int32_t, 3>> out;
+    std::vector<std::pair<int32_t, int32_t>> lent = loan.lent;   // (residency index, slot), by layer
+    std::sort(lent.begin(), lent.end());
+    std::vector<std::pair<uint32_t, int32_t>> vict, cand;
+    for (size_t a = 0; a < lent.size();) {
+        const int64_t l = lent[a].first / n_expert;
+        size_t b = a;
+        while (b < lent.size() && lent[b].first / n_expert == l) ++b;
+        const uint32_t* r = routed ? routed->data() + l * n_expert : nullptr;
+        vict.clear();
+        cand.clear();
+        for (size_t i = a; i < b; ++i) {
+            const int32_t e = (int32_t) (lent[i].first % n_expert);
+            vict.emplace_back(r ? r[e] : 0u, e);
+        }
+        if (r != nullptr) {
+            for (int32_t e = 0; e < (int32_t) n_expert; ++e) {
+                const size_t i = (size_t) (l * n_expert + e);
+                bool own = false;
+                for (size_t k = a; k < b && !own; ++k) own = lent[k].first == (int32_t) i;
+                if (!own && !taken[i] && (*loan.res)[i] < 0 && r[e] > 0 && src.in_ram(l, e))
+                    cand.emplace_back(r[e], e);
+            }
+            std::sort(vict.begin(), vict.end());
+            std::sort(cand.begin(), cand.end(), std::greater<>());   // the most routed first
+            for (size_t k = 0; k < vict.size() && k < cand.size() && cand[k].first >= 2 * vict[k].first + 2; ++k)
+                vict[k] = cand[k];
+        }
+        for (size_t k = 0; k < vict.size(); ++k) {
+            out.push_back({(int32_t) l, vict[k].second, lent[a + k].second});
+            taken[(size_t) (l * n_expert + vict[k].second)] = 1;
+        }
+        a = b;
+    }
+    return out;
+}
+
 /// The batched prompt path's device buffers on each GPU: expert-cache slots lent for every prompt, as many as its
 /// chunk needs, else allocated once for the longest chunk.
 struct PromptBuffers {
@@ -890,6 +950,32 @@ struct PromptBuffers {
     /// After it: the lent slots refilled.
     bool give_back(strata::core::ExpertSource& src, std::string& err) {
         return loan.give_back(src, g->n_expert, err) && loan2.give_back(src, g->n_expert, err);
+    }
+    /// After it, through the tiers of the loans' GPUs (null or off: that loan's blocking give_back): what the lent
+    /// slots take back (refill_plan, `routed` the prompt's counts) goes out as their moves at once, each admitted as
+    /// it lands while the first windows run (the blocking refill held a prompt up 0.12 s after 2K tokens, 0.31 s
+    /// after 16K: the 3090's share over its x4 link).
+    bool give_back_tiers(strata::core::AdaptiveTier* t1, strata::core::AdaptiveTier* t2,
+                         const std::vector<uint32_t>* routed, strata::core::ExpertSource& src, std::string& err) {
+        std::vector<uint8_t> taken(loan.res ? loan.res->size() : loan2.res ? loan2.res->size() : 0, 0);
+        for (const SlotLoan* l : {&loan, &loan2})
+            if (l->res != nullptr)
+                for (size_t i = 0; i < taken.size(); ++i) taken[i] |= (*l->res)[i] >= 0 ? 1 : 0;
+        const std::pair<SlotLoan*, strata::core::AdaptiveTier*> loans[2] = {{&loan, t1}, {&loan2, t2}};
+        for (const auto& [l, t] : loans) {
+            if (l->lent.empty()) continue;
+            if (t == nullptr || !t->on()) {
+                if (!l->give_back(src, g->n_expert, err)) return false;
+                continue;
+            }
+            cudaSetDevice(l->device);
+            cudaDeviceSynchronize();   // the prompt path's last use of the slots
+            cudaSetDevice(l->main_device);
+            const auto moves = refill_plan(*l, routed, taken, g->n_expert, src);
+            l->lent.clear();
+            if (!t->refill(moves, l == &loan ? (64ull << 20) : (256ull << 20), err)) return false;
+        }
+        return true;
     }
 };
 
@@ -3638,6 +3724,7 @@ int main(int argc, char** argv) {
                 tier.apply_pending(true);   // no copy may still land in a lent slot
                 tier2.apply_pending(true);
                 if (!pbuf.take(std::min(o.prefill_chunk, batched_end - reuse), err)) { report(err); return 1; }
+                prefill.clear_routed();
                 if (kvg.on && pbuf.lend && pbuf.loan.first >= 0 && pbuf.loan.first < kvg.top && kvg.lo < kvg.top) {
                     report("the prompt path's loan reached the slots the elastic K/V took (a bug: --no-kv-grow)");
                     return 1;
@@ -3663,10 +3750,14 @@ int main(int argc, char** argv) {
                     }
                     a0 = b0;
                 }
-                if (!pbuf.give_back(*srcp, err)) {
+                // the tiers' moves (deterministic modes: refilled before the windows, as they were)
+                const bool through_tiers = o.adapt_every > 0 && !o.deterministic_adapt;
+                if (through_tiers ? !pbuf.give_back_tiers(&tier, &tier2, &prefill.routed(), *srcp, err)
+                                  : !pbuf.give_back(*srcp, err)) {
                     report("refilling a lent slot failed: " + err);
                     return 1;
                 }
+                add_prompt_usage(drive.d.usage, prefill.routed(), g.n_expert);
                 tr("prompt done (slots refilled)");
             }
             // A window whose logits held a NaN or an infinity (upstream #879): nothing of it is used, the request
@@ -3950,13 +4041,16 @@ int main(int argc, char** argv) {
         // refill the lent slots from the arena and give them back to the decode tiers
         const size_t n_lent[2] = {pbuf.loan.lent.size(), pbuf.loan2.lent.size()};
         const Clock::time_point tr = Clock::now();
-        if (!pbuf.give_back(*srcp, err)) {
+        const bool through_tiers = o.adapt_every > 0 && !o.deterministic_adapt;
+        if (through_tiers ? !pbuf.give_back_tiers(&tier, &tier2, &prefill.routed(), *srcp, err)
+                          : !pbuf.give_back(*srcp, err)) {
             std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
             return 1;
         }
         if (n_lent[0] + n_lent[1] > 0)
-            std::fprintf(stderr, "strata generate: lent slots refilled (%zu, %zu on the second GPU) in %.1f ms\n",
-                         n_lent[0], n_lent[1], std::chrono::duration<double, std::milli>(Clock::now() - tr).count());
+            std::fprintf(stderr, "strata generate: lent slots %s (%zu, %zu on the second GPU) in %.1f ms\n",
+                         through_tiers ? "given back to the tiers" : "refilled", n_lent[0], n_lent[1],
+                         std::chrono::duration<double, std::milli>(Clock::now() - tr).count());
         prefill_batched_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
         prefill_ms += prefill_batched_ms;
         pos_start = n_batched;
@@ -4271,6 +4365,7 @@ int main(int argc, char** argv) {
         ver.set_pcie_share(drive.d.pcie_num > 0);
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        if (o.prefill_chunk > 0 && n_prompt > 1) add_prompt_usage(drive.d.usage, prefill.routed(), g.n_expert);
         int64_t p = spec_pos;
         int32_t x = (int32_t) tok;
         const int W = o.max_window();

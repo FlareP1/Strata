@@ -81,6 +81,10 @@ public:
     int64_t processed() const { return processed_; }
 
     const PrefillStats& stats() const { return stats_; }
+    /// The prompt's routing: per layer (n_layers x n_expert) how often the tokens run since `clear_routed` chose each
+    /// expert.
+    const std::vector<uint32_t>& routed() const;
+    void clear_routed();
 
     /// The MTP draft layer (or null): after every chunk, its K/V over the chunk's cells in the chunk's batched
     /// arithmetic (cell t pairs the chunk's final residual at t with the token at t + 1).

@@ -179,6 +179,7 @@ struct Prefill::Impl {
     cudaEvent_t ev_mixed = nullptr, ev_routed = nullptr;   // ev_routed: a layer's routing is in host memory
     std::vector<cudaEvent_t> ev_in, ev_piece;   // a sub-chunk's input is in host memory, its sums on this GPU
     std::vector<int32_t> order;                 // per layer its experts, the likeliest first (set_order)
+    std::vector<uint32_t> routed;               // per layer and expert: the routed entries since clear_routed
     Gemm gemm;
     void* owned = nullptr;   // the buffers' own allocation (no region)
     Bufs b;
@@ -242,6 +243,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     const size_t T = (size_t) max_chunk;
     m.steps_host.resize(T * strata::kernels::kStepCount);
+    m.routed.assign((size_t) (g.n_layers * NE), 0);
     m.cnt.resize(NE);
     m.off.resize(NE + 1);
     m.entry_of.resize(T * K);
@@ -259,6 +261,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
 }
 
 void Prefill::set_order(std::vector<int32_t> order) { impl_->order = std::move(order); }
+const std::vector<uint32_t>& Prefill::routed() const { return impl_->routed; }
+void Prefill::clear_routed() { std::fill(impl_->routed.begin(), impl_->routed.end(), 0u); }
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool offload) {
     const strata::kernels::QsaShapes s = shapes_of(g);
@@ -726,6 +730,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 if (e < 0 || e >= NE) { err = "prefill: routed id out of range"; return false; }
                 ++m.cnt[(size_t) e];
             }
+            for (int32_t e = 0; e < NE; ++e) m.routed[(size_t) l * NE + (size_t) e] += (uint32_t) m.cnt[(size_t) e];
             m.off[0] = 0;
             for (int64_t e = 0; e < NE; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
             {

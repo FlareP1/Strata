@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -82,6 +83,10 @@ public:
     /// the cache's GPU: the last work that may read the slots they overwrite).
     void set_paced(cudaEvent_t ev) { paced_ = true; after_ = ev; }
     bool pump(uint64_t budget, uint64_t& sent, std::string& err);
+
+    /// Moves into slots outside its free lists (the prompt path's lent slots, given back): (layer, expert, slot)
+    /// each, sent at once in batches of about `batch` bytes; each is admitted by apply_pending once its batch lands.
+    bool refill(const std::vector<std::array<int32_t, 3>>& moves, uint64_t batch, std::string& err);
 
     /// A running average of the copies' measured rate (bytes per ms), 0 until the first timed ones have landed.
     double copy_rate() const { return rate_; }

@@ -224,6 +224,28 @@ bool AdaptiveTier::pump(uint64_t budget, uint64_t& sent, std::string& err) {
     return send(err) && end_batch(timed, sent, err);
 }
 
+bool AdaptiveTier::refill(const std::vector<std::array<int32_t, 3>>& moves, uint64_t batch, std::string& err) {
+    if (moves.empty()) return true;
+    for (const auto& m : moves) {
+        queued_.push_back({m[0], m[1], -1, m[2]});
+        pending_.emplace_back(m[0] * (int32_t) n_expert_ + m[1], m[2]);
+        ++fills;
+    }
+    if (paced_) {
+        for (uint64_t sent = 1; sent > 0 && sent_ < queued_.size();)
+            if (!pump(batch, sent, err)) return false;
+    } else {
+        stage(UINT64_MAX);
+        while (sent_ < staged_) {
+            const size_t s0 = sent_;
+            const uint64_t o0 = off_;
+            if (!pump_bytes(batch, err)) return false;
+            if (sent_ == s0 && off_ == o0) break;   // a guarded pump at its flight cap: the windows' pumps go on
+        }
+    }
+    return true;
+}
+
 bool AdaptiveTier::adapt(std::vector<float>& usage, std::string& err, bool decay) {
     const auto t0 = std::chrono::steady_clock::now();
     if (!failed_.empty()) { err = failed_; return false; }

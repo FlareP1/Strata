@@ -26,6 +26,10 @@
 
 namespace strata::prefill {
 
+/// --hc-q8: the hyper-connection matrices have no BF16 copy, and a chunk's buffers hold a layer's in BF16 (26 MiB).
+/// Before any sizing.
+void set_hc_q8(bool on);
+
 /// The sections `Prefill::profile` times, in the order a layer runs them.
 enum PrefillSection {
     kPsPle, kPsHcRead, kPsGdn, kPsGdnConv, kPsGdnScan, kPsGdnNorm, kPsGdnOut, kPsQsaProj, kPsQsaIndexer, kPsQsaScores, kPsQsaAttn, kPsQsaOut, kPsHcFfn, kPsRouter,

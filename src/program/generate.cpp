@@ -271,6 +271,7 @@ struct Options {
     double second_gpu_pin_gib = 0.0;
     /// The elastic K/V (--kv-grow, STRATA_KV_GROW=1): the K/V takes VRAM as the context grows, the expert cache the rest.
     bool kv_grow = false;
+    bool hc_q8 = false;   ///< the hyper-connection matrices only in 8 bits (core::HcQ8)
     double head_split = 0.45;                ///< the second GPU's share of the head's rows (0: all on the main GPU)
     /// Plan v0.3 P6: the share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the
     /// pinned arena while the CPU computes the rest (verify windows).
@@ -433,6 +434,9 @@ void usage() {
                  "                       reach and the expert cache holds the rest, giving slots up as a conversation\n"
                  "                       grows and taking them back after (STRATA_KV_GROW=1/0 too; after Niko1221/Strata\n"
                  "                       0.1.40).  Default: the whole --max-context allocated at start\n"
+                 "  --hc-q8              with --native: the hyper-connection projections only in 8 bits (int8, an\n"
+                 "                       f16 scale a 32: the GGUF's Q8_0 as stored, BF16 ones rounded so); the verify\n"
+                 "                       windows read them, the prompt path takes them in BF16 a layer at a time\n"
                  "  --head-split F       with --second-gpu: its share of the output head's rows (default 0.45;\n"
                  "                       each GPU streams its part after the last layer; 0 = all on the main GPU)\n"
                  "  --no-prompt-offload  with --second-gpu: the prompt path streams the experts the main GPU's cache\n"
@@ -1003,6 +1007,10 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
             return argv[++i];
         };
+        if (a == "--hc-q8") {   // outside the chain below: MSVC refuses one this long (C1061)
+            o.hc_q8 = true;
+            continue;
+        }
         if (a == "--help" || a == "-h") { usage(); return 0; }
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--tokens") {
@@ -1399,6 +1407,15 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (!o.native_head_gguf.empty()) skip.insert("output.weight");
+        if (o.hc_q8 && (!native_pack || native_shards.empty())) {
+            std::fprintf(stderr, "strata generate: --hc-q8 needs a native pack and --native\n");
+            return 2;
+        }
+        strata::prefill::set_hc_q8(o.hc_q8);
+        if (o.hc_q8 && !strata::core::HcQ8::names(native_shards, skip, err)) {   // their 8-bit planes instead
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
         // the PLE module validates its canonical key at construction (8 MB); a native pack has none to load
         if (!native_pack) skip.erase("blk.1.ple_key.weight");
         if (native_pack) skip.insert("token_embd.weight");
@@ -1431,6 +1448,16 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights\n",
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0));
+    }
+
+    strata::core::HcQ8 hc_q8;
+    if (o.hc_q8) {
+        if (!hc_q8.load(native_shards, wt, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: %zu hyper-connection matrices in 8 bits (%zu as the GGUF stores them), "
+                             "%.2f MiB\n", hc_q8.matrices(), hc_q8.stored_q8_0(), (double) hc_q8.bytes() / 1048576.0);
     }
 
     strata::kernels::gr_set_fp32_activations(o.gr_fp32_activations);

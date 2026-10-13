@@ -641,6 +641,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.bo_prev = bo_ + t * N; a.inj_prev = inj_prev + t * HC;
                 a.w_norm = (const float*) wn[half]->data; a.w_down = (const uint16_t*) wd[half]->data;
                 a.w_up = (const uint16_t*) wu[half]->data; a.w_inject = (const uint16_t*) wi[half]->data;
+                a.q_down = wd[half]->hc_codes; a.s_down = wd[half]->hc_scales;
+                a.q_up = wu[half]->hc_codes; a.s_up = wu[half]->hc_scales;
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N; a.gate_ema = gate_ema;
                 a.est_norm = est_norm; a.est_gates = est_gates; a.est = pmixed_ + t * N;
@@ -1019,6 +1021,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 fa[t].R = Rt(t); fa[t].R_out = Rt(t); fa[t].apply = false;
                 fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
                 fa[t].w_up = (const uint16_t*) hu->data; fa[t].eps = EPS;
+                fa[t].q_down = hd->hc_codes; fa[t].s_down = hd->hc_scales;
+                fa[t].q_up = hu->hc_codes; fa[t].s_up = hu->hc_scales;
                 fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = head_mixed_ + t * N;
             }
             fused_gr_read_multi(fa, T, grs_, cs);

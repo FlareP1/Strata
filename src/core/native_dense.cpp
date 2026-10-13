@@ -4,7 +4,10 @@
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
+#include <immintrin.h>
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <climits>
 #include <exception>
 #include <limits>
@@ -179,6 +182,120 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         return true;
     } catch (const std::exception& error) {
         err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
+namespace {
+bool hc_matrix(const std::string& name) {
+    if (name.rfind("blk.", 0) != 0) return name == "output_hc_down.weight" || name == "output_hc_up.weight";
+    return name.ends_with(".hc_attn_down.weight") || name.ends_with(".hc_attn_up.weight") ||
+           name.ends_with(".hc_ffn_down.weight") || name.ends_with(".hc_ffn_up.weight");
+}
+// one row's values as ggml's quantize_row_q8_0_ref: per 32, d = amax / 127 stored as f16, codes round(x / d)
+void q8_0_row(const float* x, int64_t n, int8_t* q, uint16_t* s) {
+    for (int64_t b = 0; b < n / 32; ++b) {
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[b * 32 + j]));
+        const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+        s[b] = (uint16_t) _mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(d), _MM_FROUND_TO_NEAREST_INT), 0);
+        for (int j = 0; j < 32; ++j) q[b * 32 + j] = (int8_t) std::roundf(x[b * 32 + j] * id);
+    }
+}
+float f16_to_f32(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h))); }
+}  // namespace
+
+bool HcQ8::names(const std::vector<std::string>& shards, std::set<std::string>& out, std::string& err) {
+    try {
+        for (const auto& path : shards) {
+            strata::GgufFile gguf(path);
+            for (const auto& t : gguf.tensors())
+                if (hc_matrix(t.name)) out.insert(t.name);
+        }
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("hc q8: ") + error.what();
+        return false;
+    }
+}
+
+HcQ8::~HcQ8() {
+    for (void* p : allocs_) cudaFree(p);
+}
+
+bool HcQ8::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err) {
+    try {
+        std::vector<int8_t> q;
+        std::vector<uint16_t> s;
+        std::vector<float> row;
+        for (const auto& path : shards) {
+            strata::GgufFile gguf(path);
+            for (const auto& t : gguf.tensors()) {
+                if (!hc_matrix(t.name)) continue;
+                auto found = table.table_.find(t.name);
+                if (found == table.table_.end()) {
+                    err = "hc q8: tensor absent from the canonical table: " + t.name;
+                    return false;
+                }
+                WeightRef& ref = found->second;
+                const std::string tn = t.type_name();
+                if (t.shape.size() != 2 || t.shape[0] != (uint64_t) ref.ne0 || t.shape[1] != (uint64_t) ref.ne1 ||
+                    ref.ne0 % 32 != 0 || (tn != "Q8_0" && tn != "BF16" && tn != "F16" && tn != "F32")) {
+                    err = "hc q8: " + t.name + " has another shape or type (" + tn + ")";
+                    return false;
+                }
+                const int64_t cols = ref.ne0, rows = ref.ne1;
+                q.resize((size_t) (rows * cols));
+                s.resize((size_t) (rows * cols / 32));
+                row.resize((size_t) cols);
+                const uint8_t* src = gguf.tensor_data(t);
+                for (int64_t r = 0; r < rows; ++r) {
+                    int8_t* qr = q.data() + r * cols;
+                    uint16_t* sr = s.data() + r * (cols / 32);
+                    if (tn == "Q8_0") {   // as stored: {f16 d, 32 codes} a block
+                        const uint8_t* bl = src + (size_t) (r * (cols / 32)) * 34;
+                        for (int64_t b = 0; b < cols / 32; ++b) {
+                            std::memcpy(sr + b, bl + b * 34, 2);
+                            std::memcpy(qr + b * 32, bl + b * 34 + 2, 32);
+                        }
+                        continue;
+                    }
+                    for (int64_t c = 0; c < cols; ++c) {
+                        const size_t i = (size_t) (r * cols + c);
+                        if (tn == "F32") {
+                            std::memcpy(&row[(size_t) c], src + i * 4, 4);
+                        } else {
+                            uint16_t h;
+                            std::memcpy(&h, src + i * 2, 2);
+                            if (tn == "F16") {
+                                row[(size_t) c] = f16_to_f32(h);
+                            } else {
+                                const uint32_t u = (uint32_t) h << 16;
+                                std::memcpy(&row[(size_t) c], &u, 4);
+                            }
+                        }
+                    }
+                    q8_0_row(row.data(), cols, qr, sr);
+                }
+                void *dq = nullptr, *ds = nullptr;
+                if (cudaMalloc(&dq, q.size()) != cudaSuccess || cudaMalloc(&ds, s.size() * 2) != cudaSuccess ||
+                    cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
+                    cudaMemcpy(ds, s.data(), s.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    if (dq) cudaFree(dq);
+                    if (ds) cudaFree(ds);
+                    err = "hc q8: upload of " + t.name + ": " + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                allocs_.push_back(dq);
+                allocs_.push_back(ds);
+                bytes_ += q.size() + s.size() * 2;
+                if (tn == "Q8_0") ++q8_0_;
+                ref.hc_codes = (const int8_t*) dq;
+                ref.hc_scales = (const uint16_t*) ds;
+            }
+        }
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("hc q8: ") + error.what();
         return false;
     }
 }

@@ -512,6 +512,11 @@ __global__ void to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict_
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         y[i] = hf(x[i]);
 }
+__global__ void q8_to_bf16_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ s, int64_t n,
+                                  uint16_t* __restrict__ y) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        y[i] = bf((float) q[i] * __half2float(__ushort_as_half(s[i / 32])));
+}
 __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         y[i] = bf(x[i]);
@@ -536,6 +541,13 @@ void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     to_bf16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (cudaStream_t) stream>>>(x, y, n);
     check("to_bf16");
+}
+
+void q8_to_bf16(const int8_t* q, const uint16_t* scales, int64_t n, uint16_t* y, void* stream) {
+    if (n <= 0) return;
+    q8_to_bf16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (cudaStream_t) stream>>>(
+        q, scales, n, y);
+    check("q8_to_bf16");
 }
 
 void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t* xn16, int64_t T, void* stream) {

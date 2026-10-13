@@ -33,4 +33,26 @@ private:
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
 };
+/// --hc-q8: the hyper-connection projections' down and up matrices (hc_attn_*, hc_ffn_*, output_hc_*) only in 8 bits:
+/// int8 codes and an f16 scale a 32 values, the GGUF's own Q8_0 values where it stores them so (UD-Q4_K_XL), else its
+/// values rounded as ggml's quantize_row_q8_0_ref rounds them (IQ3_S's BF16).  Attached to the canonical WeightRef
+/// (hc_codes, hc_scales), whose BF16 copy the arena skips (`names`): the verify window reads them in 8 bits (fused_gr's
+/// q_down / q_up), the prompt path dequantizes them to BF16 once a layer (Q8_0 ones bitwise the pack's copy).
+class HcQ8 {
+public:
+    HcQ8() = default;
+    ~HcQ8();
+    HcQ8(const HcQ8&) = delete;
+    HcQ8& operator=(const HcQ8&) = delete;
+    bool load(const std::vector<std::string>& shards, WeightTable& table, std::string& err);
+    /// The canonical names of these matrices in the shards (from the headers only), for the arena to skip.
+    static bool names(const std::vector<std::string>& shards, std::set<std::string>& out, std::string& err);
+    uint64_t bytes() const { return bytes_; }
+    size_t matrices() const { return allocs_.size() / 2; }
+    size_t stored_q8_0() const { return q8_0_; }   ///< of them taken as the GGUF stores them
+private:
+    std::vector<void*> allocs_;
+    uint64_t bytes_ = 0;
+    size_t q8_0_ = 0;
+};
 } // namespace strata::core

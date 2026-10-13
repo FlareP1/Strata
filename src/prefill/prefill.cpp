@@ -57,6 +57,7 @@ struct Alloc {
 // The device buffers of one binding.
 struct Bufs {
     uint16_t* w16 = nullptr;
+    uint16_t* hc16 = nullptr;   // a layer's hyper-connection down and up matrices without a BF16 copy, dequantized
     void* gemm_ws = nullptr;
     // the chunk's: residual stream, the MoE's input (FP16) and output, the FFN half's injection, routing, steps, PLE
     // rows, the second GPU's sums (FP16)
@@ -83,6 +84,8 @@ struct Bufs {
     uint64_t local_bytes = 0;
 };
 
+bool g_hc_q8 = false;   // set_hc_q8
+
 // Chunks of T tokens: the chunk-long buffers, the sub-chunk ones, then the union of the steps a layer takes one after
 // the other on the stream.  (Staging copies run ahead on a copy stream only while the routed experts run, after the
 // host has waited for the stream, and the stream waits for them before the next step.)
@@ -90,6 +93,7 @@ Bufs layout(Alloc& a, int64_t T, int64_t cap, int64_t max_blocks, bool offload) 
     const size_t t = (size_t) T, p = (size_t) std::min(T, SUB);
     Bufs b;
     b.w16 = a.take<uint16_t>((size_t) W16);
+    if (g_hc_q8) b.hc16 = a.take<uint16_t>((size_t) (4 * LR * D));
     b.gemm_ws = a.take<uint8_t>(GEMM_WS);
     b.R = a.take<float>(t * D);
     b.mixed_h = a.take<uint16_t>(t * N);
@@ -260,6 +264,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
            m.local.init(dev, dev, stream, src, cache, host_res, NE, max_chunk, offload == nullptr, err);
 }
 
+void set_hc_q8(bool on) { g_hc_q8 = on; }
+
 void Prefill::set_order(std::vector<int32_t> order) { impl_->order = std::move(order); }
 const std::vector<uint32_t>& Prefill::routed() const { return impl_->routed; }
 void Prefill::clear_routed() { std::fill(impl_->routed.begin(), impl_->routed.end(), 0u); }
@@ -320,10 +326,15 @@ const core::WeightRef* need(const core::LayerView& v, const char* suffix, std::s
     if (!r) err = v.name(suffix) + " is missing";
     return r;
 }
+// `data`: the weights in BF16 when the table holds none (null: its own)
 bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
-               std::string& err, int64_t ldy = 0) {
-    if (w->kind != core::WeightKind::Bf16InF32 || !w->data) { err = "prefill: " + name + " is not a resident BF16 tensor"; return false; }
-    gm.bf16(X, (const uint16_t*) w->data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy);
+               std::string& err, int64_t ldy = 0, const uint16_t* data = nullptr) {
+    if (data == nullptr) data = (const uint16_t*) w->data;
+    if (w->kind != core::WeightKind::Bf16InF32 || !data) {
+        err = "prefill: " + name + " is not a resident BF16 tensor";
+        return false;
+    }
+    gm.bf16(X, data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy);
     return true;
 }
 
@@ -557,6 +568,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 !(wsd = need(v, "ffn_down_shexp.weight", err)))
                 return false;
             if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
+            // the hyper-connection matrices kept only in 8 bits, in BF16 for this layer
+            const uint16_t* hc16[2][2] = {};   // [half][down, up]
+            for (int h = 0; h < 2; ++h)
+                for (int k = 0; k < 2; ++k) {
+                    const core::WeightRef* w = v.get((std::string(h == 0 ? "hc_attn_" : "hc_ffn_") +
+                                                      (k == 0 ? "down.weight" : "up.weight")).c_str());
+                    if (w != nullptr && w->data == nullptr && w->hc_codes != nullptr) {
+                        uint16_t* dst = b.hc16 + (size_t) (2 * h + k) * LR * D;
+                        q8_to_bf16(w->hc_codes, w->hc_scales, w->ne0 * w->ne1, dst, m.cs);
+                        hc16[h][k] = dst;
+                    }
+                }
             // ================ per sub-chunk: the mixer half, then the FFN half up to the routing ================
             for (int64_t t0 = 0; t0 < T; t0 += SUB) {
                 const int64_t P = std::min(SUB, T - t0), pp = p0 + t0;
@@ -578,9 +601,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     } else if (half == 0) {
                         gr_norm_rs(b.R + t0 * D, (const float*) wn->data, EPS, b.rs, b.xn16, P, m.cs);
                     }
-                    if (!bf16_proj(m.gemm, wd, b.xn16, b.lo, P, sd, err)) return false;
+                    if (!bf16_proj(m.gemm, wd, b.xn16, b.lo, P, sd, err, 0, hc16[half][0])) return false;
                     gr_silu(b.lo, b.lo16, P, m.cs);
-                    if (!bf16_proj(m.gemm, wu, b.lo16, b.gated, P, su, err)) return false;
+                    if (!bf16_proj(m.gemm, wu, b.lo16, b.gated, P, su, err, 0, hc16[half][1])) return false;
                     if (!bf16_proj(m.gemm, wi, b.xn16, inj, P, si, err)) return false;
                     gr_mix_r(b.R + t0 * D, b.rs, (const float*) wn->data, b.gated, nullptr, b.mixed_bf, P, m.cs,
                              mixed_h);

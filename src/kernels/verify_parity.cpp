@@ -586,8 +586,9 @@ int test_router_rows(std::mt19937& rng, cudaStream_t s) {
 }
 
 // ---- the hyper-connection read: every token of an n-token read bitwise its 1-token read, and within a rounding
-// bound of an FP64 reference (|error| <= 1e-4 x the sum of the terms' magnitudes, carried through silu and sigmoid)
-int test_gr_read(std::mt19937& rng, cudaStream_t s) {
+// bound of an FP64 reference (|error| <= 1e-4 x the sum of the terms' magnitudes, carried through silu and sigmoid);
+// `q8`: the down and up projections in 8 bits (int8 codes, an f16 scale a 32 values; every code from -128 to 127)
+int test_gr_read(std::mt19937& rng, cudaStream_t s, bool q8) {
     const int64_t N = 2560, HC = 4, D = N * HC, LR = 320;
     auto bf16 = [&](size_t n) {
         std::vector<uint16_t> v(n);
@@ -604,6 +605,33 @@ int test_gr_read(std::mt19937& rng, cudaStream_t s) {
     for (auto& v : wn) v = edgy(rng);
     const std::vector<uint16_t> wd = bf16((size_t) (LR * D)), wu = bf16((size_t) (D * LR)), wi = bf16((size_t) (HC * D));
     uint16_t *d_wd = dev<uint16_t>(wd.size()), *d_wu = dev<uint16_t>(wu.size()), *d_wi = dev<uint16_t>(wi.size());
+    // the 8-bit forms: codes, and normal f16 scales of 2^-12 to 2^-4 (the weights about the BF16 ones' size)
+    auto codes = [&](size_t n) {
+        std::vector<int8_t> v(n);
+        for (auto& x : v) x = (int8_t) (int) (rng() % 256 - 128);
+        return v;
+    };
+    auto scales = [&](size_t n) {
+        std::vector<uint16_t> v(n);
+        for (auto& x : v) x = (uint16_t) (((3 + rng() % 9) << 10) | (rng() % 1024));
+        return v;
+    };
+    auto hf = [](uint16_t h) { return std::ldexp(1.0 + (h & 1023) / 1024.0, (int) (h >> 10) - 15); };
+    const std::vector<int8_t> qd = codes((size_t) (LR * D)), qu = codes((size_t) (D * LR));
+    const std::vector<uint16_t> sd = scales((size_t) (LR * D / 32)), su = scales((size_t) (D * LR / 32));
+    int8_t *d_qd = dev<int8_t>(qd.size()), *d_qu = dev<int8_t>(qu.size());
+    uint16_t *d_sd = dev<uint16_t>(sd.size()), *d_su = dev<uint16_t>(su.size());
+    up(d_qd, qd);
+    up(d_qu, qu);
+    up(d_sd, sd);
+    up(d_su, su);
+    // a down row's weight i, an up row's weight k
+    auto w_down = [&](int64_t r, int64_t i) {
+        return q8 ? qd[(size_t) (r * D + i)] * hf(sd[(size_t) (r * (D / 32) + i / 32)]) : bf(wd[(size_t) (r * D + i)]);
+    };
+    auto w_up = [&](size_t i, int64_t k) {
+        return q8 ? qu[i * LR + (size_t) k] * hf(su[i * (LR / 32) + (size_t) k / 32]) : bf(wu[i * LR + (size_t) k]);
+    };
     float* d_wn = dev<float>(wn.size());
     up(d_wd, wd);
     up(d_wu, wu);
@@ -653,6 +681,7 @@ int test_gr_read(std::mt19937& rng, cudaStream_t s) {
                     a.R = d[p][0] + t * D; a.R_out = d[p][0] + t * D; a.apply = apply;
                     a.bo_prev = d_bo + t * N; a.inj_prev = d_inj + t * HC;
                     a.w_norm = d_wn; a.w_down = d_wd; a.w_up = d_wu; a.w_inject = inject ? d_wi : nullptr;
+                    if (q8) { a.q_down = d_qd; a.s_down = d_sd; a.q_up = d_qu; a.s_up = d_su; }
                     a.eps = 1e-6f;
                     a.lo = d[p][1] + t * LR; a.rs = d[p][2] + t * HC; a.inject_out = d[p][3] + t * HC;
                     a.mixed = d[p][4] + t * N;
@@ -707,11 +736,11 @@ int test_gr_read(std::mt19937& rng, cudaStream_t s) {
                     for (int64_t i = 0; i < D; ++i) near(got[0][(size_t) i], Rp[(size_t) i], 1e-6 * Ra[(size_t) i] + 1e-30, "R", i);
                 std::vector<double> lo((size_t) LR), lo_b((size_t) LR);
                 for (int64_t r = 0; r < LR + (inject ? HC : 0); ++r) {
-                    const uint16_t* w = r < LR ? wd.data() + (size_t) (r * D) : wi.data() + (size_t) ((r - LR) * D);
                     double y = 0.0, mag = 0.0;
                     for (int64_t i = 0; i < D; ++i) {
-                        y += bf(w[i]) * xn[(size_t) i];
-                        mag += std::fabs(bf(w[i])) * xa[(size_t) i];
+                        const double w = r < LR ? w_down(r, i) : bf(wi[(size_t) ((r - LR) * D + i)]);
+                        y += w * xn[(size_t) i];
+                        mag += std::fabs(w) * xa[(size_t) i];
                     }
                     if (r < LR) {
                         const double x = y / HC;
@@ -728,7 +757,7 @@ int test_gr_read(std::mt19937& rng, cudaStream_t s) {
                         const size_t i = (size_t) (c * N + dd);
                         double u = 0.0, du = 0.0;
                         for (int64_t k = 0; k < LR; ++k) {
-                            const double w = bf(wu[i * LR + (size_t) k]);
+                            const double w = w_up(i, k);
                             u += w * lo[(size_t) k];
                             du += std::fabs(w) * (1e-4 * std::fabs(lo[(size_t) k]) + lo_b[(size_t) k]);
                         }
@@ -758,7 +787,9 @@ int test_gr_read(std::mt19937& rng, cudaStream_t s) {
             cudaFree(d_inj);
         }
     }
-    for (void* p : {(void*) d_wd, (void*) d_wu, (void*) d_wi, (void*) d_wn, (void*) d_scratch}) cudaFree(p);
+    for (void* p : {(void*) d_wd, (void*) d_wu, (void*) d_wi, (void*) d_wn, (void*) d_scratch, (void*) d_qd,
+                    (void*) d_qu, (void*) d_sd, (void*) d_su})
+        cudaFree(p);
     bad += off;
     char msg[256];
     std::snprintf(msg, sizeof msg,
@@ -766,7 +797,7 @@ int test_gr_read(std::mt19937& rng, cudaStream_t s) {
                   "estimating another read or not); FP64, the gates' average and the estimate within bounds (largest "
                   "error %.2g of its bound)",
                   worst);
-    std::printf("gr_read: %s\n", bad ? "MISMATCH" : msg);
+    std::printf("gr_read%s: %s\n", q8 ? " (8-bit down and up)" : "", bad ? "MISMATCH" : msg);
     return bad;
 }
 
@@ -1658,7 +1689,8 @@ int main(int argc, char** argv) {
     bad += test_router_multi(rng, s);
     bad += test_verify_router(rng, s);
     bad += test_router_rows(rng, s);
-    bad += test_gr_read(rng, s);
+    bad += test_gr_read(rng, s, false);
+    bad += test_gr_read(rng, s, true);
     bad += test_rope_tokens(rng, s);
     bad += test_norm_rope(rng, s);
     bad += test_kv_append(rng, s);

@@ -90,9 +90,10 @@ struct WeightRef {
     const void* native_data = nullptr;
     void* native_q8_1 = nullptr;
     int native_type = -1;
-    /// S23 experiment (STRATA_HC_Q8=1): a hyper-connection projection's Q8_0 bytes as the GGUF stores them, owned by
-    /// NativeDense, for the verify window's read (every other path keeps the pack's BF16 `data`)
-    const void* hc_q8 = nullptr;
+    /// A hyper-connection projection in 8 bits (HcQ8): int8 codes [ne1][ne0] and an f16 scale a 32 values, for the
+    /// verify window's read; every other path keeps the pack's BF16 `data`.
+    const int8_t* hc_codes = nullptr;
+    const uint16_t* hc_scales = nullptr;
     /// Plan v0.3 P1: false when the loader SKIPPED this tensor's canonical bytes because another form serves it
     /// (native GGUF projections, the native head).  The metadata above stays valid; `data` is null.
     bool resident = true;
@@ -137,6 +138,7 @@ public:
 
 private:
     friend class NativeDense;
+    friend class HcQ8;
     std::map<std::string, WeightRef> table_;
     LoadReport report_;
 };

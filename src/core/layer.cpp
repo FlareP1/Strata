@@ -1111,6 +1111,10 @@ bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockB
         err = "lm_head: the output_hc_* weights have the wrong engine forms";
         return false;
     }
+    if (wd->data == nullptr || wu->data == nullptr) {
+        err = "lm_head: the final mixer has no BF16 copy (--hc-q8 needs the native head)";
+        return false;
+    }
     const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
     strata::kernels::gr_read(bb.R, (const float*) wn->data, (const uint16_t*) wd->data,
                             (const uint16_t*) wu->data, nullptr, RMS_EPS, gs, bb.gr,

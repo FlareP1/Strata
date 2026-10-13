@@ -15,9 +15,10 @@
 // The down projection is split by input slices: 80 blocks each take a quarter of the 324 rows over a twentieth of
 // the input, so each block reads 1/20 of every token's R' instead of all of it, and the stream's rs multiplies the
 // slice sums (a slice lies in one stream).  The last block of each quarter adds the partials in a fixed order.
-// FP32 activations and BF16 weights; every token's outputs are the same whatever its place in the window and the
-// window's size.  Geometry is the artifact's: n_embd 2560, hc 4, hc_lr 320.  `inj_prev` and `inject_out` must be
-// different buffers (every block reads the former while one block writes the latter).
+// FP32 activations and BF16 weights, or the down and up projections in 8 bits (`q_down`, `q_up`: int8 codes with an f16
+// scale a 32 values, as GGUF's Q8_0; the injection's rows stay BF16); every token's outputs are the same whatever its
+// place in the window and the window's size.  Geometry is the artifact's: n_embd 2560, hc 4, hc_lr 320.  `inj_prev`
+// and `inject_out` must be different buffers (every block reads the former while one block writes the latter).
 #pragma once
 
 #include <cstddef>
@@ -35,6 +36,10 @@ struct FusedGrArgs {
     const uint16_t* w_down = nullptr;  ///< bf16 [hc_lr][hc*n_embd]
     const uint16_t* w_up = nullptr;    ///< bf16 [hc*n_embd][hc_lr]
     const uint16_t* w_inject = nullptr;///< bf16 [hc][hc*n_embd], or null (the final mixer)
+    const int8_t* q_down = nullptr;    ///< w_down in 8 bits [hc_lr][hc*n_embd], or null (w_down)
+    const uint16_t* s_down = nullptr;  ///< its f16 scales [hc_lr][hc*n_embd/32]
+    const int8_t* q_up = nullptr;      ///< w_up in 8 bits [hc*n_embd][hc_lr], or null (w_up)
+    const uint16_t* s_up = nullptr;    ///< its f16 scales [hc*n_embd][hc_lr/32]
     float eps = 1e-6f;
     float* lo = nullptr;               ///< workspace, hc_lr floats
     float* rs = nullptr;               ///< workspace, hc floats
@@ -49,7 +54,7 @@ struct FusedGrArgs {
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
 
 /// The read of `n_tok` tokens (1-8): `a[t]` is token t's arguments (its own R, pending write, lo, rs, inject,
-/// mixed, est; the four weight pointers, gate_ema, est_norm, est_gates and eps must be the same for every t).
+/// mixed, est; the weight pointers, gate_ema, est_norm, est_gates and eps must be the same for every t).
 /// `scratch` is `fused_gr_scratch_bytes()`, zeroed once when allocated (the kernels leave it zeroed); reads that share
 /// it must run in stream order.
 constexpr int kFusedGrMaxT = 8;

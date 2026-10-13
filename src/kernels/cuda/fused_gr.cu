@@ -54,6 +54,30 @@ __device__ __forceinline__ float dot8h(const uint4 w, const float4 x0, const flo
     return acc;
 }
 
+// 8 int8 (two words) against 8 floats held as two float4, in the order of dot8h: each byte biased by 128 into the low
+// mantissa bits of 2^23, less 2^23 + 128, is the code exactly
+__device__ __forceinline__ float i8f(uint32_t biased, unsigned sel) {
+    return __uint_as_float(__byte_perm(biased, 0x4B000000u, sel)) - 8388736.0f;
+}
+__device__ __forceinline__ float dot8q(const uint2 w, const float4 x0, const float4 x1) {
+    const uint32_t a = w.x ^ 0x80808080u, b = w.y ^ 0x80808080u;
+    float acc = 0.0f;
+    acc = fmaf(i8f(a, 0x7650u), x0.x, acc);
+    acc = fmaf(i8f(a, 0x7651u), x0.y, acc);
+    acc = fmaf(i8f(a, 0x7652u), x0.z, acc);
+    acc = fmaf(i8f(a, 0x7653u), x0.w, acc);
+    acc = fmaf(i8f(b, 0x7650u), x1.x, acc);
+    acc = fmaf(i8f(b, 0x7651u), x1.y, acc);
+    acc = fmaf(i8f(b, 0x7652u), x1.z, acc);
+    acc = fmaf(i8f(b, 0x7653u), x1.w, acc);
+    return acc;
+}
+__device__ __forceinline__ float f16f(uint16_t h) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    return f;
+}
+
 struct GrMulti {
     FusedGrArgs a[kFusedGrMaxT];
     int T;
@@ -199,6 +223,149 @@ __global__ void __launch_bounds__(DTH) gr_down_split_kernel(GrMulti m, float* __
     if (t == 0) ctr[g] = 0u;
 }
 
+// The down projection in 8 bits: the BF16 kernel's slices, staging, sums of squares and reduction; a group's 80 rows of
+// q_down go to warps 0-7, ten each, a lane 8 codes a step with their 32-column block's scale, and its injection row
+// (BF16) to warp 8.
+constexpr int DQW = 8, DQR = LR / DG / DQW;   // the code rows' warps a group and rows a warp
+static_assert(DQW * DQR * DG == LR && DQW + 1 == DW, "8-bit down geometry");
+template <int TT>
+__global__ void __launch_bounds__(DTH) gr_down_q8_split_kernel(GrMulti m, float* __restrict__ scratch) {
+    static_assert(TT >= 1 && TT <= DT, "tokens a launch");
+    __shared__ __align__(16) float4 xs[TT][DNF];
+    __shared__ float ssw[TT][DW];
+    __shared__ float s_rs[TT][HC];
+    __shared__ bool s_last;
+    unsigned* ctr = reinterpret_cast<unsigned*>(scratch + SC_CTR);
+    float* ssp = scratch + SC_SSP;
+    float* part = scratch + SC_PART;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int s = blockIdx.x, g = blockIdx.y;
+    const int c = s / DSPC, col0 = s * DCS;
+    const bool inj_warp = warp == DQW, has_inj = m.a[0].w_inject != nullptr;
+    const int rq0 = g * (DQW * DQR) + warp * DQR;   // the warp's first code row
+    float4 pr[TT], pb[TT], pw = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (t < DNF) {
+        pw = *reinterpret_cast<const float4*>(m.a[0].w_norm + col0 + 4 * t);
+#pragma unroll
+        for (int k = 0; k < TT; ++k) {
+            const FusedGrArgs& a = m.a[k];
+            pr[k] = *reinterpret_cast<const float4*>(a.R + col0 + 4 * t);
+            if (a.apply) pb[k] = *reinterpret_cast<const float4*>(a.bo_prev + col0 - c * N + 4 * t);
+        }
+    }
+    uint2 w[DQR][DSTEPS];
+    float sc[DQR][DSTEPS];
+    uint4 wi[DSTEPS];
+    if (!inj_warp) {
+#pragma unroll
+        for (int i = 0; i < DQR; ++i) {
+            const int8_t* row = m.a[0].q_down + (size_t) (rq0 + i) * D + col0;
+            const uint16_t* srow = m.a[0].s_down + (size_t) (rq0 + i) * (D / 32) + col0 / 32;
+#pragma unroll
+            for (int j = 0; j < DSTEPS; ++j) {
+                w[i][j] = __ldg(reinterpret_cast<const uint2*>(row) + j * 32 + lane);
+                sc[i][j] = f16f(__ldg(srow + (j * 32 + lane) / 4));
+            }
+        }
+    } else {
+        const uint16_t* row = m.a[0].w_inject + (size_t) (has_inj ? g : 0) * D + col0;
+        const uint4* w4 = reinterpret_cast<const uint4*>(row) + lane;
+#pragma unroll
+        for (int j = 0; j < DSTEPS; ++j) wi[j] = has_inj ? __ldg(w4 + j * 32) : make_uint4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int k = 0; k < TT; ++k) {
+        const FusedGrArgs& a = m.a[k];
+        const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+        float sq = 0.0f;
+        if (t < DNF) {
+            float4 r = pr[k];
+            if (a.apply) {
+                r.x = fmaf(pb[k].x, gw, r.x); r.y = fmaf(pb[k].y, gw, r.y);
+                r.z = fmaf(pb[k].z, gw, r.z); r.w = fmaf(pb[k].w, gw, r.w);
+            }
+            sq = fmaf(r.x, r.x, sq); sq = fmaf(r.y, r.y, sq); sq = fmaf(r.z, r.z, sq); sq = fmaf(r.w, r.w, sq);
+            xs[k][(t & 1) * (DNF / 2) + (t >> 1)] = make_float4(r.x * pw.x, r.y * pw.y, r.z * pw.z, r.w * pw.w);
+        }
+        sq = warp_sum(sq);
+        if (lane == 0) ssw[k][warp] = sq;
+    }
+    __syncthreads();
+    if (t < TT) {
+        float sq = 0.0f;
+#pragma unroll
+        for (int q = 0; q < DW; ++q) sq += ssw[t][q];
+        ssp[(g * DS + s) * DT + t] = sq;
+    }
+    if (!inj_warp) {
+        float acc[DQR * TT];
+#pragma unroll
+        for (int e = 0; e < DQR * TT; ++e) acc[e] = 0.0f;
+#pragma unroll
+        for (int j = 0; j < DSTEPS; ++j) {
+            float4 x0[TT], x1[TT];
+#pragma unroll
+            for (int k = 0; k < TT; ++k) { x0[k] = xs[k][j * 32 + lane]; x1[k] = xs[k][DNF / 2 + j * 32 + lane]; }
+#pragma unroll
+            for (int i = 0; i < DQR; ++i)
+#pragma unroll
+                for (int k = 0; k < TT; ++k)
+                    acc[i * TT + k] = fmaf(sc[i][j], dot8q(w[i][j], x0[k], x1[k]), acc[i * TT + k]);
+        }
+        auto emit = [=](int vi, float sum) {
+            const int i = vi / TT, k = vi - i * TT;
+            part[(s * DT + k) * NR + rq0 + i] = sum;
+        };
+        reduce_chunks<DQR * TT, 0, DQR * TT>(acc, lane, emit);
+    } else if (has_inj) {
+        float acc[TT];
+#pragma unroll
+        for (int k = 0; k < TT; ++k) acc[k] = 0.0f;
+#pragma unroll
+        for (int j = 0; j < DSTEPS; ++j)
+#pragma unroll
+            for (int k = 0; k < TT; ++k) acc[k] += dot8h(wi[j], xs[k][j * 32 + lane], xs[k][DNF / 2 + j * 32 + lane]);
+        auto emit = [=](int k, float sum) { part[(s * DT + k) * NR + LR + g] = sum; };
+        reduce_chunks<TT, 0, TT>(acc, lane, emit);
+    }
+    // the group's last block
+    __threadfence();
+    __syncthreads();
+    if (t == 0) s_last = atomicAdd(ctr + g, 1u) == (unsigned) (DS - 1);
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    if (t < TT * HC) {
+        const int k = t / HC, cc = t - k * HC;
+        float sq = 0.0f;
+#pragma unroll
+        for (int q = 0; q < DSPC; ++q) sq += __ldcg(ssp + (g * DS + cc * DSPC + q) * DT + k);
+        s_rs[k][cc] = rsqrtf(sq / (float) N + m.a[0].eps);
+    }
+    __syncthreads();
+    constexpr int GR = DQW * DQR + 1;   // a group's rows: its code rows, then its injection row
+    for (int e = t; e < TT * GR; e += DTH) {
+        const int k = e / GR, r = e - k * GR, rb = r < GR - 1 ? g * (GR - 1) + r : LR + g;
+        if (rb >= LR && !has_inj) continue;
+        float y = 0.0f;
+#pragma unroll
+        for (int cc = 0; cc < HC; ++cc) {
+            float p = 0.0f;
+#pragma unroll
+            for (int q = 0; q < DSPC; ++q) p += __ldcg(part + ((cc * DSPC + q) * DT + k) * NR + rb);
+            y = fmaf(s_rs[k][cc], p, y);
+        }
+        if (rb >= LR) {
+            m.a[k].inject_out[rb - LR] = y;
+        } else {
+            const float x = y / (float) HC;
+            m.a[k].lo[rb] = x / (1.0f + __expf(-x));
+        }
+    }
+    if (g == 0 && t < TT * HC) m.a[t / HC].rs[t % HC] = s_rs[t / HC][t % HC];
+    if (t == 0) ctr[g] = 0u;
+}
+
 // The up projection of TT tokens: each row of w_up read once, RW rows a warp at a time; the TT x RW dots of those rows
 // summed by one xor tree (xor_scatter) and every (row, token) epilogue on the lane holding its sum, its inputs fetched
 // while the dots run: R <- R' for this block's columns (when apply), mixed[d] = mean_c xn[c,d] * sigmoid(u[c,d]), the
@@ -296,6 +463,106 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
     }
 }
 
+// The up projection in 8 bits: the BF16 kernel with each row's 320 codes read 8 a lane (lanes 0-7 twice), each 8 with
+// their 32-column block's scale.
+template <int TT>
+__global__ void __launch_bounds__(THREADS) gr_up_q8_multi_kernel(GrMulti m) {
+    constexpr int RW = TT <= 4 ? 4 : 2;
+    constexpr int NV = pow2_at_least(TT * RW);
+    constexpr int LPV = 32 / NV;
+    __shared__ __align__(16) float4 lo4[TT][2][LR / 8];
+    __shared__ float g[TT][HC][UPM_COLS];
+    __shared__ float gs[TT][HC][UPM_COLS];
+    __shared__ float ge[TT][HC][UPM_COLS];
+    const bool est = m.a[0].est_norm != nullptr;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int d0 = blockIdx.x * UPM_COLS;
+    for (int i = t; i < TT * LR / 4; i += THREADS) {
+        const int k = i / (LR / 4), f = i - k * (LR / 4);
+        lo4[k][f & 1][f >> 1] = reinterpret_cast<const float4*>(m.a[k].lo)[f];
+    }
+    __syncthreads();
+    const int vi = xor_scatter_index<NV>(lane);
+    const int vq = vi / TT, vk = vi - vq * TT;
+    const bool epi = (lane & (LPV - 1)) == 0 && vi < TT * RW;
+    for (int r0 = warp * UPM_ROWS; r0 < (warp + 1) * UPM_ROWS; r0 += RW) {
+        uint2 wa[RW], wb[RW];
+        float sa[RW], sb[RW];
+#pragma unroll
+        for (int q = 0; q < RW; ++q) {
+            const int r = r0 + q, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+            const uint2* w2 = reinterpret_cast<const uint2*>(m.a[0].q_up + (size_t) i * LR);
+            const uint16_t* srow = m.a[0].s_up + (size_t) i * (LR / 32);
+            wa[q] = __ldg(w2 + lane);
+            sa[q] = f16f(__ldg(srow + lane / 4));
+            const bool two = lane < LR / 8 - 32;
+            wb[q] = two ? __ldg(w2 + 32 + lane) : make_uint2(0, 0);
+            sb[q] = two ? f16f(__ldg(srow + (32 + lane) / 4)) : 0.0f;
+        }
+        const int er = r0 + vq, ec = er / UPM_COLS, edd = er - ec * UPM_COLS, ei = ec * N + d0 + edd;
+        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f, en = 0.0f, eg = 0.0f;
+        bool apply = false;
+        if (epi) {
+            const FusedGrArgs& a = m.a[vk];
+            rv = a.R[ei];
+            wn = a.w_norm[ei];
+            rsc = a.rs[ec];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + edd]; ip = a.inj_prev[ec]; }
+            if (est) { en = a.est_norm[ei]; eg = a.est_gates[ei]; }
+        }
+        float v[NV];
+#pragma unroll
+        for (int q = 0; q < RW; ++q)
+#pragma unroll
+            for (int k = 0; k < TT; ++k) {
+                float acc = sa[q] * dot8q(wa[q], lo4[k][0][lane], lo4[k][1][lane]);
+                if (lane < LR / 8 - 32)
+                    acc = fmaf(sb[q], dot8q(wb[q], lo4[k][0][32 + lane], lo4[k][1][32 + lane]), acc);
+                v[q * TT + k] = acc;
+            }
+#pragma unroll
+        for (int e = TT * RW; e < NV; ++e) v[e] = 0.0f;
+        xor_scatter<NV>(v, lane);
+        if (epi) {
+            float x = rv;
+            if (apply) {
+                x = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), x);
+                m.a[vk].R_out[ei] = x;
+            }
+            const float y = x * wn * rsc;
+            const float gate = sigmoidf_(v[0]);
+            g[vk][ec][edd] = y * gate;
+            gs[vk][ec][edd] = gate;
+            ge[vk][ec][edd] = x * rsc * en * eg;
+        }
+    }
+    __syncthreads();
+    for (int i = t; i < TT * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        m.a[k].mixed[d0 + col] = s / (float) HC;
+    }
+    if (est)
+        for (int i = t; i < TT * UPM_COLS; i += THREADS) {
+            const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+            float s = 0.0f;
+#pragma unroll
+            for (int c = 0; c < HC; ++c) s += ge[k][c][col];
+            m.a[k].est[d0 + col] = s / (float) HC;
+        }
+    if (m.a[0].gate_ema != nullptr && t < HC * UPM_COLS) {
+        const int c = t / UPM_COLS, col = t - c * UPM_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int k = 0; k < TT; ++k) s += gs[k][c][col];
+        float* e = m.a[0].gate_ema + (size_t) c * N + d0 + col;
+        *e += 0.25f * (s / (float) TT - *e);
+    }
+}
+
 }  // namespace
 
 size_t fused_gr_scratch_bytes() { return (size_t) SC_FLOATS * sizeof(float); }
@@ -309,9 +576,12 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* scratch, void* 
     for (int t = 0; t < n_tok; ++t) {
         m.a[t] = a[t];
         const FusedGrArgs& x = a[t];
-        if (!x.R || !x.w_norm || !x.w_down || !x.w_up || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
+        if (!x.R || !x.w_norm || (!x.w_down && !x.q_down) || (!x.w_up && !x.q_up) || !x.lo || !x.rs || !x.mixed ||
+            (x.w_inject && !x.inject_out) ||
             (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out || x.inj_prev == x.inject_out)) ||
             x.w_down != a[0].w_down || x.w_up != a[0].w_up || x.w_inject != a[0].w_inject ||
+            x.q_down != a[0].q_down || x.s_down != a[0].s_down || x.q_up != a[0].q_up || x.s_up != a[0].s_up ||
+            (x.q_down && !x.s_down) || (x.q_up && !x.s_up) ||
             x.w_norm != a[0].w_norm || x.gate_ema != a[0].gate_ema || x.eps != a[0].eps ||
             x.est_norm != a[0].est_norm || x.est_gates != a[0].est_gates || (x.est_norm && (!x.est_gates || !x.est))) {
             std::fprintf(stderr, "fused_gr_read_multi: invalid arguments for token %d\n", t);
@@ -325,12 +595,27 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* scratch, void* 
         GrMulti md;
         md.T = std::min(DT, n_tok - t0);
         for (int k = 0; k < md.T; ++k) md.a[k] = a[t0 + k];
+        if (a[0].q_down != nullptr) {
+            switch (md.T) {
+#define STRATA_DOWN(T) case T: gr_down_q8_split_kernel<T><<<down_grid, DTH, 0, st>>>(md, scratch); break;
+                STRATA_DOWN(1) STRATA_DOWN(2) STRATA_DOWN(3) STRATA_DOWN(4)
+#undef STRATA_DOWN
+            }
+            continue;
+        }
         switch (md.T) {
 #define STRATA_DOWN(T) case T: gr_down_split_kernel<T><<<down_grid, DTH, 0, st>>>(md, scratch); break;
             STRATA_DOWN(1) STRATA_DOWN(2) STRATA_DOWN(3) STRATA_DOWN(4)
 #undef STRATA_DOWN
         }
     }
+    if (a[0].q_up != nullptr)
+        switch (n_tok) {
+#define STRATA_UP(T) case T: gr_up_q8_multi_kernel<T><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+            STRATA_UP(1) STRATA_UP(2) STRATA_UP(3) STRATA_UP(4) STRATA_UP(5) STRATA_UP(6) STRATA_UP(7) STRATA_UP(8)
+#undef STRATA_UP
+        }
+    else
     switch (n_tok) {
 #define STRATA_UP(T) case T: gr_up_multi_kernel<T><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
         STRATA_UP(1) STRATA_UP(2) STRATA_UP(3) STRATA_UP(4) STRATA_UP(5) STRATA_UP(6) STRATA_UP(7) STRATA_UP(8)

@@ -28,6 +28,7 @@
     "--kv",
     "int8",
     "--kv-grow",
+    "--hc-q8",
     "--pcie-mode",
     "kernel",
     "--pcie-frac",

@@ -669,7 +669,10 @@ void drive_rows_in(void* user, int64_t layer) {
 bool pump_gap(Drive* t, std::string& err, bool all = false) {
     if (t->tier2 == nullptr) return true;
     const Clock::time_point start = std::max(Clock::now(), t->copies_end);
-    const double left = t->gap_ms - std::chrono::duration<double, std::milli>(start - t->tail_at).count();
+    // 1.3 of the gap: the moves may reach into the next window's first pool, as many as the gap's own length is worth
+    // (at 1.0 the GDN commit's state-only replay, 0.37 ms shorter, cost UD-Q4_K_XL edit text 4.5% in moves left out)
+    constexpr double kGapScale = 1.3;
+    const double left = kGapScale * t->gap_ms - std::chrono::duration<double, std::milli>(start - t->tail_at).count();
     const double rate = t->tier2->copy_rate();
     const bool paced = !all && rate > 0 && t->gap_ms > 0;
     if (paced && left <= 0) return true;

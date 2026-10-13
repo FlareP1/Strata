@@ -293,7 +293,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         for (auto& x : xqm_) x = b.take<uint8_t>(strata::prefill::mmq::q8_bytes((int64_t) T, max_in));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
-        z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
+        z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV);
         qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
         idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
@@ -1186,15 +1186,13 @@ bool Verifier::capture_commit(std::string& err) {
         for (int64_t l = 0; l < g.n_layers && ok; ++l) {
             const LayerView v(*wt_, l);
             if (!is_qsa_layer(g, l)) {
-                const WeightRef* wnm = need(v, "ssm_norm.weight", err);
-                if (!wnm) { ok = false; break; }
                 float* state = ss.gdn_state + (size_t) gdn_index * gdn_floats;
                 float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                 const float* qkv = qkv_L_ + (size_t) gdn_index * MT * C;
                 gdn_conv_commit(conv, qkv, (int) C, commit_, cs_);
-                gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C, (int) C, gate_L_ + (size_t) gdn_index * MT * HV,
-                                    beta_L_ + (size_t) gdn_index * MT * HV, z_, (const float*) wnm->data, EPS, y_dummy_,
-                                    (int) g.ssm_k_heads, (int) HV, (int) MT, commit_, cs_);
+                gdn_step_commit(state, h_L_ + (size_t) gdn_index * MT * C, (int) C, gate_L_ + (size_t) gdn_index * MT * HV,
+                                beta_L_ + (size_t) gdn_index * MT * HV, (int) g.ssm_k_heads, (int) HV, (int) MT, commit_,
+                                cs_);
                 ++gdn_index;
             } else {
                 const QsaState& st = ss.qsa_states[qsa_index];

@@ -503,6 +503,16 @@ int main(int argc, char** argv) {
                 // the verify half leaves the state untouched; the commit half writes the state after n tokens
                 const std::vector<float>& want_st = c.n_keep < 0 ? st0 : sr;
                 if (std::memcmp(st.data(), want_st.data(), st.size() * 4) != 0) ok = false;
+                if (c.n_keep >= 0) {   // the commit's replay, state only
+                    check(cudaMemcpy(d_st, st0.data(), st0.size() * 4, cudaMemcpyHostToDevice), "s0");
+                    strata::kernels::gdn_step_commit(d_st, d_h, C, d_gate, d_beta, h_k, h_v, T, d_nk, nullptr);
+                    std::vector<float> stc(st0.size());
+                    down(stc, d_st);
+                    if (std::memcmp(stc.data(), sr.data(), stc.size() * 4) != 0) {
+                        std::printf("    *** gdn_step_commit T=%d '%s': the state differs ***\n", T, c.name);
+                        ok = false;
+                    }
+                }
                 ++sn_n;
                 if (!ok) {
                     std::printf("    *** gdn_step_norm_multi T=%d '%s' differs from fused_gdn_step_norm (memcmp): %zu of %zu y words%s ***\n",

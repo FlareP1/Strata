@@ -18,10 +18,11 @@ namespace {
 constexpr int64_t N = 2560, FF2 = 1280, FF = 640, K = 10;
 // Batches of consecutive ids, at most G experts and ROWS rows (an expert with more rows is a batch of its own, in
 // pieces of ROWS).  Per-expert launches made the host, not the GPU, the limit (~10 calls for each of ~500 experts a
-// layer).
+// layer); with ROWS 4096 the second GPU's share of a 16K chunk still took ~9-13 ms of launches a layer, which the main
+// GPU waited for (8192: 2.8-3.6% off a 16K prompt; G 32 on top: <= 0.6%).
 constexpr int G = 16;
 static_assert(G <= mmq::kGatherGroupMax, "a batch's experts gathered in one launch");
-constexpr int64_t ROWS = 4096;
+constexpr int64_t ROWS = 8192;
 constexpr int SLOTS = 2;                 // batches in staging: the copies of one overlap the work on the other
 constexpr size_t GEMM_WS = 32u << 20;    // cuBLAS workspace
 constexpr int NPTR = 7;                  // per-expert device pointers: blob, xs, gate/up, gu, h, down, d

@@ -113,7 +113,8 @@ __global__ void quantize_mmq_q8_1_f16(const half* __restrict__ x, void* __restri
     if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
         sum = xi.x + xi.y + xi.z + xi.w;
 #pragma unroll
-        for (int offset = vals_per_sum / 8; offset > 0; offset >>= 1) sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+        for (int offset = vals_per_sum / 8; offset > 0; offset >>= 1)
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
     }
     const float d_inv = 127.0f / amax;
     char4 q;
@@ -170,18 +171,19 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
 void quantize_f16(const uint16_t* x, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
     const int64_t ne0 = pad512(cols);
-    const dim3 grid((unsigned) rows, (unsigned) ((ne0 + 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ)));
+    constexpr int B = CUDA_QUANTIZE_BLOCK_SIZE_MMQ;
+    const dim3 grid((unsigned) rows, (unsigned) ((ne0 + 4 * B - 1) / (4 * B)));
     const cudaStream_t s = (cudaStream_t) stream;
     const half* h = (const half*) x;
     switch (mmq_get_q8_1_ds_layout((ggml_type) t)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_D4><<<grid, CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 0, s>>>(h, xq, cols, ld, ne0, (int) rows);
+            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_D4><<<grid, B, 0, s>>>(h, xq, cols, ld, ne0, (int) rows);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_DS4><<<grid, CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 0, s>>>(h, xq, cols, ld, ne0, (int) rows);
+            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_DS4><<<grid, B, 0, s>>>(h, xq, cols, ld, ne0, (int) rows);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
-            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_D2S6><<<grid, CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 0, s>>>(h, xq, cols, ld, ne0, (int) rows);
+            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_D2S6><<<grid, B, 0, s>>>(h, xq, cols, ld, ne0, (int) rows);
             break;
         default:
             std::fprintf(stderr, "prefill mmq: no q8_1 layout for type %d\n", t);

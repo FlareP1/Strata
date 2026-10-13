@@ -20,6 +20,7 @@ constexpr int64_t N = 2560, FF2 = 1280, FF = 640, K = 10;
 // pieces of ROWS).  Per-expert launches made the host, not the GPU, the limit (~10 calls for each of ~500 experts a
 // layer).
 constexpr int G = 16;
+static_assert(G <= mmq::kGatherGroupMax, "a batch's experts gathered in one launch");
 constexpr int64_t ROWS = 4096;
 constexpr int SLOTS = 2;                 // batches in staging: the copies of one overlap the work on the other
 constexpr size_t GEMM_WS = 32u << 20;    // cuBLAS workspace
@@ -567,12 +568,14 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, const std::vector<int32_t
         const bool q = use_mmq && rows <= ROWS;   // an expert with more rows is multiplied in pieces, in FP16
         if (q) {
             // the batch's GGUF blocks side by side in the dequantization buffers' place (MMQ reads the experts at
-            // one stride), a zeroed tail after them
-            for (size_t j = j0; j < j1; ++j) {
-                const uint8_t* bl = (const uint8_t*) P[0 * E + j];
-                mmq::gather_native(bl, bl + f.up_off, gub / 2, bl + f.down_off, db, (uint8_t*) m.dq_gu + (j - j0) * gub,
-                                   (uint8_t*) m.dq_d + (j - j0) * db, m.s);
-            }
+            // one stride), a zeroed tail after them; one launch for the batch (G <= kGatherGroupMax)
+            if (!mmq::gather_native_group((const uint8_t* const*) (P + 0 * E + j0), n, f.up_off, gub / 2, f.down_off, db,
+                                          m.dq_gu, gub, m.dq_d, db, m.s))
+                for (size_t j = j0; j < j1; ++j) {
+                    const uint8_t* bl = (const uint8_t*) P[0 * E + j];
+                    mmq::gather_native(bl, bl + f.up_off, gub / 2, bl + f.down_off, db,
+                                       (uint8_t*) m.dq_gu + (j - j0) * gub, (uint8_t*) m.dq_d + (j - j0) * db, m.s);
+                }
             cudaMemsetAsync((uint8_t*) m.dq_gu + (size_t) n * gub, 0, MMQ_TAIL, m.s);
             cudaMemsetAsync((uint8_t*) m.dq_d + (size_t) n * db, 0, MMQ_TAIL, m.s);
         } else if (lay.native)

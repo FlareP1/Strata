@@ -3601,6 +3601,9 @@ int main(int argc, char** argv) {
             int req_penalty_last_n = 0;
             double req_spec_min_p = o.spec_min_p;
             std::vector<int32_t> req_score;   // score=ID:ID:...: see the first window
+            // img_keys=<hex>,<hex>,...: each picture's key from the server (its normalized bytes' hash), in prompt
+            // order; the conversation cache then matches a picture by key and grid, not by its embedding floats
+            std::vector<uint64_t> req_img_keys;
             if (endp != nullptr) {
                 for (;;) {
                     while (*endp == ' ') ++endp;
@@ -3623,6 +3626,16 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(v, nullptr, 10);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "img_keys") {
+                        req_img_keys.clear();
+                        for (const char* q = v; *q != '\0';) {
+                            char* qe = nullptr;
+                            const unsigned long long hk = std::strtoull(q, &qe, 16);
+                            if (qe == q || (*qe != ',' && *qe != '\0')) { req_img_keys.clear(); break; }
+                            req_img_keys.push_back((uint64_t) hk);
+                            q = *qe == ',' ? qe + 1 : qe;
+                        }
+                    }
                     else if (key == "score") {
                         for (const char* q = v; *q != '\0';) {
                             char* qe = nullptr;
@@ -3691,8 +3704,11 @@ int main(int argc, char** argv) {
                         const Img& im = imgs[k++];
                         const int64_t grid[3] = {im.n, im.nx, im.ny};
                         uint64_t image_hash = fnv1a(grid, sizeof grid);
-                        image_hash = fnv1a(img_rows.data() + im.off,
-                                           (size_t) im.n * (size_t) g.n_embd * sizeof(float), image_hash);
+                        if (req_img_keys.size() == imgs.size())   // the server's key for picture k
+                            image_hash = fnv1a(&req_img_keys[k - 1], sizeof(uint64_t), image_hash);
+                        else
+                            image_hash = fnv1a(img_rows.data() + im.off,
+                                               (size_t) im.n * (size_t) g.n_embd * sizeof(float), image_hash);
                         req_imgs.push_back({i, image_hash});
                         for (int64_t j = 0; j < im.n && ve.empty(); ++j)
                             if (i + j >= n || ids[(size_t) (i + j)] != kImagePad)

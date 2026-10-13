@@ -1555,7 +1555,7 @@ int test_prefill_gdn(std::mt19937& rng, cudaStream_t s) {
             up(d_hist[p], hist);
             up(d_state[p], state);
         }
-        uint16_t* d_y16 = dev<uint16_t>(z.size());
+        uint16_t *d_y16 = dev<uint16_t>(z.size()), *d_y16b = dev<uint16_t>(z.size());
         // the verify window's kernels, a window of up to 8 tokens after another, each committed
         std::vector<int32_t> counts;
         for (int t0 = 0; t0 < T; t0 += 8) counts.push_back(std::min(8, T - t0));
@@ -1572,9 +1572,12 @@ int test_prefill_gdn(std::mt19937& rng, cudaStream_t s) {
         // the prompt path, all T at once
         strata::prefill::gdn_conv(d_hist[1], d_qkv, d_w, d_h[1], T, eps, s);
         strata::prefill::gdn_scan(d_state[1], d_h[1], d_gate, d_beta, d_y[1], T, s);
-        strata::prefill::gdn_out_norm(d_y[1], d_z, d_gamma, eps, d_y16, T, s);
+        strata::prefill::gdn_out_norm(d_y[1], d_z, d_gamma, eps, d_y16, T, s);   // the engine's: FP16 only
+        strata::prefill::gdn_out_norm(d_y[1], d_z, d_gamma, eps, d_y16b, T, s, true);   // and FP32, in place
         check(cudaStreamSynchronize(s), "prefill gdn");
-        const int b = bitwise_diff(down(d_h[0], qkv.size()), down(d_h[1], qkv.size()), "conv output") +
+        const bool y16_same = down(d_y16, z.size()) == down(d_y16b, z.size());
+        if (!y16_same) std::fprintf(stderr, "  FP16 y: the norm's two forms differ\n");
+        const int b = !y16_same + bitwise_diff(down(d_h[0], qkv.size()), down(d_h[1], qkv.size()), "conv output") +
                       bitwise_diff(down(d_y[0], z.size()), down(d_y[1], z.size()), "y") +
                       bitwise_diff(down(d_state[0], state.size()), down(d_state[1], state.size()), "state") +
                       bitwise_diff(down(d_hist[0], hist.size()), down(d_hist[1], hist.size()), "conv history");
@@ -1588,6 +1591,7 @@ int test_prefill_gdn(std::mt19937& rng, cudaStream_t s) {
         }
         for (float* p : {d_qkv, d_gate, d_beta, d_z}) cudaFree(p);
         cudaFree(d_y16);
+        cudaFree(d_y16b);
         cudaFree(d_counts);
     }
     cudaFree(d_w);

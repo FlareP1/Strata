@@ -207,14 +207,13 @@ __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commi
 template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
 
 // The recurrence over the chunk, the arithmetic of gdn_step_norm_multi: a thread per (CPT columns, group of 32
-// state rows), a head's columns split over S / CB blocks.  A column's four row groups sit in adjacent lanes, so
-// both sums over the row groups are shuffles added in the decode kernels' order (group 0 + 1 + 2 + 3).  Each
-// token's q, k, v, gate and beta are copied (cp.async) into a ring of DEPTH token slots DEPTH - 1 tokens ahead, so
-// the reads from memory overlap the steps before them: one barrier per token.  Each thread reads its row group's
-// 32 q and 32 k values into registers with 16-byte loads once for its CPT columns; a row group is padded to 36
-// words, so the four groups a warp reads at once sit in different banks.  Writes o (before the norm) to `out`;
-// gdn_norm_kernel finishes each token.
-constexpr int RG = 4, RPG = S / RG, RP = RPG + 4, DEPTH = 8, SLOT = 2 * RG * RP;
+// state rows) of the VPK value heads that share a key head (head % HK), a block per key head and CB columns.  A column's four row groups sit in adjacent lanes, so both sums
+// over the row groups are shuffles added in the decode kernels' order (group 0 + 1 + 2 + 3).  Each token's q, k, v,
+// gate and beta are copied (cp.async) into a ring of DEPTH token slots DEPTH - 1 tokens ahead, so the reads from memory
+// overlap the steps before them: one barrier per token.  Each thread reads its row group's 32 q and 32 k values into
+// registers with 16-byte loads once for its VPK x CPT columns; a row group is padded to 36 words, so the four groups a
+// warp reads at once sit in different banks.  Writes o (before the norm) to `out`; gdn_norm_kernel finishes each token.
+constexpr int RG = 4, RPG = S / RG, RP = RPG + 4, DEPTH = 8, SLOT = 2 * RG * RP, VPK = HV / HK;
 template <int CB, int CPT>
 __global__ void __launch_bounds__(CB / CPT * RG) gdn_scan_kernel(float* __restrict__ state,
                                                                  const float* __restrict__ h,
@@ -222,14 +221,18 @@ __global__ void __launch_bounds__(CB / CPT * RG) gdn_scan_kernel(float* __restri
                                                                  const float* __restrict__ beta,
                                                                  float* __restrict__ out, int T) {
     constexpr int NT = CB / CPT * RG, QL = (2 * S + NT - 1) / NT;   // threads; q/k values each thread copies
-    static_assert(CB % (8 * CPT) == 0 && NT >= CB + 2, "8 column groups a warp; a thread each for v, gate, beta");
+    constexpr int NV = VPK * (CB + 2), VL = (NV + NT - 1) / NT;      // v, gate and beta values; each thread's
+    static_assert(CB % (8 * CPT) == 0 && VPK * HK == HV, "8 column groups a warp; HV / HK value heads a key head");
     __shared__ __align__(16) float sqk[DEPTH * SLOT];   // per slot: q, then k, [row group][row]
-    __shared__ float sv[DEPTH * CB], sgb[DEPTH * 2];
-    const int head = blockIdx.x, tid = threadIdx.x, lane = tid & 31;
+    __shared__ float sv[DEPTH * VPK * CB], sgb[DEPTH * 2 * VPK];   // per slot: v [head][column]; gate, beta [head]
+    const int tid = threadIdx.x, lane = tid & 31;
     const int cl = ((tid >> 5) * 8 + (lane >> 2)) * CPT, rg = lane & 3, g0 = lane & ~3;   // first local column
-    const int qh = head % HK;
-    // what this thread copies for every token: q/k value i = tid + j * NT < 2S (row i & 127 of q or k), then v of
-    // local column tid (tid < CB), the gate (tid == CB) or beta (tid == CB + 1)
+    // % HK although the grid has HK blocks in x: without the bound ptxas compiles the kernel to 182 registers instead
+    // of 226, 1.2x slower
+    const int qh = blockIdx.x % HK;
+    auto head = [&](int j) { return qh + j * HK; };
+    // what this thread copies for every token: q/k value i = tid + j * NT < 2S (row i & 127 of q or k), then item
+    // i = tid + j * NT < NV: v of head i / CB's local column i % CB (i < VPK * CB), else the gate or beta of a head
     int qk_off[QL], qk_at[QL];
 #pragma unroll
     for (int j = 0; j < QL; ++j) {
@@ -237,15 +240,33 @@ __global__ void __launch_bounds__(CB / CPT * RG) gdn_scan_kernel(float* __restri
         qk_off[j] = i < 2 * S ? (i < S ? 0 : HK * S) + qh * S + (i & (S - 1)) : -1;
         qk_at[j] = (i >> 7) * RG * RP + ((i & (S - 1)) / RPG) * RP + (i & (RPG - 1));
     }
-    const int v_off = 2 * HK * S + head * S + blockIdx.y * CB + tid;
-    const float* gb = (tid == CB ? gate : beta) + head;
-    float s[CPT][RPG];
-    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + blockIdx.y * CB + cl;
+    const float* it_src[VL];   // token 0's value; -1 offset: none
+    int it_ld[VL], it_at[VL];
+#pragma unroll
+    for (int j = 0; j < VL; ++j) {
+        const int i = tid + j * NT;
+        it_src[j] = nullptr;
+        if (i < VPK * CB) {
+            it_src[j] = h + 2 * HK * S + head(i / CB) * S + blockIdx.y * CB + i % CB;
+            it_ld[j] = C;
+            it_at[j] = i;
+        } else if (i < NV) {
+            const int k = i - VPK * CB;
+            it_src[j] = (k < VPK ? gate : beta) + head(k % VPK);
+            it_ld[j] = HV;
+            it_at[j] = DEPTH * VPK * CB + k;   // into sgb, which follows sv
+        }
+    }
+    float s[VPK][CPT][RPG];
     const size_t rs = (size_t) HV * S;
 #pragma unroll
-    for (int c = 0; c < CPT; ++c)
+    for (int j = 0; j < VPK; ++j) {
+        const float* base = state + ((size_t) (rg * RPG) * HV + head(j)) * S + blockIdx.y * CB + cl;
 #pragma unroll
-        for (int r = 0; r < RPG; ++r) s[c][r] = base[r * rs + c];
+        for (int c = 0; c < CPT; ++c)
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) s[j][c][r] = base[r * rs + c];
+    }
     int next = 0;   // the next token to copy
     auto issue = [&]() {
         if (next < T) {
@@ -254,8 +275,12 @@ __global__ void __launch_bounds__(CB / CPT * RG) gdn_scan_kernel(float* __restri
 #pragma unroll
             for (int j = 0; j < QL; ++j)
                 if (qk_off[j] >= 0) cp_async4(&sqk[slot * SLOT + qk_at[j]], ht + qk_off[j]);
-            if (tid < CB) cp_async4(&sv[slot * CB + tid], ht + v_off);
-            else if (tid < CB + 2) cp_async4(&sgb[slot * 2 + tid - CB], gb + (size_t) next * HV);
+#pragma unroll
+            for (int j = 0; j < VL; ++j)
+                if (it_src[j] != nullptr)
+                    cp_async4(it_at[j] < DEPTH * VPK * CB ? &sv[slot * VPK * CB + it_at[j]]
+                                                          : &sgb[slot * 2 * VPK + it_at[j] - DEPTH * VPK * CB],
+                              it_src[j] + (size_t) next * it_ld[j]);
         }
         cp_async_commit();
         ++next;
@@ -275,44 +300,63 @@ __global__ void __launch_bounds__(CB / CPT * RG) gdn_scan_kernel(float* __restri
             kr[4 * j] = a.x; kr[4 * j + 1] = a.y; kr[4 * j + 2] = a.z; kr[4 * j + 3] = a.w;
             qr[4 * j] = b.x; qr[4 * j + 1] = b.y; qr[4 * j + 2] = b.z; qr[4 * j + 3] = b.w;
         }
-        const float g = __expf(sgb[slot * 2]), bt = sgb[slot * 2 + 1];
-        float kv[CPT], o[CPT];
+        float g[VPK], bt[VPK];
 #pragma unroll
-        for (int c = 0; c < CPT; ++c) kv[c] = o[c] = 0.0f;
+        for (int j = 0; j < VPK; ++j) g[j] = __expf(sgb[slot * 2 * VPK + j]), bt[j] = sgb[slot * 2 * VPK + VPK + j];
+        float kv[VPK][CPT], o[VPK][CPT];
 #pragma unroll
-        for (int r = 0; r < RPG; ++r)
+        for (int j = 0; j < VPK; ++j)
 #pragma unroll
-            for (int c = 0; c < CPT; ++c) kv[c] = fmaf(s[c][r], kr[r], kv[c]);
-        float delta[CPT];
-#pragma unroll
-        for (int c = 0; c < CPT; ++c) {
-            const float k0 = __shfl_sync(0xffffffffu, kv[c], g0), k1 = __shfl_sync(0xffffffffu, kv[c], g0 + 1),
-                        k2 = __shfl_sync(0xffffffffu, kv[c], g0 + 2), k3 = __shfl_sync(0xffffffffu, kv[c], g0 + 3);
-            const float kv_col = k0 + k1 + k2 + k3;
-            delta[c] = (sv[slot * CB + cl + c] - g * kv_col) * bt;
-        }
+            for (int c = 0; c < CPT; ++c) kv[j][c] = o[j][c] = 0.0f;
 #pragma unroll
         for (int r = 0; r < RPG; ++r)
+#pragma unroll
+            for (int j = 0; j < VPK; ++j)
+#pragma unroll
+                for (int c = 0; c < CPT; ++c) kv[j][c] = fmaf(s[j][c][r], kr[r], kv[j][c]);
+        float delta[VPK][CPT];
+#pragma unroll
+        for (int j = 0; j < VPK; ++j)
 #pragma unroll
             for (int c = 0; c < CPT; ++c) {
-                s[c][r] = fmaf(g, s[c][r], kr[r] * delta[c]);
-                o[c] = fmaf(s[c][r], qr[r], o[c]);
+                const float k0 = __shfl_sync(0xffffffffu, kv[j][c], g0), k1 = __shfl_sync(0xffffffffu, kv[j][c], g0 + 1),
+                            k2 = __shfl_sync(0xffffffffu, kv[j][c], g0 + 2), k3 = __shfl_sync(0xffffffffu, kv[j][c], g0 + 3);
+                const float kv_col = k0 + k1 + k2 + k3;
+                delta[j][c] = (sv[slot * VPK * CB + j * CB + cl + c] - g[j] * kv_col) * bt[j];
             }
-        float* ot = out + (size_t) t * HV * S + head * S + blockIdx.y * CB + cl;
 #pragma unroll
-        for (int c = 0; c < CPT; ++c) {
-            const float o0 = __shfl_sync(0xffffffffu, o[c], g0), o1 = __shfl_sync(0xffffffffu, o[c], g0 + 1),
-                        o2 = __shfl_sync(0xffffffffu, o[c], g0 + 2), o3 = __shfl_sync(0xffffffffu, o[c], g0 + 3);
-            if (rg == 0) ot[c] = (o0 + o1 + o2 + o3) * rsqrtf((float) S);
+        for (int r = 0; r < RPG; ++r)
+#pragma unroll
+            for (int j = 0; j < VPK; ++j)
+#pragma unroll
+                for (int c = 0; c < CPT; ++c) {
+                    s[j][c][r] = fmaf(g[j], s[j][c][r], kr[r] * delta[j][c]);
+                    o[j][c] = fmaf(s[j][c][r], qr[r], o[j][c]);
+                }
+#pragma unroll
+        for (int j = 0; j < VPK; ++j) {
+            float* ot = out + (size_t) t * HV * S + head(j) * S + blockIdx.y * CB + cl;
+#pragma unroll
+            for (int c = 0; c < CPT; ++c) {
+                const float o0 = __shfl_sync(0xffffffffu, o[j][c], g0), o1 = __shfl_sync(0xffffffffu, o[j][c], g0 + 1),
+                            o2 = __shfl_sync(0xffffffffu, o[j][c], g0 + 2), o3 = __shfl_sync(0xffffffffu, o[j][c], g0 + 3);
+                if (rg == 0) ot[c] = (o0 + o1 + o2 + o3) * rsqrtf((float) S);
+            }
         }
     }
     cp_async_wait<0>();
 #pragma unroll
-    for (int c = 0; c < CPT; ++c)
+    for (int j = 0; j < VPK; ++j) {
+        float* base = state + ((size_t) (rg * RPG) * HV + head(j)) * S + blockIdx.y * CB + cl;
 #pragma unroll
-        for (int r = 0; r < RPG; ++r) base[r * rs + c] = s[c][r];
+        for (int c = 0; c < CPT; ++c)
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) base[r * rs + c] = s[j][c][r];
+    }
 }
-// y = rmsnorm(o) * gamma * sigmoid(z) per (token, head), in place over o; also the FP16 image
+// y16 = rmsnorm(o) * gamma * sigmoid(z) per (token, head) in FP16 (the out projection's input), from o in y; with
+// Y32 its FP32 value too, in place over o
+template <bool Y32>
 __global__ void __launch_bounds__(S) gdn_norm_kernel(float* __restrict__ y, const float* __restrict__ z,
                                                      const float* __restrict__ gamma, float eps,
                                                      uint16_t* __restrict__ y16) {
@@ -324,7 +368,7 @@ __global__ void __launch_bounds__(S) gdn_norm_kernel(float* __restrict__ y, cons
     __syncthreads();
     const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
     const float v = oc * rsqrtf(ss / (float) S + eps) * gamma[threadIdx.x] * sigm(z[i]);
-    y[i] = v;
+    if constexpr (Y32) y[i] = v;
     y16[i] = hf(v);
 }
 
@@ -600,16 +644,23 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
     check("gdn_conv");
 }
 void gdn_scan(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T, void* stream) {
-    // 32 columns a block, 2 a thread (fastest of 16-128 columns, 1-2 a thread: 0.67 us a token on the 3090)
-    constexpr int CB = 32, CPT = 2;
-    gdn_scan_kernel<CB, CPT><<<dim3(HV, S / CB), CB / CPT * RG, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, (int) T);
+    // 16 columns a block, 1 a thread (0.65 us a token at 16K on the 3090: 1.2x a block per value head, 32 columns, 2 a
+    // thread; 8 or 32 columns, 1 a thread: 0.87x / 0.92x; 16 columns, 2 a thread spill)
+    constexpr int CB = 16, CPT = 1;
+    gdn_scan_kernel<CB, CPT><<<dim3(HK, S / CB), CB / CPT * RG, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, (int) T);
     check("gdn_scan");
 }
-void gdn_out_norm(float* y, const float* z, const float* gamma, float eps, uint16_t* y16, int64_t T, void* stream) {
+void gdn_out_norm(float* y, const float* z, const float* gamma, float eps, uint16_t* y16, int64_t T, void* stream,
+                  bool y32) {
     for (int64_t t0 = 0; t0 < T; t0 += 65535) {
         const int64_t n = std::min<int64_t>(65535, T - t0);
-        gdn_norm_kernel<<<dim3(HV, (unsigned) n), S, 0, (cudaStream_t) stream>>>(y + t0 * HV * S, z + t0 * HV * S, gamma,
-                                                                                eps, y16 + t0 * HV * S);
+        const dim3 grid(HV, (unsigned) n);
+        if (y32)
+            gdn_norm_kernel<true><<<grid, S, 0, (cudaStream_t) stream>>>(y + t0 * HV * S, z + t0 * HV * S, gamma, eps,
+                                                                         y16 + t0 * HV * S);
+        else
+            gdn_norm_kernel<false><<<grid, S, 0, (cudaStream_t) stream>>>(y + t0 * HV * S, z + t0 * HV * S, gamma, eps,
+                                                                          y16 + t0 * HV * S);
     }
     check("gdn_out_norm");
 }

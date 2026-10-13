@@ -1572,8 +1572,7 @@ int test_prefill_gdn(std::mt19937& rng, cudaStream_t s) {
         }
         // the prompt path, all T at once
         strata::prefill::gdn_conv(d_hist[1], d_qkv, d_w, d_h[1], T, eps, s);
-        void* d_scratch = dev<uint8_t>(strata::prefill::gdn_scan_scratch_bytes(T));
-        strata::prefill::gdn_scan(d_state[1], d_h[1], d_gate, d_beta, d_y[1], T, d_scratch, s);
+        strata::prefill::gdn_scan(d_state[1], d_h[1], d_gate, d_beta, d_y[1], T, s);
         strata::prefill::gdn_out_norm(d_y[1], d_z, d_gamma, eps, d_y16, T, s);   // the engine's: FP16 only
         strata::prefill::gdn_out_norm(d_y[1], d_z, d_gamma, eps, d_y16b, T, s, true);   // and FP32, in place
         check(cudaStreamSynchronize(s), "prefill gdn");
@@ -1607,7 +1606,6 @@ int test_prefill_gdn(std::mt19937& rng, cudaStream_t s) {
         for (float* p : {d_qkv, d_gate, d_beta, d_z}) cudaFree(p);
         cudaFree(d_y16);
         cudaFree(d_y16b);
-        cudaFree(d_scratch);
         cudaFree(d_counts);
     }
     cudaFree(d_w);

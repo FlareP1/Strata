@@ -417,28 +417,50 @@ __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict
 //   B_t = beta_t (v_t - exp(gamma_t) S0^T k_t),   D = T B (the delta rule's corrections),
 //   o_t = exp(gamma_t) S0^T q_t + sum_{i <= t} exp(gamma_t - gamma_i) (q_t.k_i) D_i,
 //   S = exp(gamma_L) S0 + sum_t exp(gamma_L - gamma_t) k_t D_t^T.
-// gdn_chunk_prep_kernel: T, P (the decayed q.k) and the scales of every chunk (FP32, a block per chunk and key head);
-// gdn_chunk_walk_kernel: a block per key head and GCW value columns, a warp per value head and 16 columns, its state
-// slice S^T [16 x 128] in FP32 registers as mma accumulators, chunk after chunk; every product an m16n8k16 FP16 mma
-// with FP32 sums (an accumulator tile pair is the next mma's A operand; K and Q staged in FP32, rounded as loaded).
+// gdn_chunk_kernel: a block per key head and GCW value columns, chunk after chunk.  Six walk warps, a value head and 16
+// columns each: the state slice S^T [16 x 128] in FP32 registers as mma accumulators, every product an m16n8k16 FP16
+// mma with FP32 sums (an accumulator tile pair is the next mma's A operand), K and Q through ldmatrix.  Two prep warps
+// a chunk ahead: K K^T, Q K^T (from hi + lo FP16 halves: the FP32 dots' precision), T, P and the scales, K and Q in
+// FP16.  Two loader warps two chunks ahead (cp.async).  One barrier a chunk: the walk warps only compute.
 constexpr int VPK = HV / HK;     // value heads a key head
 constexpr int GCL = 16;          // tokens a chunk
-constexpr int GCW = 32;          // value columns a walk block
+constexpr int GCW = 32;          // value columns a block
 constexpr int GKP = S + 8;       // padded FP32 K / Q rows: a half-warp's 64-bit loads on distinct banks
+constexpr int GKH = S + 8;       // padded FP16 K / Q rows: ldmatrix's 8 rows on distinct 16-byte bank groups
 constexpr int GTP = GCL + 8;     // padded FP16 T / P rows
 constexpr int GVP = GCW + 4;     // padded V rows
-struct alignas(16) GdnTps {      // a (chunk, value head)
+constexpr int GWALK = 32 * 2 * VPK, GPREP = 64, GLOAD = 64;   // the block's threads: walk, prep, loaders
+struct alignas(16) GdnIn {       // the loaders' K, Q, gates and betas: chunk c in buffer c % 2
+    float k[GCL][GKP], q[GCL][GKP];
+    float gate[VPK][GCL], beta[VPK][GCL];
+};
+struct alignas(16) GdnV {        // V: c % 2, a chunk ahead
+    float v[VPK][GCL][GVP];
+};
+struct alignas(16) GdnTps {      // a value head's chunk
     __half t[GCL][GTP], p[GCL][GTP];
     float s[64];                 // exp(gamma_t), exp(gamma_L - gamma_t), beta_t, exp(gamma_L)
 };
-struct alignas(16) GdnStage {
-    float k[GCL][GKP], q[GCL][GKP];
+struct alignas(16) GdnOut {      // the prep's: c % 3
+    __half k[GCL][GKH], q[GCL][GKH];
     GdnTps tp[VPK];
-    float v[VPK][GCL][GVP];
 };
+struct alignas(16) GdnScratch {  // the prep's working set
+    float kk[GCL][GCL + 1], qk[GCL][GCL + 1];
+    float a[VPK][GCL][GCL + 1];
+    float gm[VPK][GCL];
+};
+constexpr int GDN_SMEM = 2 * sizeof(GdnIn) + 2 * sizeof(GdnV) + 3 * sizeof(GdnOut) + sizeof(GdnScratch);
 __device__ __forceinline__ uint32_t gh2(float lo, float hi) {
     const __half2 v = __floats2half2_rn(lo, hi);
     return *reinterpret_cast<const uint32_t*>(&v);
+}
+__device__ __forceinline__ void gsplit(float x, float y, uint32_t& hi, uint32_t& lo) {   // x ~ hi + lo / 2^11
+    const __half2 h = __floats2half2_rn(x, y);
+    const float2 f = __half22float2(h);
+    const __half2 l = __floats2half2_rn((x - f.x) * 2048.0f, (y - f.y) * 2048.0f);
+    hi = *reinterpret_cast<const uint32_t*>(&h);
+    lo = *reinterpret_cast<const uint32_t*>(&l);
 }
 __device__ __forceinline__ uint32_t gld32(const __half* p) { return *reinterpret_cast<const uint32_t*>(p); }
 __device__ __forceinline__ void gmma(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
@@ -447,100 +469,223 @@ __device__ __forceinline__ void gmma(float (&d)[4], const uint32_t (&a)[4], uint
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
+__device__ __forceinline__ void gmmah(uint32_t (&d)[2], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {   // FP16 sums
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
+                 : "+r"(d[0]), "+r"(d[1])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
 __device__ __forceinline__ void ga_of(const float (&x)[4], const float (&y)[4], uint32_t (&a)[4]) {
     a[0] = gh2(x[0], x[1]);
     a[1] = gh2(x[2], x[3]);
     a[2] = gh2(y[0], y[1]);
     a[3] = gh2(y[2], y[3]);
 }
+__device__ __forceinline__ void gldsm(uint32_t (&r)[4], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"((unsigned) __cvta_generic_to_shared(p)));
+}
+__device__ __forceinline__ void gldsm_t(uint32_t (&r)[4], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"((unsigned) __cvta_generic_to_shared(p)));
+}
 __device__ __forceinline__ void gcp16(void* dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src));
 }
-
-__global__ void __launch_bounds__(128) gdn_chunk_prep_kernel(const float* __restrict__ h, const float* __restrict__ gate,
-                                                             const float* __restrict__ beta, int T,
-                                                             GdnTps* __restrict__ tp) {
-    const int ch = blockIdx.x, kh = blockIdx.y, tid = threadIdx.x, j = tid >> 5, lane = tid & 31;
-    const int t0 = ch * GCL, n = min(GCL, T - t0);
-    __shared__ __align__(16) float sk[GCL][S + 4], sq[GCL][S + 4];
-    __shared__ float kk[GCL][GCL + 1], qk[GCL][GCL + 1];
-    __shared__ float a[VPK][GCL][GCL + 1], ti[VPK][GCL][GCL + 1], gm[VPK][GCL], bt[VPK][GCL];
-    for (int i = tid; i < 2 * GCL * (S / 4); i += blockDim.x) {
-        const int w = i / (GCL * (S / 4)), t = (i / (S / 4)) % GCL, r4 = (i % (S / 4)) * 4;
-        const float4 v = t < n ? *reinterpret_cast<const float4*>(h + (size_t) (t0 + t) * C + (w ? HK * S : 0) + kh * S + r4)
-                               : make_float4(0.f, 0.f, 0.f, 0.f);
-        *reinterpret_cast<float4*>(w ? &sk[t][r4] : &sq[t][r4]) = v;
-    }
-    __syncthreads();
-    for (int p = tid; p < 2 * GCL * GCL; p += blockDim.x) {
-        const int w = p / (GCL * GCL), t = (p / GCL) % GCL, i = p % GCL;
-        const float4* x = reinterpret_cast<const float4*>(w ? sq[t] : sk[t]);
-        const float4* y = reinterpret_cast<const float4*>(sk[i]);
-        float acc = 0.0f;
-#pragma unroll 8
-        for (int r = 0; r < S / 4; ++r) {
-            const float4 u = x[r], v = y[r];
-            acc = fmaf(u.x, v.x, acc);
-            acc = fmaf(u.y, v.y, acc);
-            acc = fmaf(u.z, v.z, acc);
-            acc = fmaf(u.w, v.w, acc);
-        }
-        (w ? qk : kk)[t][i] = acc;
-    }
-    __syncthreads();
-    if (j >= VPK) return;   // the fourth warp only helped with the loads and the dots
-    const int head = kh + j * HK;
-    float gv = lane < n ? gate[(size_t) (t0 + lane) * HV + head] : 0.0f;
-#pragma unroll
-    for (int d = 1; d < 32; d <<= 1) {
-        const float y = __shfl_up_sync(0xffffffffu, gv, d);
-        if (lane >= d) gv += y;
-    }
-    if (lane < GCL) {
-        gm[j][lane] = gv;
-        bt[j][lane] = lane < n ? beta[(size_t) (t0 + lane) * HV + head] : 0.0f;
-    }
-    __syncwarp();
-    for (int p = lane; p < GCL * GCL; p += 32) {
-        const int t = p / GCL, i = p % GCL;
-        a[j][t][i] = i < t ? bt[j][t] * expf(gm[j][t] - gm[j][i]) * kk[t][i] : 0.0f;
-        ti[j][t][i] = t == i ? 1.0f : 0.0f;
-    }
-    __syncwarp();
-    for (int t = 1; t < GCL; ++t) {   // T = (I + A)^-1, row t from the rows before it
-        if (lane < t) {
-            float acc = 0.0f;
-            for (int m = lane; m < t; ++m) acc = fmaf(a[j][t][m], ti[j][m][lane], acc);
-            ti[j][t][lane] = -acc;
-        }
-        __syncwarp();
-    }
-    GdnTps& w = tp[(size_t) ch * HV + head];
-    uint32_t* wt = reinterpret_cast<uint32_t*>(&w.t[0][0]);
-    uint32_t* wp = reinterpret_cast<uint32_t*>(&w.p[0][0]);
-    for (int p = lane; p < GCL * (GCL / 2); p += 32) {
-        const int t = p / (GCL / 2), i = 2 * (p % (GCL / 2));
-        wt[t * (GTP / 2) + i / 2] = gh2(ti[j][t][i], ti[j][t][i + 1]);
-        wp[t * (GTP / 2) + i / 2] = gh2(i <= t ? expf(gm[j][t] - gm[j][i]) * qk[t][i] : 0.0f,
-                                        i + 1 <= t ? expf(gm[j][t] - gm[j][i + 1]) * qk[t][i + 1] : 0.0f);
-    }
-    if (lane < GCL) {
-        w.s[lane] = expf(gm[j][lane]);
-        w.s[GCL + lane] = expf(gm[j][GCL - 1] - gm[j][lane]);
-        w.s[2 * GCL + lane] = bt[j][lane];
-    }
-    if (lane == 0) w.s[3 * GCL] = expf(gm[j][GCL - 1]);
+__device__ __forceinline__ void gcp4(void* dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src));
+}
+__device__ __forceinline__ float gex2(float x) {   // 2^x, subnormal results flushed
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
 }
 
-__global__ void __launch_bounds__(32 * 2 * VPK) gdn_chunk_walk_kernel(float* __restrict__ state, const float* __restrict__ h,
-                                                                   const GdnTps* __restrict__ tp, float* __restrict__ out,
-                                                                   int T) {
+// prep warp 0: K K^T from FP16 K, which it keeps for the walk; prep warp 1: Q K^T as hi(Q) hi(K) with FP32 sums plus
+// (hi(Q) lo(K) + lo(Q) hi(K)) / 2^11 with FP16 sums (twice the rate), keeping hi(Q)
+template <bool QK>
+__device__ __forceinline__ void gdn_dots(const GdnIn& in, GdnOut& out, GdnScratch& x, int lane) {
+    const int g = lane >> 2, q = lane & 3;
+    const float(*m)[GKP] = QK ? in.q : in.k;
+    __half(*m16)[GKH] = QK ? out.q : out.k;
+    float acc[2][2][4] = {};   // [n tile][k step parity]
+    uint32_t cor[2][2][2] = {};
+#pragma unroll
+    for (int kt = 0; kt < S / 16; ++kt) {
+        const int c = 16 * kt + 2 * q;
+        const float2 a0 = *reinterpret_cast<const float2*>(&m[g][c]);
+        const float2 a1 = *reinterpret_cast<const float2*>(&m[g + 8][c]);
+        const float2 a2 = *reinterpret_cast<const float2*>(&m[g][c + 8]);
+        const float2 a3 = *reinterpret_cast<const float2*>(&m[g + 8][c + 8]);
+        uint32_t a[4], al[4];
+        gsplit(a0.x, a0.y, a[0], al[0]);
+        gsplit(a1.x, a1.y, a[1], al[1]);
+        gsplit(a2.x, a2.y, a[2], al[2]);
+        gsplit(a3.x, a3.y, a[3], al[3]);
+        *reinterpret_cast<uint32_t*>(&m16[g][c]) = a[0];
+        *reinterpret_cast<uint32_t*>(&m16[g + 8][c]) = a[1];
+        *reinterpret_cast<uint32_t*>(&m16[g][c + 8]) = a[2];
+        *reinterpret_cast<uint32_t*>(&m16[g + 8][c + 8]) = a[3];
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            const float2 k0 = *reinterpret_cast<const float2*>(&in.k[8 * nt + g][c]);
+            const float2 k1 = *reinterpret_cast<const float2*>(&in.k[8 * nt + g][c + 8]);
+            uint32_t b0, b1, l0, l1;
+            gsplit(k0.x, k0.y, b0, l0);
+            gsplit(k1.x, k1.y, b1, l1);
+            gmma(acc[nt][kt & 1], a, b0, b1);
+            if (QK) {
+                gmmah(cor[nt][kt & 1], al, b0, b1);
+                gmmah(cor[nt][kt & 1], a, l0, l1);
+            }
+        }
+    }
+    float(*o)[GCL + 1] = QK ? x.qk : x.kk;
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {   // accumulator pair h: row g + 8 h, columns 2 q, 2 q + 1
+            float r0 = acc[nt][0][2 * h] + acc[nt][1][2 * h], r1 = acc[nt][0][2 * h + 1] + acc[nt][1][2 * h + 1];
+            if (QK) {
+                const float2 c0 = __half22float2(*reinterpret_cast<const __half2*>(&cor[nt][0][h]));
+                const float2 c1 = __half22float2(*reinterpret_cast<const __half2*>(&cor[nt][1][h]));
+                r0 += (c0.x + c1.x) * (1.0f / 2048.0f);
+                r1 += (c0.y + c1.y) * (1.0f / 2048.0f);
+            }
+            o[g + 8 * h][8 * nt + 2 * q] = r0;
+            o[g + 8 * h][8 * nt + 2 * q + 1] = r1;
+        }
+}
+
+// a chunk's T, P, scales and FP16 K, Q from its staged inputs, by the prep threads (pt: 0 .. 63)
+__device__ __forceinline__ void gdn_prep(const GdnIn& in, GdnOut& out, GdnScratch& x, int pt) {
+    const int lane = pt & 31, jj = pt >> 4, tt = pt & 15;   // 48 threads: value head jj, its token or column tt
+    {   // gamma: the gates' running sum (0 past the prompt's end)
+        float gv = jj < VPK ? in.gate[jj][tt] : 0.0f;
+#pragma unroll
+        for (int d = 1; d < GCL; d <<= 1) {
+            const float y = __shfl_up_sync(0xffffffffu, gv, d, GCL);
+            if (tt >= d) gv += y;
+        }
+        if (jj < VPK) x.gm[jj][tt] = gv;
+    }
+    if (pt >> 5) gdn_dots<true>(in, out, x, lane);
+    else gdn_dots<false>(in, out, x, lane);
+    asm volatile("bar.sync 1, 64;\n" ::: "memory");
+    if (jj < VPK) {   // row tt: A (FP32), P (FP16 pairs), the scales; branch-free, the row's dots loaded first
+        constexpr float LOG2E = 1.4426950408889634f;
+        const float gt = x.gm[jj][tt], bt = in.beta[jj][tt], gl = x.gm[jj][GCL - 1];
+        float gi[GCL], e[GCL], kr[GCL], qr[GCL];
+#pragma unroll
+        for (int i = 0; i < GCL; i += 4) *reinterpret_cast<float4*>(&gi[i]) = *reinterpret_cast<const float4*>(&x.gm[jj][i]);
+#pragma unroll
+        for (int i = 0; i < GCL; ++i) {
+            kr[i] = x.kk[tt][i];
+            qr[i] = x.qk[tt][i];
+        }
+#pragma unroll
+        for (int i = 0; i < GCL; ++i) e[i] = gex2((i <= tt ? gt - gi[i] : 0.0f) * LOG2E);
+        uint32_t* pr = reinterpret_cast<uint32_t*>(out.tp[jj].p[tt]);
+#pragma unroll
+        for (int i = 0; i < GCL; i += 2) {
+            x.a[jj][tt][i] = i < tt ? bt * e[i] * kr[i] : 0.0f;
+            x.a[jj][tt][i + 1] = i + 1 < tt ? bt * e[i + 1] * kr[i + 1] : 0.0f;
+            pr[i / 2] = gh2(i <= tt ? e[i] * qr[i] : 0.0f, i + 1 <= tt ? e[i + 1] * qr[i + 1] : 0.0f);
+        }
+        float* s = out.tp[jj].s;
+        s[tt] = gex2(gt * LOG2E);
+        s[GCL + tt] = gex2((gl - gt) * LOG2E);
+        s[2 * GCL + tt] = bt;
+        if (tt == 0) s[3 * GCL] = gex2(gl * LOG2E);
+    }
+    asm volatile("bar.sync 1, 64;\n" ::: "memory");
+    if (jj < VPK) {   // T = (I + A)^-1, column tt: x_t = -sum_{m < t} A[t][m] x_m, x_tt = 1
+        float xv[GCL];
+#pragma unroll
+        for (int t = 0; t < GCL; ++t) xv[t] = t == tt ? 1.0f : 0.0f;
+        const float(*a)[GCL + 1] = x.a[jj];
+#pragma unroll
+        for (int m = 0; m < GCL - 1; ++m)
+#pragma unroll
+            for (int t = m + 1; t < GCL; ++t) xv[t] = fmaf(-a[t][m], xv[m], xv[t]);
+#pragma unroll
+        for (int t = 0; t < GCL; ++t) out.tp[jj].t[t][tt] = __float2half_rn(xv[t]);
+    }
+}
+
+__global__ void __launch_bounds__(GWALK + GPREP + GLOAD, 1) gdn_chunk_kernel(float* __restrict__ state,
+                                                                             const float* __restrict__ h,
+                                                                             const float* __restrict__ gate,
+                                                                             const float* __restrict__ beta,
+                                                                             float* __restrict__ out, int T) {
     extern __shared__ __align__(16) unsigned char gdn_smem[];
-    GdnStage* st = reinterpret_cast<GdnStage*>(gdn_smem);
+    GdnIn* in = reinterpret_cast<GdnIn*>(gdn_smem);
+    GdnV* vb = reinterpret_cast<GdnV*>(gdn_smem + 2 * sizeof(GdnIn));
+    GdnOut* ob = reinterpret_cast<GdnOut*>(gdn_smem + 2 * sizeof(GdnIn) + 2 * sizeof(GdnV));
+    GdnScratch& px = *reinterpret_cast<GdnScratch*>(gdn_smem + 2 * sizeof(GdnIn) + 2 * sizeof(GdnV) + 3 * sizeof(GdnOut));
     const int kh = blockIdx.x, cs = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int nch = (T + GCL - 1) / GCL;
+    // a chunk's barrier: its prepared operands, V and the next chunk's inputs are in, the buffers of the chunks before
+    // free
+    if (tid >= GWALK + GPREP) {   // the loaders: chunk c + 2's K, Q, gates and betas and c + 1's V while c is walked
+        const int lt = tid - GWALK - GPREP;
+        auto copy = [&](int ckq, int cv) {   // a cp.async group every call, nothing past the last chunk
+            if (ckq < nch) {
+                GdnIn& b = in[ckq & 1];
+                const int t0 = ckq * GCL, n = min(GCL, T - t0);
+                const float* hc = h + (size_t) t0 * C;
+#pragma unroll
+                for (int k = 0; k < 2 * GCL * (S / 4) / GLOAD; ++k) {
+                    const int i = lt + k * GLOAD, w = i / (GCL * (S / 4)), t = (i / (S / 4)) % GCL, r4 = (i % (S / 4)) * 4;
+                    float* d = w ? &b.k[t][r4] : &b.q[t][r4];
+                    if (t < n) gcp16(d, hc + t * C + (w ? HK * S : 0) + kh * S + r4);
+                    else *reinterpret_cast<float4*>(d) = make_float4(0.f, 0.f, 0.f, 0.f);
+                }
+                for (int i = lt; i < 2 * VPK * GCL; i += GLOAD) {
+                    const int w = i / (VPK * GCL), jj = (i / GCL) % VPK, t = i % GCL;
+                    float* d = w ? &b.beta[jj][t] : &b.gate[jj][t];
+                    if (t < n) gcp4(d, (w ? beta : gate) + (size_t) (t0 + t) * HV + kh + jj * HK);
+                    else *d = 0.0f;
+                }
+            }
+            if (cv >= 0 && cv < nch) {
+                GdnV& v = vb[cv & 1];
+                const int t0 = cv * GCL, n = min(GCL, T - t0);
+                const float* hc = h + (size_t) t0 * C;
+#pragma unroll
+                for (int k = 0; k < VPK * GCL * (GCW / 4) / GLOAD; ++k) {
+                    const int i = lt + k * GLOAD, jj = i / (GCL * (GCW / 4)), t = (i / (GCW / 4)) % GCL;
+                    const int c4 = (i % (GCW / 4)) * 4;
+                    float* d = &v.v[jj][t][c4];
+                    if (t < n) gcp16(d, hc + t * C + 2 * HK * S + (kh + jj * HK) * S + cs * GCW + c4);
+                    else *reinterpret_cast<float4*>(d) = make_float4(0.f, 0.f, 0.f, 0.f);
+                }
+            }
+            asm volatile("cp.async.commit_group;\n" ::);
+        };
+        copy(0, 0);
+        copy(1, -1);
+        asm volatile("cp.async.wait_group 1;\n" ::);
+        __syncthreads();
+        for (int ch = 0; ch < nch; ++ch) {
+            asm volatile("cp.async.wait_group 0;\n" ::);
+            __syncthreads();
+            copy(ch + 2, ch + 1);
+        }
+        return;
+    }
+    if (tid >= GWALK) {   // the prep warps: chunk c + 1 while c is walked
+        __syncthreads();
+        gdn_prep(in[0], ob[0], px, tid - GWALK);
+        for (int ch = 0; ch < nch; ++ch) {
+            __syncthreads();
+            if (ch + 1 < nch) gdn_prep(in[(ch + 1) & 1], ob[(ch + 1) % 3], px, tid - GWALK);
+        }
+        return;
+    }
     const int g = lane >> 2, q = lane & 3, j = warp >> 1, head = kh + j * HK;
     const int cl = (warp & 1) * 16, cb = cs * GCW + cl;   // the warp's first column, in the block and in the head
-    const int nch = (T + GCL - 1) / GCL;
     float s[S / 8][4];   // S^T: tile nt covers rows 8 nt .. 8 nt + 7
 #pragma unroll
     for (int nt = 0; nt < S / 8; ++nt) {
@@ -550,52 +695,28 @@ __global__ void __launch_bounds__(32 * 2 * VPK) gdn_chunk_walk_kernel(float* __r
         s[nt][2] = state[((size_t) r * HV + head) * S + cb + g + 8];
         s[nt][3] = state[((size_t) (r + 1) * HV + head) * S + cb + g + 8];
     }
-    auto stage = [&](int ch) {
-        GdnStage& b = st[ch & 1];
-        const int t0 = ch * GCL, n = min(GCL, T - t0);
-        for (int i = tid; i < 2 * GCL * (S / 4); i += blockDim.x) {
-            const int w = i / (GCL * (S / 4)), t = (i / (S / 4)) % GCL, r4 = (i % (S / 4)) * 4;
-            float* d = w ? &b.k[t][r4] : &b.q[t][r4];
-            if (t < n) gcp16(d, h + (size_t) (t0 + t) * C + (w ? HK * S : 0) + kh * S + r4);
-            else *reinterpret_cast<float4*>(d) = make_float4(0.f, 0.f, 0.f, 0.f);
-        }
-        for (int i = tid; i < VPK * (int) (sizeof(GdnTps) / 16); i += blockDim.x) {
-            const int jj = i / (int) (sizeof(GdnTps) / 16), p = i % (int) (sizeof(GdnTps) / 16);
-            gcp16(reinterpret_cast<char*>(&b.tp[jj]) + 16 * p,
-                  reinterpret_cast<const char*>(tp + (size_t) ch * HV + kh + jj * HK) + 16 * p);
-        }
-        for (int i = tid; i < VPK * GCL * (GCW / 4); i += blockDim.x) {
-            const int jj = i / (GCL * (GCW / 4)), t = (i / (GCW / 4)) % GCL, c4 = (i % (GCW / 4)) * 4;
-            float* d = &b.v[jj][t][c4];
-            if (t < n) gcp16(d, h + (size_t) (t0 + t) * C + 2 * HK * S + (kh + jj * HK) * S + cs * GCW + c4);
-            else *reinterpret_cast<float4*>(d) = make_float4(0.f, 0.f, 0.f, 0.f);
-        }
-        asm volatile("cp.async.commit_group;\n" ::);
-    };
-    stage(0);
+    __syncthreads();
+    const int wr = 8 * (lane >> 4) + (lane & 7), wc = 8 * ((lane >> 3) & 1);   // ldmatrix rows: W^T and Q^T's B
+    const int ur = (lane & 7) + 8 * ((lane >> 3) & 1), uc = 8 * (lane >> 4);   // the update's
+    const float rs = rsqrtf((float) S);
     for (int ch = 0; ch < nch; ++ch) {
-        if (ch + 1 < nch) stage(ch + 1);
-        else asm volatile("cp.async.commit_group;\n" ::);
-        asm volatile("cp.async.wait_group 1;\n" ::);
         __syncthreads();
-        const GdnStage& b = st[ch & 1];
+        const GdnOut& b = ob[ch % 3];
+        const GdnV& vv = vb[ch & 1];
         const int t0 = ch * GCL, n = min(GCL, T - t0);
         const float* scj = b.tp[j].s;
         // W^T = S^T K^T and S^T Q^T [16 columns x GCL tokens]
         float w[GCL / 8][4] = {}, qs[GCL / 8][4] = {};
 #pragma unroll
         for (int kt = 0; kt < S / 16; ++kt) {
-            uint32_t a[4];
+            uint32_t a[4], kb[4], qb[4];
             ga_of(s[2 * kt], s[2 * kt + 1], a);
-#pragma unroll
-            for (int nt = 0; nt < GCL / 8; ++nt) {
-                const float2 k0 = *reinterpret_cast<const float2*>(&b.k[8 * nt + g][16 * kt + 2 * q]);
-                const float2 k1 = *reinterpret_cast<const float2*>(&b.k[8 * nt + g][16 * kt + 2 * q + 8]);
-                const float2 q0 = *reinterpret_cast<const float2*>(&b.q[8 * nt + g][16 * kt + 2 * q]);
-                const float2 q1 = *reinterpret_cast<const float2*>(&b.q[8 * nt + g][16 * kt + 2 * q + 8]);
-                gmma(w[nt], a, gh2(k0.x, k0.y), gh2(k1.x, k1.y));
-                gmma(qs[nt], a, gh2(q0.x, q0.y), gh2(q1.x, q1.y));
-            }
+            gldsm(kb, &b.k[wr][16 * kt + wc]);
+            gldsm(qb, &b.q[wr][16 * kt + wc]);
+            gmma(w[0], a, kb[0], kb[1]);
+            gmma(w[1], a, kb[2], kb[3]);
+            gmma(qs[0], a, qb[0], qb[1]);
+            gmma(qs[1], a, qb[2], qb[3]);
         }
         // B^T = beta (V^T - exp(gamma) W^T); element e of tile nt: column g + 8 (e >> 1), token 8 nt + 2 q + (e & 1)
         float bt[GCL / 8][4];
@@ -604,7 +725,7 @@ __global__ void __launch_bounds__(32 * 2 * VPK) gdn_chunk_walk_kernel(float* __r
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const int t = 8 * nt + 2 * q + (e & 1);
-                bt[nt][e] = scj[2 * GCL + t] * (b.v[j][t][cl + g + 8 * (e >> 1)] - scj[t] * w[nt][e]);
+                bt[nt][e] = scj[2 * GCL + t] * (vv.v[j][t][cl + g + 8 * (e >> 1)] - scj[t] * w[nt][e]);
             }
         // D^T = B^T T^T, O^T = exp(gamma) S^T Q^T + D^T P^T
         uint32_t ab[4], ad[4];
@@ -616,7 +737,7 @@ __global__ void __launch_bounds__(32 * 2 * VPK) gdn_chunk_walk_kernel(float* __r
             gmma(d[nt], ab, gld32(tr), gld32(tr + 8));
         }
         ga_of(d[0], d[1], ad);
-        const float rs = rsqrtf((float) S);
+        float* oc = out + (size_t) t0 * HV * S + head * S + cb + g;   // the chunk's first token, the lane's column
 #pragma unroll
         for (int nt = 0; nt < GCL / 8; ++nt) {
 #pragma unroll
@@ -626,7 +747,7 @@ __global__ void __launch_bounds__(32 * 2 * VPK) gdn_chunk_walk_kernel(float* __r
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const int t = 8 * nt + 2 * q + (e & 1);
-                if (t < n) out[(size_t) (t0 + t) * HV * S + head * S + cb + g + 8 * (e >> 1)] = o[nt][e] * rs;
+                if (t < n) oc[t * HV * S + 8 * (e >> 1)] = o[nt][e] * rs;
             }
         }
         // S^T = exp(gamma_L) S^T + (exp(gamma_L - gamma) D^T) K
@@ -637,13 +758,17 @@ __global__ void __launch_bounds__(32 * 2 * VPK) gdn_chunk_walk_kernel(float* __r
         ga_of(d[0], d[1], ad);
         const float eL = scj[3 * GCL];
 #pragma unroll
-        for (int nt = 0; nt < S / 8; ++nt) {
+        for (int nt = 0; nt < S / 8; nt += 2) {
+            uint32_t kb[4];
+            gldsm_t(kb, &b.k[ur][8 * nt + uc]);
 #pragma unroll
-            for (int e = 0; e < 4; ++e) s[nt][e] *= eL;
-            const int r = 8 * nt + g;
-            gmma(s[nt], ad, gh2(b.k[2 * q][r], b.k[2 * q + 1][r]), gh2(b.k[2 * q + 8][r], b.k[2 * q + 9][r]));
+            for (int e = 0; e < 4; ++e) {
+                s[nt][e] *= eL;
+                s[nt + 1][e] *= eL;
+            }
+            gmma(s[nt], ad, kb[0], kb[1]);
+            gmma(s[nt + 1], ad, kb[2], kb[3]);
         }
-        __syncthreads();   // every warp is done with this stage before the next one fills it
     }
 #pragma unroll
     for (int nt = 0; nt < S / 8; ++nt) {
@@ -732,23 +857,18 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
     gdn_conv_hist_kernel<<<C / 256, 256, 0, (cudaStream_t) stream>>>(history, qkv, T);
     check("gdn_conv");
 }
-size_t gdn_scan_scratch_bytes(int64_t T) { return (size_t) ((T + GCL - 1) / GCL) * HV * sizeof(GdnTps); }
-void gdn_scan(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T, void* scratch,
-              void* stream) {
+void gdn_scan(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T, void* stream) {
     if (T <= 0) return;
-    static const bool smem_set = [] {   // the walk's two stages: 58 KB
-        return cudaFuncSetAttribute(gdn_chunk_walk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    (int) (2 * sizeof(GdnStage))) == cudaSuccess;
+    static const bool smem_set = [] {   // 97 KB
+        return cudaFuncSetAttribute(gdn_chunk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, GDN_SMEM) ==
+               cudaSuccess;
     }();
     if (!smem_set) {
-        std::fprintf(stderr, "gdn_scan: the walk's shared memory\n");
+        std::fprintf(stderr, "gdn_scan: the kernel's shared memory\n");
         std::exit(1);
     }
-    auto* tp = (GdnTps*) scratch;
-    gdn_chunk_prep_kernel<<<dim3((unsigned) ((T + GCL - 1) / GCL), HK), 128, 0, (cudaStream_t) stream>>>(h, gate, beta,
-                                                                                                       (int) T, tp);
-    gdn_chunk_walk_kernel<<<dim3(HK, S / GCW), 32 * 2 * VPK, 2 * sizeof(GdnStage), (cudaStream_t) stream>>>(state, h, tp,
-                                                                                                         y, (int) T);
+    gdn_chunk_kernel<<<dim3(HK, S / GCW), GWALK + GPREP + GLOAD, GDN_SMEM, (cudaStream_t) stream>>>(state, h, gate, beta,
+                                                                                                   y, (int) T);
     check("gdn_scan");
 }
 void gdn_out_norm(float* y, const float* z, const float* gamma, float eps, uint16_t* y16, int64_t T, void* stream,

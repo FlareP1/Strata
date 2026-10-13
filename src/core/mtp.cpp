@@ -592,6 +592,9 @@ MtpPromptKv MtpDrafter::prompt_kv() {
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, float min_p, int* n_drafts) {
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
+    // the accepted rows' K/V and row a's layer: no read reaches a cell past the one being drafted, and the chain or the
+    // next round writes the rejected rows' cells first
+    T = a + 1;
     if (!capture_round(T, err)) return false;
     const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
@@ -644,18 +647,14 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     return true;
 }
 
-bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
+bool MtpDrafter::draft_first(const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                              float* probs, float min_p, int* n_drafts) {
-    // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
-    const int64_t HCN = g_->hc * g_->n_embd;
-    for (int t = 0; t < T; ++t)
-        if (cudaMemcpy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
-                       cudaMemcpyDeviceToDevice) != cudaSuccess) {
-            err = "mtp: staging the first residual failed";
-            return false;
-        }
-    std::vector<int32_t> toks((size_t) T, token);
-    return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts);
+    if (cudaMemcpy((void*) window_R_, R_row, (size_t) (g_->hc * g_->n_embd) * sizeof(float), cudaMemcpyDeviceToDevice) !=
+        cudaSuccess) {
+        err = "mtp: staging the first residual failed";
+        return false;
+    }
+    return draft(1, &token, cell, 0, drafts, err, probs, min_p, n_drafts);
 }
 
 }  // namespace strata::core

@@ -73,18 +73,19 @@ public:
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 
-    /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
-    /// argmaxes: row t pairs R_{p+t} with the token at p+t+1), then the draft chain from row `a` (the last
-    /// accepted row) for T-1 drafts at cells p+a+1 ...  `drafts` gets T-1 tokens.
+    /// One round of a window of T cells from `p` (rows = the window's final residuals, `tokens` = the window's
+    /// argmaxes: row t pairs R_{p+t} with the token at p+t+1): the catch-up over the cells up to the last accepted
+    /// row `a` (the rejected rows' cells are written by the draft chain or the next round before anything reads
+    /// them), then the draft chain from row a at cells p+a+1 ...
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
 
-    /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     /// The draft head's rows gathered from the main head now (before the main GPU keeps only part of it); `bind`
     /// then takes them as they are.
     bool bind_head(const NativeHead* head, std::string& err);
     bool has_draft_head() const { return dhead_ != nullptr; }
-    bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
+    /// The first round: one cell (`cell`) from `R_row` (device) and `token`.
+    bool draft_first(const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
 
     /// Called with each draft as soon as it is known (j = 0.., its probability under the draft layer), while the

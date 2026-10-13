@@ -196,8 +196,9 @@ struct Prefill::Impl {
     int32_t* ids_host = nullptr;   // pinned [max_chunk, K]
     float* w_host = nullptr;
     std::vector<int32_t> steps_host, cnt, off, entry_of;
-    std::vector<int32_t> ex1, off1, src1, ex2, off2, src2;   // this GPU's experts, the second GPU's
-    std::vector<float> w1, w2;
+    // this GPU's experts; the second GPU's, the tokens of the first half and of the second (run_layer's passes)
+    std::vector<int32_t> ex1, off1, src1, ex2[2], off2[2], src2[2];
+    std::vector<float> w1, w2[2];
     // a chunk's PLE rows, read on a thread while the chunk before runs: two pinned buffers, their row indices
     float* ple_host[2] = {};
     std::vector<uint32_t> ple_rows[2];
@@ -772,29 +773,47 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
                 for (int64_t i = 0; i < T * K; ++i) m.entry_of[(size_t) fill[(size_t) m.ids_host[i]]++] = (int32_t) i;
             }
-            for (auto* v2 : {&m.ex1, &m.src1, &m.ex2, &m.src2}) v2->clear();
+            // the second GPU's share in two passes split at a sub-chunk boundary, each sending its half's sums back
+            // as it ends: this GPU starts the next layer's first sub-chunks on the first half's while the second
+            // GPU computes the second (an expert's entries are in token order)
+            const int64_t th = std::min(T, (((T + SUB - 1) / SUB + 1) / 2) * SUB);
+            m.ex1.clear();
+            m.src1.clear();
             m.w1.clear();
-            m.w2.clear();
             m.off1.assign(1, 0);
-            m.off2.assign(1, 0);
+            for (int h = 0; h < 2; ++h) {
+                m.ex2[h].clear();
+                m.src2[h].clear();
+                m.w2[h].clear();
+                m.off2[h].assign(1, 0);
+            }
             for (int32_t e = 0; e < NE; ++e) {
                 if (m.cnt[(size_t) e] == 0) continue;
                 const bool here = !m.offload || (m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0);
-                std::vector<int32_t>& ex = here ? m.ex1 : m.ex2;
-                std::vector<int32_t>& of = here ? m.off1 : m.off2;
-                std::vector<int32_t>& sr = here ? m.src1 : m.src2;
-                std::vector<float>& wv = here ? m.w1 : m.w2;
-                ex.push_back(e);
-                for (int32_t p = m.off[(size_t) e]; p < m.off[(size_t) e + 1]; ++p) {
-                    const int32_t i = m.entry_of[(size_t) p];
-                    sr.push_back(i / (int32_t) K);
-                    wv.push_back(m.w_host[i]);
+                for (int h = 0; h < (here ? 1 : 2); ++h) {
+                    std::vector<int32_t>& ex = here ? m.ex1 : m.ex2[h];
+                    std::vector<int32_t>& of = here ? m.off1 : m.off2[h];
+                    std::vector<int32_t>& sr = here ? m.src1 : m.src2[h];
+                    std::vector<float>& wv = here ? m.w1 : m.w2[h];
+                    const size_t n0 = sr.size();
+                    for (int32_t p = m.off[(size_t) e]; p < m.off[(size_t) e + 1]; ++p) {
+                        const int32_t i = m.entry_of[(size_t) p], t = i / (int32_t) K;
+                        if (!here && (t >= th) != (h == 1)) continue;
+                        sr.push_back(t);
+                        wv.push_back(m.w_host[i]);
+                    }
+                    if (sr.size() == n0) continue;
+                    ex.push_back(e);
+                    of.push_back((int32_t) sr.size());
                 }
-                of.push_back((int32_t) sr.size());
             }
-            if (m.offload && !m.offload->run_layer(l, T, m.ex2, m.off2, m.src2, m.w2, SUB, nullptr, nullptr, err))
+            if (m.offload &&
+                !m.offload->run_layer(l, T, 0, th, m.ex2[0], m.off2[0], m.src2[0], m.w2[0], SUB, nullptr, nullptr, err))
                 return false;
-            if (!m.local.run_layer(l, T, m.ex1, m.off1, m.src1, m.w1, SUB, b.mixed_h, b.bo_moe, err)) return false;
+            if (!m.local.run_layer(l, T, 0, T, m.ex1, m.off1, m.src1, m.w1, SUB, b.mixed_h, b.bo_moe, err)) return false;
+            if (m.offload && th < T &&
+                !m.offload->run_layer(l, T, th, T, m.ex2[1], m.off2[1], m.src2[1], m.w2[1], SUB, nullptr, nullptr, err))
+                return false;
             // ---- the MoE output (+ the second GPU's sums) goes into the residual stream as the next layer reads it
             if (m.offload) {
                 for (int64_t t0 = 0; t0 < T; t0 += SUB) {

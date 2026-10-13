@@ -100,11 +100,13 @@ struct ExpertRunner::Impl {
     std::vector<int32_t> mark, first, count;
     uint8_t* stage[SLOTS] = {};
     void** ptrs = nullptr;                    // NPTR arrays of n_expert device pointers
-    // a layer's uploads, staged in pinned memory (a pageable copy blocks the host behind queued expert copies):
-    // [pointers | adds | rows | weights], for chunks of up to max_chunk tokens
-    uint8_t* h_up = nullptr;
-    cudaEvent_t up_done = nullptr;   // the previous layer's uploads have been read
-    bool up_live = false;
+    // a call's uploads, staged in pinned memory (a pageable copy blocks the host behind queued expert copies):
+    // [pointers | adds | rows | weights], for chunks of up to max_chunk tokens; two blocks, calls alternating (a
+    // layer's second pass would wait on the host for the first one's upload)
+    uint8_t* h_up[2] = {};
+    cudaEvent_t up_done[2] = {};   // the block's uploads have been read
+    bool up_live[2] = {};
+    int up_cur = 0;
     uint16_t *h_input = nullptr, *h_sum = nullptr;
     // a layer's blobs copied ahead: at pre_off[e] in `pre` (-1: not there), covered by event pre_ev[pre_grp[e]] (its
     // piece); pre_list the experts to copy in order, pre_next the next one, pre_at the area's next free byte
@@ -163,12 +165,12 @@ ExpertRunner::~ExpertRunner() {
         if (m.copied[i]) cudaEventDestroy(m.copied[i]);
         if (m.used[i]) cudaEventDestroy(m.used[i]);
     }
-    for (cudaEvent_t e : {m.t0, m.t1, m.pre_used, m.up_done}) if (e) cudaEventDestroy(e);
+    for (cudaEvent_t e : {m.t0, m.t1, m.pre_used, m.up_done[0], m.up_done[1]}) if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : m.pre_ev) if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : m.piece_ev) if (e) cudaEventDestroy(e);
     if (m.h_input) cudaFreeHost(m.h_input);
     if (m.h_sum) cudaFreeHost(m.h_sum);
-    if (m.h_up) cudaFreeHost(m.h_up);
+    for (uint8_t* p : m.h_up) if (p) cudaFreeHost(p);
     if (m.owned) cudaFree(m.owned);
     if (m.copy) cudaStreamDestroy(m.copy);
     if (m.remote && m.s) cudaStreamDestroy(m.s);
@@ -204,9 +206,10 @@ bool ExpertRunner::init(int device, int main_device, void* stream, core::ExpertS
     m.first.resize((size_t) max_chunk);
     m.count.resize((size_t) max_chunk);
     OnDevice on(device, main_device, m.remote);
-    bool ok = cudaEventCreateWithFlags(&m.up_done, cudaEventDisableTiming) == cudaSuccess &&
-              cudaEventCreate(&m.t0) == cudaSuccess && cudaEventCreate(&m.t1) == cudaSuccess &&
-              cudaHostAlloc((void**) &m.h_up, up_bytes(max_chunk, n_expert), cudaHostAllocDefault) == cudaSuccess;
+    bool ok = cudaEventCreate(&m.t0) == cudaSuccess && cudaEventCreate(&m.t1) == cudaSuccess;
+    for (int i = 0; ok && i < 2; ++i)
+        ok = cudaEventCreateWithFlags(&m.up_done[i], cudaEventDisableTiming) == cudaSuccess &&
+             cudaHostAlloc((void**) &m.h_up[i], up_bytes(max_chunk, n_expert), cudaHostAllocDefault) == cudaSuccess;
     if (m.remote) ok = ok && cudaStreamCreateWithFlags(&m.s, cudaStreamNonBlocking) == cudaSuccess;
     else m.s = (cudaStream_t) stream;
     if (streams) {
@@ -406,24 +409,28 @@ void ExpertRunner::stage_input(int64_t t0, int64_t rows, cudaEvent_t ready) {
     cudaMemcpyAsync(m.input + t0 * N, m.h_input + t0 * N, (size_t) rows * N * 2, cudaMemcpyHostToDevice, m.s);
 }
 
-bool ExpertRunner::run_layer(int64_t layer, int64_t T, const std::vector<int32_t>& experts, const std::vector<int32_t>& off,
-                             const std::vector<int32_t>& src, const std::vector<float>& w, int64_t piece,
-                             const uint16_t* input, float* sum, std::string& err) {
+bool ExpertRunner::run_layer(int64_t layer, int64_t T, int64_t t_begin, int64_t t_end, const std::vector<int32_t>& experts,
+                             const std::vector<int32_t>& off, const std::vector<int32_t>& src, const std::vector<float>& w,
+                             int64_t piece, const uint16_t* input, float* sum, std::string& err) {
     Impl& m = *impl_;
     const size_t n_exp = experts.size(), n_rows = src.size();
+    const int64_t pc = piece > 0 ? piece : T;
     if (T > m.T || off.size() != n_exp + 1 || w.size() != n_rows || (size_t) off.back() != n_rows ||
-        n_rows > (size_t) T * K || n_exp > (size_t) m.n_expert || (!m.remote && (input == nullptr || sum == nullptr))) {
+        n_rows > (size_t) T * K || n_exp > (size_t) m.n_expert || (!m.remote && (input == nullptr || sum == nullptr)) ||
+        t_begin < 0 || t_begin >= t_end || t_end > T || t_begin % pc != 0) {
         err = "prompt experts: a layer's share is out of range";
         return false;
     }
     OnDevice on(m.dev, m.main, m.remote);
     const auto h0 = std::chrono::steady_clock::now();
-    if (m.timed && cudaEventQuery(m.t1) == cudaSuccess) {   // the previous layer (the main GPU waited for it)
-        float ms = 0;
-        cudaEventElapsedTime(&ms, m.t0, m.t1);
-        ms_gpu += ms;
+    if (t_begin == 0) {
+        if (m.timed && cudaEventQuery(m.t1) == cudaSuccess) {   // the previous layer (the main GPU waited for it)
+            float ms = 0;
+            cudaEventElapsedTime(&ms, m.t0, m.t1);
+            ms_gpu += ms;
+        }
+        m.timed = false;
     }
-    m.timed = false;
     const auto& lay = strata::kernels::cpu::expert_layout();
     const auto& f = lay.fmt.empty() ? strata::kernels::cpu::NativeFmt{} : lay.fmt[(size_t) layer];
     const size_t bb = (size_t) lay.blob_bytes(layer);
@@ -445,9 +452,11 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, const std::vector<int32_t
         batches.emplace_back(j0, j1);
         j0 = j1;
     }
-    if (m.up_live) cudaEventSynchronize(m.up_done);   // the host block is free again
+    const int ub = m.up_cur;
+    m.up_cur ^= 1;
+    if (m.up_live[ub]) cudaEventSynchronize(m.up_done[ub]);   // the host block is free again
     const size_t E = (size_t) m.n_expert;   // array stride
-    void** P = (void**) m.h_up;
+    void** P = (void**) m.h_up[ub];
     int32_t* h_adds = (int32_t*) (P + NPTR * E);
     int32_t* h_rows = h_adds + adds_cap(m.max_chunk, m.n_expert);
     float* h_w = (float*) (h_rows + (size_t) m.max_chunk * K);
@@ -510,7 +519,7 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, const std::vector<int32_t
         bounds_at[b] = n_adds;   // MMQ: the batch's experts' rows, from the batch's first
         for (size_t j = batches[b].first; j <= batches[b].second; ++j) h_adds[n_adds++] = off[j] - r0;
     }
-    if (m.remote) cudaEventRecord(m.t0, m.s);
+    if (m.remote && t_begin == 0) cudaEventRecord(m.t0, m.s);
     const uint16_t* in = m.remote ? m.input : input;
     float* out = m.remote ? m.sum : sum;
     std::copy(src.begin(), src.end(), h_rows);
@@ -522,9 +531,9 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, const std::vector<int32_t
         cudaMemcpyAsync(m.w, h_w, n_rows * 4, cudaMemcpyHostToDevice, m.s);
     }
     if (use_mmq) mmq::iota(m.ident, ROWS, m.s);   // each layer: the local runner's buffers share the dense steps'
-    cudaEventRecord(m.up_done, m.s);
-    m.up_live = true;
-    if (m.remote) cudaMemsetAsync(m.sum, 0, (size_t) T * N * 4, m.s);
+    cudaEventRecord(m.up_done[ub], m.s);
+    m.up_live[ub] = true;
+    if (m.remote) cudaMemsetAsync(m.sum + t_begin * N, 0, (size_t) (t_end - t_begin) * N * 4, m.s);
     // ---- staging: the streamed experts of batch b into slot b % SLOTS, a copy per run of adjacent arena blobs
     auto stage_batch = [&](size_t b) {
         const auto [j0, j1] = batches[b];
@@ -590,7 +599,8 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, const std::vector<int32_t
             cudaEventRecord(m.pre_used, m.s);
             m.pre_live = true;
         }
-        for (size_t j = j0; j < j1; ++j) if (held(experts[j]) >= 0) ++experts_resident;
+        if (t_begin == 0)   // counted once a layer
+            for (size_t j = j0; j < j1; ++j) if (held(experts[j]) >= 0) ++experts_resident;
         if (rows > ROWS) {   // one expert: its rows in pieces
             for (int64_t p = 0; p < rows; p += ROWS) {
                 const int64_t nr = std::min<int64_t>(ROWS, rows - p);
@@ -635,10 +645,9 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, const std::vector<int32_t
         moe_gather_add(out, m.d, r0, m.w, a, a + ntok[b], a + 2 * ntok[b] + 1, ntok[b], m.s);
     }
     if (m.remote) {   // the sums as FP16 in the input's place (half the bytes over the first GPU's x4 link), in pieces
-        const int64_t pc = piece > 0 ? piece : T;
-        for (int64_t t0 = 0, k = 0; t0 < T; t0 += pc, ++k) {
-            const int64_t n = std::min(pc, T - t0);
-            if ((size_t) k == m.piece_ev.size()) {
+        for (int64_t t0 = t_begin, k = t_begin / pc; t0 < t_end; t0 += pc, ++k) {
+            const int64_t n = std::min(pc, t_end - t0);
+            while ((size_t) k >= m.piece_ev.size()) {
                 m.piece_ev.push_back(nullptr);
                 cudaEventCreateWithFlags(&m.piece_ev.back(), cudaEventDisableTiming);
             }
@@ -646,8 +655,10 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, const std::vector<int32_t
             cudaMemcpyAsync(m.h_sum + t0 * N, m.input + t0 * N, (size_t) n * N * 2, cudaMemcpyDeviceToHost, m.s);
             cudaEventRecord(m.piece_ev[(size_t) k], m.s);
         }
-        cudaEventRecord(m.t1, m.s);
-        m.timed = true;
+        if (t_end == T) {
+            cudaEventRecord(m.t1, m.s);
+            m.timed = true;
+        }
     }
     ms_host += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
     const cudaError_t e = cudaGetLastError();

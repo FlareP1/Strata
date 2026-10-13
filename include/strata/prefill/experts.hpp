@@ -82,14 +82,15 @@ public:
     /// reach host_input.
     void stage_input(int64_t t0, int64_t rows, cudaEvent_t ready);
 
-    /// Layer `layer` of a chunk of T tokens: expert experts[j] serves rows [off[j], off[j + 1]), row r being token
-    /// src[r] with routing weight w[r]; each row times its weight adds to its token's sum.  Local: reads `input`
-    /// [T, n_embd] (FP16) and adds into `sum` [T, n_embd], queued on the prompt path's stream.  Remote: `input` and
-    /// `sum` are null, the input came through stage_input, and the sums reach host_sum in pieces of `piece` rows,
-    /// piece_done(k) recorded as piece k lands.  Returns once the work is queued.
-    bool run_layer(int64_t layer, int64_t T, const std::vector<int32_t>& experts, const std::vector<int32_t>& off,
-                   const std::vector<int32_t>& src, const std::vector<float>& w, int64_t piece,
-                   const uint16_t* input, float* sum, std::string& err);
+    /// Layer `layer` of a chunk of T tokens, the rows of tokens [t_begin, t_end): expert experts[j] serves rows
+    /// [off[j], off[j + 1]), row r being token src[r] with routing weight w[r]; each row times its weight adds to its
+    /// token's sum.  Local: reads `input` [T, n_embd] (FP16) and adds into `sum` [T, n_embd], queued on the prompt
+    /// path's stream.  Remote: `input` and `sum` are null, the input came through stage_input, and the sums of
+    /// [t_begin, t_end) reach host_sum in pieces of `piece` rows (t_begin a multiple of it), piece_done(k) recorded as
+    /// piece k lands; a layer's calls cover [0, T) in order.  Returns once the work is queued.
+    bool run_layer(int64_t layer, int64_t T, int64_t t_begin, int64_t t_end, const std::vector<int32_t>& experts,
+                   const std::vector<int32_t>& off, const std::vector<int32_t>& src, const std::vector<float>& w,
+                   int64_t piece, const uint16_t* input, float* sum, std::string& err);
     cudaEvent_t piece_done(int64_t k) const;
 
     int64_t experts_resident = 0;   ///< expert-layer groups served from its cache

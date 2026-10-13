@@ -190,6 +190,190 @@ __global__ void __launch_bounds__(DOWN_WARPS * 32) native_down_kernel(const unsi
     }
 }
 
+// ---------------------------------------------------------------- the same, decoded once
+// The two kernels above for the formats with a Split (iq_dot.cuh) and rows of NS calls: a row takes G lanes instead of
+// the warp, with the same values bitwise.  Lane t of a G-lane group stands for the warp's lanes t + G j: it sums each
+// one's calls t + G j, t + G j + 32, ... in row_dot's order and folds those sums in warp_sum's order (its xor 16 .. G
+// steps in registers, the rest by shuffles within the group).  A call's weights are decoded once for NE entries x[c],
+// and an entry's activation block is fetched once for the R rows w[r]; `lut` is the format's codebook.
+template<int TY, int G, int NS, int R, int NE>
+__device__ __forceinline__ void rows_sub(const uint8_t* const (&w)[R], const block_q8_1* const (&x)[NE], int t,
+                                         const void* lut, float (&out)[R][NE]) {
+    using F = Fmt<TY>;
+    using S = Split<TY>;
+    constexpr int J = 32 / G;
+    float acc[J][R][NE];
+#pragma unroll
+    for (int j = 0; j < J; ++j)
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int c = 0; c < NE; ++c) acc[j][r][c] = 0.0f;
+#pragma unroll
+    for (int j = 0; j < J; ++j)
+#pragma unroll
+        for (int k0 = G * j; k0 < NS; k0 += 32) {
+            const int k = k0 + t;
+            if (NS % G != 0 && k >= NS) continue;
+            const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+            typename S::W wv[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) wv[r] = S::load(w[r], kbx, iqs, lut);
+#pragma unroll
+            for (int c = 0; c < NE; ++c) {
+                const typename S::A a = S::fetch(x[c] + kbx * (F::qk / 32), iqs);
+#pragma unroll
+                for (int r = 0; r < R; ++r) acc[j][r][c] += S::apply(wv[r], a);
+            }
+        }
+#pragma unroll
+    for (int h = J / 2; h >= 1; h /= 2)
+#pragma unroll
+        for (int j = 0; j < h; ++j)
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int c = 0; c < NE; ++c) acc[j][r][c] = __fadd_rn(acc[j][r][c], acc[j + h][r][c]);
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NE; ++c) {
+            float v = acc[0][r][c];
+#pragma unroll
+            for (int o = G / 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            out[r][c] = v;
+        }
+}
+
+// The gate and up rows of h's column `col` for the NE entries from `tok` on, SwiGLU into sh[c][col]
+template<int TG, int NE>
+__device__ __forceinline__ void gus80_pass(const uint8_t* wg, const uint8_t* wu, const block_q8_1* __restrict__ xq,
+                                           const int32_t* __restrict__ tok, int t, const void* lut, float (*sh)[32],
+                                           int col) {
+    const uint8_t* const w[2] = {wg, wu};
+    const block_q8_1* x[NE];
+#pragma unroll
+    for (int c = 0; c < NE; ++c) x[c] = xq + (size_t) tok[c] * 80;
+    float v[2][NE];
+    rows_sub<TG, 16, 80, 2, NE>(w, x, t, lut, v);
+    if (t == 0)
+#pragma unroll
+        for (int c = 0; c < NE; ++c) sh[c][col] = (v[0][c] / (1.0f + __expf(-v[0][c]))) * v[1][c];
+}
+
+// native_gus_kernel for gate/up rows of 80 calls (n_embd 2560): a half-warp takes a column of h (its gate and up rows),
+// two entries a pass at two blocks an SM (64 registers; four entries took 128, one block an SM, 2-17% slower at 1-2
+// tokens), the codebook copied to shared memory (its scattered lookups 5-15% faster there).
+template<int TG>
+__global__ void __launch_bounds__(GUS_WARPS * 32, 2) native_gus80_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                         const int32_t* __restrict__ grp_start,
+                                                                         const int32_t* __restrict__ n_groups,
+                                                                         const int32_t* __restrict__ ent_tok,
+                                                                         const block_q8_1* __restrict__ xq,
+                                                                         NativeExpertLayout L,
+                                                                         block_q8_1* __restrict__ hq) {
+    using S = Split<TG>;
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    __shared__ float sh[GUS_BATCH][32];
+    __shared__ __align__(16) uint32_t s_grid[S::grid_bytes > 0 ? S::grid_bytes / 4 : 1];
+    const void* lut = nullptr;
+    if constexpr (S::grid_bytes > 0) {
+        for (int i = threadIdx.x; i < S::grid_bytes / 4; i += blockDim.x) s_grid[i] = ((const uint32_t*) S::grid())[i];
+        lut = s_grid;
+        __syncthreads();
+    }
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, c = blockIdx.x;
+    const int col = GUS_ROWS * warp + (lane >> 4), t = lane & 15;
+    const uint8_t* wg = (const uint8_t*) grp_ptr[g] + (size_t) (32 * c + col) * L.gu_row;
+    const uint8_t* wu = wg + L.up_off;
+    const int hb = (int) (L.n_ff / 32);
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    for (int b0 = e0; b0 < e1; b0 += GUS_BATCH) {
+        const int b1 = min(e1, b0 + GUS_BATCH);
+        for (int e = b0; e < b1; e += 2) {
+            if (b1 - e == 1) gus80_pass<TG, 1>(wg, wu, xq, ent_tok + e, t, lut, sh + (e - b0), col);
+            else gus80_pass<TG, 2>(wg, wu, xq, ent_tok + e, t, lut, sh + (e - b0), col);
+        }
+        __syncthreads();
+        for (int e = b0 + warp; e < b1; e += GUS_WARPS) {   // as native_gus_kernel
+            const float xi = sh[e - b0][lane];
+            float amax = fabsf(xi), sum = xi;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+                sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            }
+            const float d = q8_1_finite(amax / 127.0f);
+            const int8_t q = q8_1_quant(xi, d, amax);
+            block_q8_1* y = hq + (size_t) e * hb + c;
+            y->qs[lane] = q;
+            if (lane == 0) y->ds = q8_1_ds(d, sum);
+        }
+        __syncthreads();
+    }
+}
+
+// The down row r for the NE entries from `e` on
+template<int TD, int G, int NS, int NE>
+__device__ __forceinline__ void down_pass(const uint8_t* wr, const block_q8_1* __restrict__ hq, int hb, int e, int t,
+                                          const int32_t* __restrict__ ent_dst, int64_t n_embd, int r,
+                                          float* __restrict__ out) {
+    const uint8_t* const w[1] = {wr};
+    const block_q8_1* x[NE];
+#pragma unroll
+    for (int c = 0; c < NE; ++c) x[c] = hq + (size_t) (e + c) * hb;
+    float v[1][NE];
+    rows_sub<TD, G, NS, 1, NE>(w, x, t, nullptr, v);
+    if (t == 0)
+#pragma unroll
+        for (int c = 0; c < NE; ++c) out[(size_t) ent_dst[e + c] * n_embd + r] = v[0][c];
+}
+
+// native_down_kernel for down rows of NS calls (n_ff 640): G lanes a row, DOWN_WARPS * 32 / G rows a block, up to four
+// entries a pass (two or one: 1-11% slower)
+template<int TD, int G, int NS>
+__global__ void __launch_bounds__(DOWN_WARPS * 32) native_down_sub_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                          const int32_t* __restrict__ grp_start,
+                                                                          const int32_t* __restrict__ n_groups,
+                                                                          const int32_t* __restrict__ ent_dst,
+                                                                          const block_q8_1* __restrict__ hq,
+                                                                          NativeExpertLayout L, float* __restrict__ out) {
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    const int lane = threadIdx.x & 31, t = lane & (G - 1);
+    const int r = (blockIdx.x * DOWN_WARPS + (threadIdx.x >> 5)) * (32 / G) + lane / G;
+    const uint8_t* wr = (const uint8_t*) grp_ptr[g] + L.down_off + (size_t) r * L.d_row;
+    const int hb = (int) (L.n_ff / 32);
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    for (int e = e0; e < e1; e += 4) {
+        switch (min(4, e1 - e)) {
+            case 1: down_pass<TD, G, NS, 1>(wr, hq, hb, e, t, ent_dst, L.n_embd, r, out); break;
+            case 2: down_pass<TD, G, NS, 2>(wr, hq, hb, e, t, ent_dst, L.n_embd, r, out); break;
+            case 3: down_pass<TD, G, NS, 3>(wr, hq, hb, e, t, ent_dst, L.n_embd, r, out); break;
+            default: down_pass<TD, G, NS, 4>(wr, hq, hb, e, t, ent_dst, L.n_embd, r, out); break;
+        }
+    }
+}
+
+// The decoded-once kernels' formats: gate/up rows of 80 calls at n_embd 2560; down rows (n_ff 640) of IQ4_NL (40 calls,
+// 8 lanes a row; 4 or 16: 3-6% slower) and Q2_0 (20 calls, 4 lanes; 8 or 16: up to 14% slower at 8 tokens)
+#define STRATA_GU80_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(42)
+bool gu80(const NativeExpertLayout& L) {
+    switch (L.gu_type) {
+#define STRATA_GU80(T) case T:
+        STRATA_GU80_FMTS(STRATA_GU80)
+#undef STRATA_GU80
+            return L.n_embd == 2560;
+        default: return false;
+    }
+}
+constexpr int DOWN_G_IQ4_NL = 8, DOWN_G_Q2_0 = 4;
+int down_sub_g(const NativeExpertLayout& L) {
+    const int G = L.n_ff != 640 ? 0 : L.d_type == 20 ? DOWN_G_IQ4_NL : L.d_type == 42 ? DOWN_G_Q2_0 : 0;
+    return G > 0 && L.n_embd % (DOWN_WARPS * 32 / G) == 0 ? G : 0;
+}
+
 __global__ void rows_out_kernel(const float4* __restrict__ src, const int32_t* __restrict__ n_groups,
                                 const int32_t* __restrict__ grp_start, const int32_t* __restrict__ ent_dst,
                                 long long n4, float4* const* out, uint32_t* const* flag, const int32_t* ring,
@@ -954,6 +1138,12 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                                                                                 x_q8_1, x_stride, L, scratch); break;
         default: std::fprintf(stderr, "native_expert_grouped: Q8_K gate/up type %d\n", L.gu_type); std::exit(1);
         }
+    } else if (gu80(L)) {
+        switch (L.gu_type) {
+#define STRATA_GU80(T) case T: native_gus80_kernel<T><<<ggu, GUS_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            STRATA_GU80_FMTS(STRATA_GU80)
+#undef STRATA_GU80
+        }
     } else switch (L.gu_type) {
 #define STRATA_GU(T) case T: native_gus_kernel<T><<<ggu, GUS_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
         STRATA_FMTS(STRATA_GU)
@@ -974,6 +1164,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     } else if (L.d_act == 15 && L.d_type == 13) {
         native_down_contract_kernel<13><<<gd, DOWN_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst,
                                                                         scratch, L, out);
+    } else if (const int G = down_sub_g(L); G > 0) {
+        const dim3 gs((unsigned) (L.n_embd / (DOWN_WARPS * 32 / G)), (unsigned) cap_groups);
+        if (L.d_type == 20)
+            native_down_sub_kernel<20, DOWN_G_IQ4_NL, 40><<<gs, DOWN_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups,
+                                                                                       ent_dst, hq, L, out);
+        else
+            native_down_sub_kernel<42, DOWN_G_Q2_0, 20><<<gs, DOWN_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups,
+                                                                                     ent_dst, hq, L, out);
     } else {
     switch (L.d_type) {
 #define STRATA_DOWN(T) case T: native_down_kernel<T><<<gd, DOWN_WARPS * 32, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;

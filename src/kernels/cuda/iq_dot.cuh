@@ -543,6 +543,269 @@ __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq,
     return d8_0 * d8_1 * ((float) sumi);
 }
 
+// ---------------------------------------------------------------- the dots split, to decode a weight once for many entries
+// `load` takes what depends on the weight (grid words and their negative values' bytes, integer scales, the block scale
+// as a float; the codebook `grid()`, `grid_bytes` long, from `lut`: the table or a copy of it), `fetch` an activation's
+// ints and scale, `apply` the dot's integer chain and float expression, so that apply(load(w), fetch(x)) is the dot's
+// value bitwise (expert_grouped_parity checks it through the grouped kernels).
+template<int TY> struct Split;
+template<int N> struct SplitAct { int u[N]; float d8; };
+// the 8 ints and the scale of q8_1 block b
+__device__ __forceinline__ SplitAct<8> fetch8(const block_q8_1* __restrict__ b) {
+    SplitAct<8> a;
+#pragma unroll
+    for (int l = 0; l < 8; ++l) a.u[l] = get_int_b4(b->qs, l);
+    a.d8 = __low2float(b->ds);
+    return a;
+}
+// the i-quants' grid words and their negative values' bytes; sp - 2 sn over a block's 8 ints (h: two halves' sums)
+struct SplitGrid {
+    uint32_t g[8], gm[8];
+    __device__ __forceinline__ void put(int l0, uint32_t gx, uint32_t gy, uint2 m) {
+        g[l0] = gx; gm[l0] = gx & m.x; g[l0 + 1] = gy; gm[l0 + 1] = gy & m.y;
+    }
+    __device__ __forceinline__ int sum(const SplitAct<8>& a) const {
+        int sp = 0, sn = 0;
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            sp = ggml_cuda_dp4a((int) g[l], a.u[l], sp);
+            sn = ggml_cuda_dp4a((int) gm[l], a.u[l], sn);
+        }
+        return sp - 2 * sn;
+    }
+    __device__ __forceinline__ int sum_half(const SplitAct<8>& a, int h) const {
+        int sp = 0, sn = 0;
+#pragma unroll
+        for (int l = 4 * h; l < 4 * h + 4; ++l) {
+            sp = ggml_cuda_dp4a((int) g[l], a.u[l], sp);
+            sn = ggml_cuda_dp4a((int) gm[l], a.u[l], sn);
+        }
+        return sp - 2 * sn;
+    }
+};
+struct SplitNoGrid {
+    static constexpr int grid_bytes = 0;
+    __device__ static const void* grid() { return nullptr; }
+};
+// the i-quants of 8 calls a block: call iqs takes q8_1 block iqs / 2 of the weight block's 8
+struct SplitIq8 {
+    using A = SplitAct<8>;
+    __device__ static A fetch(const block_q8_1* __restrict__ bq8_1, int iqs) { return fetch8(bq8_1 + iqs / 2); }
+};
+template<> struct Split<16> : SplitIq8 {   // IQ2_XXS
+    struct W : SplitGrid { int ls; float dw; };
+    static constexpr int grid_bytes = sizeof(iq2xxs_grid);
+    __device__ static const void* grid() { return iq2xxs_grid; }
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const void* __restrict__ lut) {
+        W w;
+        const block_iq2_xxs* bq2 = (const block_iq2_xxs*) vbq + kbx;
+        const int q2 = get_int_b2(bq2->qs, iqs);
+        const uint8_t* aux8 = (const uint8_t*) &q2;
+        const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+#pragma unroll
+        for (int k0 = 0; k0 < 8; k0 += 2) {
+            const uint2 grid_pos = ((const uint2*) lut)[aux8[k0 / 2]];
+            w.put(k0, grid_pos.x, grid_pos.y, ksign_masks((aux32 >> (7 * k0 / 2)) & 0x7F));
+        }
+        w.ls = aux32 >> 27 | 1;
+        w.dw = __half2float(bq2->d);
+        return w;
+    }
+    __device__ static float apply(const W& w, const A& a) {
+        int sumi = w.sum(a);
+        sumi = sumi * w.ls / 8;
+        const float d = w.dw * a.d8;
+        return d * sumi;
+    }
+};
+// IQ2_XS and IQ2_S: two halves with a 4-bit scale each
+struct SplitLs2 : SplitIq8 {
+    struct W : SplitGrid { int ls0, ls1; float dw; };
+    __device__ static float apply(const W& w, const A& a) {
+        const int sumi0 = w.sum_half(a, 0), sumi1 = w.sum_half(a, 1);
+        const int sumi = (sumi0 * w.ls0 + sumi1 * w.ls1 + (sumi0 + sumi1) / 2) / 4;
+        const float d = w.dw * a.d8;
+        return d * sumi;
+    }
+};
+template<> struct Split<17> : SplitLs2 {   // IQ2_XS
+    static constexpr int grid_bytes = sizeof(iq2xs_grid);
+    __device__ static const void* grid() { return iq2xs_grid; }
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const void* __restrict__ lut) {
+        W w;
+        const block_iq2_xs* bq2 = (const block_iq2_xs*) vbq + kbx;
+        const int2 q2_packed = make_int2(get_int_b2(bq2->qs, iqs + 0), get_int_b2(bq2->qs, iqs + 1));
+        const uint16_t* q2 = (const uint16_t*) &q2_packed;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const uint2 grid_pos = ((const uint2*) lut)[q2[l0 / 2] & 0x1FF];
+            w.put(l0, grid_pos.x, grid_pos.y, ksign_masks(q2[l0 / 2] >> 9));
+        }
+        w.ls0 = bq2->scales[iqs / 2] & 0x0F;
+        w.ls1 = bq2->scales[iqs / 2] >> 4;
+        w.dw = __half2float(bq2->d);
+        return w;
+    }
+};
+template<> struct Split<22> : SplitLs2 {   // IQ2_S
+    static constexpr int grid_bytes = sizeof(iq2s_grid);
+    __device__ static const void* grid() { return iq2s_grid; }
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const void* __restrict__ lut) {
+        W w;
+        const block_iq2_s* bq2 = (const block_iq2_s*) vbq + kbx;
+        const int qs_packed = get_int_b2(bq2->qs, iqs / 2);
+        const uint8_t* qs = (const uint8_t*) &qs_packed;
+        const int qh = bq2->qh[iqs / 2];
+        const int signs_packed_32 = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
+        const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const uint2 grid_pos = ((const uint2*) lut)[qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)];
+            w.put(l0, grid_pos.x, grid_pos.y, sign_masks(signs_packed_8[l0 / 2]));
+        }
+        w.ls0 = bq2->scales[iqs / 2] & 0x0F;
+        w.ls1 = bq2->scales[iqs / 2] >> 4;
+        w.dw = __half2float(bq2->d);
+        return w;
+    }
+};
+template<> struct Split<18> : SplitIq8 {   // IQ3_XXS
+    struct W : SplitGrid { int ls; float dw; };
+    static constexpr int grid_bytes = sizeof(iq3xxs_grid);
+    __device__ static const void* grid() { return iq3xxs_grid; }
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const void* __restrict__ lut) {
+        const uint32_t* grid32 = (const uint32_t*) lut;
+        W w;
+        const block_iq3_xxs* bq3 = (const block_iq3_xxs*) vbq + kbx;
+        const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
+        const uint8_t* q3 = (const uint8_t*) &q3_packed;
+        const uint32_t aux32 = get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2)
+            w.put(l0, grid32[q3[l0 + 0]], grid32[q3[l0 + 1]], ksign_masks((aux32 >> (7 * l0 / 2)) & 0x7F));
+        w.ls = aux32 >> 28;
+        w.dw = __half2float(bq3->d);
+        return w;
+    }
+    __device__ static float apply(const W& w, const A& a) {
+        int sumi = w.sum(a);
+        sumi = (w.ls * sumi + sumi / 2) / 2;
+        const float d = w.dw * a.d8;
+        return d * sumi;
+    }
+};
+template<> struct Split<21> : SplitIq8 {   // IQ3_S
+    struct W : SplitGrid { int sc; float dw; };
+    static constexpr int grid_bytes = sizeof(iq3s_grid);
+    __device__ static const void* grid() { return iq3s_grid; }
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const void* __restrict__ lut) {
+        const uint32_t* grid32 = (const uint32_t*) lut;
+        W w;
+        const block_iq3_s* bq3 = (const block_iq3_s*) vbq + kbx;
+        const int2 qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+        const uint8_t* qs = (const uint8_t*) &qs_packed;
+        const int qh = bq3->qh[iqs / 2];
+        const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
+        const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2)
+            w.put(l0, grid32[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)], grid32[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)],
+                  sign_masks(signs_packed_8[l0 / 2]));
+        w.sc = 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+        w.dw = __half2float(bq3->d);
+        return w;
+    }
+    __device__ static float apply(const W& w, const A& a) {
+        int sumi = w.sum(a);
+        sumi *= w.sc;
+        const float d = w.dw * a.d8;
+        return d * sumi;
+    }
+};
+template<> struct Split<23> : SplitNoGrid {   // IQ4_XS
+    using A = SplitAct<8>;
+    struct W { int2 v[4]; int ls; float dw; };
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const void*) {
+        W w;
+        const block_iq4_xs* bq4 = (const block_iq4_xs*) vbq + kbx;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) w.v[j] = get_int_from_table_16(get_int_b4(bq4->qs, iqs + j), kvalues_iq4nl);
+        w.ls = ((bq4->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs / 2)) & 0x03) << 4);
+        w.dw = __half2float(bq4->d);
+        return w;
+    }
+    __device__ static A fetch(const block_q8_1* __restrict__ bq8_1, int iqs) { return fetch8(bq8_1 + iqs / 4); }
+    __device__ static float apply(const W& w, const A& a) {
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            sumi = ggml_cuda_dp4a(w.v[j].x, a.u[j + 0], sumi);
+            sumi = ggml_cuda_dp4a(w.v[j].y, a.u[j + 4], sumi);
+        }
+        sumi *= w.ls - 32;
+        const float d = w.dw * a.d8;
+        return d * sumi;
+    }
+};
+template<> struct Split<20> : SplitNoGrid {   // IQ4_NL: a call takes ints iqs, iqs + 1, iqs + 4, iqs + 5 of the q8_1 block
+    using A = SplitAct<4>;
+    struct W { int2 v[2]; float dw; };
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const void*) {
+        W w;
+        const block_iq4_nl* bq4 = (const block_iq4_nl*) vbq + kbx;
+#pragma unroll
+        for (int l = 0; l < 2; ++l) w.v[l] = get_int_from_table_16(get_int_b2(bq4->qs, iqs + l), kvalues_iq4nl);
+        w.dw = __half2float(bq4->d);
+        return w;
+    }
+    __device__ static A fetch(const block_q8_1* __restrict__ bq8_1, int iqs) {
+        const int* q8 = (const int*) bq8_1->qs + iqs;
+        A a;
+        a.u[0] = q8[0]; a.u[1] = q8[4]; a.u[2] = q8[1]; a.u[3] = q8[5];
+        a.d8 = __low2float(bq8_1->ds);
+        return a;
+    }
+    __device__ static float apply(const W& w, const A& a) {
+        int sumi = 0;
+#pragma unroll
+        for (int l = 0; l < 2; ++l) {
+            sumi = ggml_cuda_dp4a(w.v[l].x, a.u[2 * l + 0], sumi);
+            sumi = ggml_cuda_dp4a(w.v[l].y, a.u[2 * l + 1], sumi);
+        }
+        const float d = w.dw * a.d8;
+        return d * sumi;
+    }
+};
+template<> struct Split<42> : SplitNoGrid {   // Q2_0
+    using A = SplitAct<8>;
+    struct W { int qx[4], qy[4]; float d2; };
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const void*) {
+        W w;
+        const block_q2_0* bq2_0 = (const block_q2_0*) vbq + kbx;
+        w.d2 = bq2_0->d;
+        const int16_t* qs = (const int16_t*) bq2_0->qs + iqs * 4;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int q = qs[j];
+            const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+            const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+            w.qx[j] = __byte_perm(qe, qo, 0x5140);
+            w.qy[j] = __byte_perm(qe, qo, 0x7362);
+        }
+        return w;
+    }
+    __device__ static A fetch(const block_q8_1* __restrict__ bq8_1, int iqs) { return fetch8(bq8_1 + iqs); }
+    __device__ static float apply(const W& w, const A& a) {
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            sumi = ggml_cuda_dp4a(a.u[2 * j + 0], w.qx[j], sumi);
+            sumi = ggml_cuda_dp4a(a.u[2 * j + 1], w.qy[j], sumi);
+        }
+        return w.d2 * a.d8 * sumi;
+    }
+};
+
 // ---------------------------------------------------------------- the formats
 // qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
 template<int TY> struct Fmt;

@@ -5,8 +5,9 @@
 //
 //     expert_grouped_parity [--bench]
 //
-// --bench times both inside CUDA graphs (a kernel launched outside one pays WDDM's ~30-40 us) on the model files'
-// format pairs, with routings shaped like the verify windows' (tokens share about a quarter of their experts).
+// --bench times both inside CUDA graphs (a kernel launched outside one pays WDDM's ~30-40 us), each call after an L2
+// flush, on the model files' format pairs, with routings shaped like the verify windows' (tokens share about a quarter
+// of their experts).
 #include "strata/kernels/iq_kernels.hpp"
 #include "iq_dot.cuh"
 
@@ -408,14 +409,29 @@ void run(bool reference, const strata::kernels::NativeExpertLayout& L, const Dev
                                                d.scratch_new, d.out_new, s);
 }
 
-// microseconds per call, inside a graph of `reps` calls
-double time_graph(bool reference, const strata::kernels::NativeExpertLayout& L, const Dev& d, int64_t cap,
-                  cudaStream_t s) {
+// reads a buffer larger than the L2, so that a call finds its experts in VRAM as the windows do
+constexpr long long FLUSH_BYTES = 128ll << 20;
+float* g_flush = nullptr;
+__global__ void flush_kernel(const float4* __restrict__ p, long long n, float* sink) {
+    float s = 0.f;
+    for (long long i = blockIdx.x * (long long) blockDim.x + threadIdx.x; i < n; i += (long long) gridDim.x * blockDim.x) {
+        const float4 v = p[i];
+        s += v.x + v.y + v.z + v.w;
+    }
+    if (s == 1.2345f) *sink = s;
+}
+
+// microseconds per call (or per flush: `call` false), inside a graph of `reps` calls each after a flush
+double time_graph1(bool call, bool reference, const strata::kernels::NativeExpertLayout& L, const Dev& d, int64_t cap,
+                   cudaStream_t s) {
     const int reps = 50;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
     check(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture");
-    for (int i = 0; i < reps; ++i) run(reference, L, d, cap, s);
+    for (int i = 0; i < reps; ++i) {
+        flush_kernel<<<512, 256, 0, s>>>((const float4*) g_flush, FLUSH_BYTES / 16, g_flush);
+        if (call) run(reference, L, d, cap, s);
+    }
     check(cudaStreamEndCapture(s, &graph), "capture");
     check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
     const auto w0 = std::chrono::steady_clock::now();   // until the GPU has clocked up
@@ -433,6 +449,10 @@ double time_graph(bool reference, const strata::kernels::NativeExpertLayout& L, 
     cudaGraphExecDestroy(exec);
     cudaGraphDestroy(graph);
     return best;
+}
+double time_graph(bool reference, const strata::kernels::NativeExpertLayout& L, const Dev& d, int64_t cap,
+                  cudaStream_t s) {
+    return time_graph1(true, reference, L, d, cap, s) - time_graph1(false, reference, L, d, cap, s);
 }
 
 }  // namespace
@@ -457,6 +477,10 @@ int main(int argc, char** argv) {
     check(cudaMalloc(&d.scratch_new, strata::kernels::native_expert_scratch_bytes(cap, FF)), "dev");
     check(cudaMalloc(&d.out_ref, (size_t) cap * H * 4), "dev");
     check(cudaMalloc(&d.out_new, (size_t) cap * H * 4), "dev");
+    if (bench) {
+        check(cudaMalloc(&g_flush, (size_t) FLUSH_BYTES), "flush");
+        check(cudaMemset(g_flush, 0, (size_t) FLUSH_BYTES), "flush");
+    }
     {   // the tokens' activations
         std::mt19937 rng(7);
         std::normal_distribution<float> nd(0.f, 1.f);
@@ -470,11 +494,11 @@ int main(int argc, char** argv) {
         cudaFree(dx);
     }
     // parity: every gate/up format with a down format in turn (down rows are n_ff = 640 long: 32- and 64-blocks);
-    // bench: the model files' pairs (IQ2_XXS .. IQ3_S with IQ4_NL / Q2_0: the IQ3_XXS file; Q4_K, Q5_K with Q5_1,
-    // Q8_0: UD-Q4_K_XL)
+    // bench: the model files' pairs (IQ2_XXS .. IQ4_XS with IQ4_NL / Q2_0: the IQ3_S file; Q2_0: the draft layer;
+    // Q4_K, Q5_K with Q5_1, Q8_0: UD-Q4_K_XL)
     const int gus[] = {7, 8, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42}, downs[] = {7, 8, 20, 42};
     std::vector<std::pair<int, int>> pairs;
-    if (bench) pairs = {{16, 42}, {17, 20}, {18, 20}, {21, 42}, {22, 20}, {12, 7}, {13, 8}};
+    if (bench) pairs = {{16, 42}, {17, 20}, {18, 20}, {21, 42}, {22, 20}, {23, 20}, {42, 42}, {12, 7}, {13, 8}};
     else
         for (size_t i = 0; i < sizeof gus / sizeof gus[0]; ++i) pairs.emplace_back(gus[i], downs[i % 4]);
     int bad = 0;
@@ -506,7 +530,7 @@ int main(int argc, char** argv) {
             bad += diff;
         } else {
             std::printf("%-8s/%-7s", names, ggml_type_name((ggml_type) dn));
-            for (int n_tok : {1, 2, 4}) {
+            for (int n_tok : {1, 2, 4, 8}) {
                 const Plan p = make_plan(rng, n_tok, 0.92, arena, stride);
                 upload(p, d);
                 const double tr = time_graph(true, L, d, n_tok * K, s), tn = time_graph(false, L, d, n_tok * K, s);

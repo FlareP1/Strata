@@ -13,6 +13,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 
 #include <cuda_runtime.h>
 
@@ -80,6 +81,7 @@ struct Bufs {
     int32_t* sel_ids = nullptr;
     float *logits = nullptr, *sgate = nullptr, *sup = nullptr, *sg = nullptr;
     uint16_t* sh_h = nullptr;
+    uint8_t* xq = nullptr;        // a dense projection's input rounded to q8_1 for MMQ
     uint8_t* local = nullptr;     // this GPU's expert runner
     uint64_t local_bytes = 0;
 };
@@ -108,6 +110,7 @@ Bufs layout(Alloc& a, int64_t T, int64_t cap, int64_t max_blocks, bool offload) 
     b.bo = a.take<float>(p * N);
     b.inj_a = a.take<float>(p * HC);
     b.rs = a.take<float>(p * HC);
+    b.xq = a.take<uint8_t>(mmq::q8_bytes((int64_t) p, ZV));   // the widest input: 6144
     const uint64_t u0 = a.used;
     uint64_t u1 = u0;
     auto next = [&] { u1 = std::max(u1, a.used); a.used = u0; };
@@ -185,6 +188,7 @@ struct Prefill::Impl {
     std::vector<int32_t> order;                 // per layer its experts, the likeliest first (set_order)
     std::vector<uint32_t> routed;               // per layer and expert: the routed entries since clear_routed
     Gemm gemm;
+    std::unique_ptr<mmq::Context> mmq;   // the dense projections of 2048+ rows (null: no MMQ in this build)
     void* owned = nullptr;   // the buffers' own allocation (no region)
     Bufs b;
     std::vector<std::pair<const void*, const uint16_t*>> w16_have;   // this layer's dequantized weights
@@ -260,6 +264,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     int dev = 0;
     cudaGetDevice(&dev);
+    if (mmq::built()) m.mmq = std::make_unique<mmq::Context>();
     return m.gemm.init(stream, err) &&
            m.local.init(dev, dev, stream, src, cache, host_res, NE, max_chunk, offload == nullptr, err);
 }
@@ -365,6 +370,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     };
     auto native_proj = [&](const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                            std::string& e) {
+        // a matrix of 2048+ rows: its GGUF blocks on the int8 tensor cores (MMQ, the input rounded to q8_1), faster
+        // than cuBLAS on its FP16 copy (1.06-1.67x by format at 2048 tokens: scratch/aq_bench.cu); smaller ones lose
+        if (m.mmq && w->native_data && w->ne1 >= 2048 && w->ne0 <= ZV && mmq::supported(w->native_type)) {
+            mmq::quantize_f16(X, b.xq, w->native_type, w->ne0, w->ne0, T, m.cs);
+            m.mmq->run_dense(w->native_data, w->native_type, w->ne1, w->ne0, b.xq, T, Y, w->ne1, m.cs);
+            return true;
+        }
         const uint16_t* W = w->native_data ? w16(w->native_type, w->native_data, w->ne1, w->ne0) : nullptr;
         if (W == nullptr) {
             e = "prefill: " + name + (w->native_data ? " does not fit the dequantization buffer"

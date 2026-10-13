@@ -85,6 +85,56 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
 
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
+// llama.cpp's quantize_mmq_q8_1 (quantize.cu, MIT) for FP16 rows: one channel, no ids, the same arithmetic on the
+// values the FP16 rows hold
+template <mmq_q8_1_ds_layout ds_layout>
+__global__ void quantize_mmq_q8_1_f16(const half* __restrict__ x, void* __restrict__ vy, const int64_t ne00,
+                                      const int64_t s01, const int64_t ne0, const int ne1) {
+    constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+    constexpr int vals_per_sum = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
+    const int64_t i0 = ((int64_t) blockDim.x * blockIdx.y + threadIdx.x) * 4;
+    if (i0 >= ne0) return;
+    block_q8_1_mmq* y = (block_q8_1_mmq*) vy;
+    const int64_t k_block = i0 / QK8_1_MMQ, iqs = i0 % QK8_1_MMQ;
+    float4 xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (i0 < ne00) {
+        const half2* h = (const half2*) (x + (int64_t) blockIdx.x * s01 + i0);
+        const float2 a = __half22float2(h[0]), b = __half22float2(h[1]);
+        xi = make_float4(a.x, a.y, b.x, b.y);
+    }
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+    for (int offset = vals_per_scale / 8; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    float sum = 0.0f;
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+        for (int offset = vals_per_sum / 8; offset > 0; offset >>= 1) sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+    }
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = roundf(xi.x * d_inv);
+    q.y = roundf(xi.y * d_inv);
+    q.z = roundf(xi.z * d_inv);
+    q.w = roundf(xi.w * d_inv);
+    const float d = 1.0f / d_inv;
+    const int64_t ib = k_block * ne1 + blockIdx.x;
+    ((char4*) y[ib].qs)[iqs / 4] = q;
+    if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+        if (iqs % 16 == 0 && iqs < 96) {
+            y[ib].d2s6[2 + iqs / 16] = sum;
+            if (iqs % 64 == 0) y[ib].d2s6[iqs / 64] = d;
+        }
+    } else if (iqs % 32 == 0) {
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) y[ib].ds4[iqs / 32] = make_half2(d, sum);
+        else y[ib].d4[iqs / 32] = d;
+    }
+}
+
 }  // namespace
 
 bool built() { return true; }
@@ -115,6 +165,29 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
                            (cudaStream_t) stream);
     ck(cudaGetLastError(), "quantize");
+}
+
+void quantize_f16(const uint16_t* x, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
+    if (rows <= 0) return;
+    const int64_t ne0 = pad512(cols);
+    const dim3 grid((unsigned) rows, (unsigned) ((ne0 + 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ)));
+    const cudaStream_t s = (cudaStream_t) stream;
+    const half* h = (const half*) x;
+    switch (mmq_get_q8_1_ds_layout((ggml_type) t)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_D4><<<grid, CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 0, s>>>(h, xq, cols, ld, ne0, (int) rows);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_DS4><<<grid, CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 0, s>>>(h, xq, cols, ld, ne0, (int) rows);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_D2S6><<<grid, CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 0, s>>>(h, xq, cols, ld, ne0, (int) rows);
+            break;
+        default:
+            std::fprintf(stderr, "prefill mmq: no q8_1 layout for type %d\n", t);
+            std::exit(1);
+    }
+    ck(cudaGetLastError(), "quantize_f16");
 }
 
 Context::Context() {
@@ -155,6 +228,41 @@ void Context::run(const Product& p, void* stream) {
             std::exit(1);
     }
     ck(cudaGetLastError(), "mul_mat_q");
+}
+
+void Context::run_dense(const void* w, int type, int64_t rows, int64_t cols, const void* xq, int64_t T, float* dst,
+                        int64_t ld_dst, void* stream) {
+    if (T <= 0) return;
+    const ggml_type t = (ggml_type) type;
+    const int64_t bpr = cols / ggml_blck_size(t);
+    const int64_t s12 = T * pad512(cols) * (int64_t) sizeof(block_q8_1) / (QK8_1 * (int64_t) sizeof(int));
+    const mmq_args a = {(const char*) w, t, (const int*) xq, nullptr, nullptr, dst, nullptr,
+                        cols, rows, T, bpr, T, ld_dst,
+                        1, 1, rows * bpr, s12, T * ld_dst,
+                        1, 1, 0, 0, 0,
+                        T, T};
+    auto& ctx = *(ggml_backend_cuda_context*) ctx_;
+    const cudaStream_t s = (cudaStream_t) stream;
+    switch (t) {
+        case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, a, s); break;
+        case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, a, s); break;
+        case GGML_TYPE_IQ2_XS: mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, a, s); break;
+        case GGML_TYPE_IQ2_S: mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, a, s); break;
+        case GGML_TYPE_IQ3_XXS: mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ctx, a, s); break;
+        case GGML_TYPE_IQ3_S: mul_mat_q_case<GGML_TYPE_IQ3_S>(ctx, a, s); break;
+        case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, a, s); break;
+        case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
+        case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
+        case GGML_TYPE_IQ1_S: mul_mat_q_case<GGML_TYPE_IQ1_S>(ctx, a, s); break;
+        case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
+        case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
+        case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
+        case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
+        default:
+            std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
+            std::exit(1);
+    }
+    ck(cudaGetLastError(), "mul_mat_q (dense)");
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,

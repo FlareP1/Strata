@@ -151,11 +151,15 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
+                // a zeroed tail: the prompt path's MMQ reads past the last row of a matrix whose rows are not whole
+                // 256-value steps (the shared expert's down projection, 640), and NaN times a zero input is NaN
+                constexpr uint64_t kTail = 4096;
                 void* allocation = nullptr;
-                auto status = cudaMalloc(&allocation, bytes);
+                auto status = cudaMalloc(&allocation, bytes + kTail);
                 DevicePtr data(allocation);
                 if (status == cudaSuccess)
                     status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
+                if (status == cudaSuccess) status = cudaMemset((uint8_t*) data.get() + bytes, 0, kTail);
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                 }

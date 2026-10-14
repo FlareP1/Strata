@@ -282,6 +282,9 @@ struct Options {
     /// 125.7 GiB machine).
     double vram_pin_gib = 0.0;
     double second_gpu_pin_gib = 0.0;
+    /// The arena's blobs placed by the RAM's measured read rate once the GPUs' experts are known
+    /// (ArenaExpertSource::place): for RAM with slower regions, off by default.
+    bool arena_place = false;
     /// The elastic K/V (--kv-grow, STRATA_KV_GROW=1): the K/V takes VRAM as the context grows, the expert cache the rest.
     bool kv_grow = false;
     bool hc_q8 = false;   ///< the hyper-connection matrices only in 8 bits (core::HcQ8)
@@ -450,6 +453,9 @@ void usage() {
                  "                       VRAM: its lowest slots keep them for good and the RAM arena leaves them out\n"
                  "                       (experts that outgrow the RAM then fit; native packs read from the GGUF)\n"
                  "  --second-gpu-pin-gib G  the next ones, up to G GiB, only in the second GPU's VRAM\n"
+                 "  --arena-place        at the start, time each expert's place in the RAM arena and move the experts\n"
+                 "                       no GPU holds out of the slow places, into the GPU-resident ones' (RAM with\n"
+                 "                       slower regions, as unpaired DIMMs make; ~2-4 s).  Off by default\n"
                  "  --kv-grow            with --serve: the K/V takes VRAM only for the cells the requests\n"
                  "                       reach and the expert cache holds the rest, giving slots up as a conversation\n"
                  "                       grows and taking them back after (STRATA_KV_GROW=1/0 too; after Niko1221/Strata\n"
@@ -1030,9 +1036,12 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
             return argv[++i];
         };
-        if (a == "--hc-q8") {   // outside the chain below: MSVC refuses one this long (C1061)
-            o.hc_q8 = true;
-            continue;
+        {   // switches outside the chain below: MSVC refuses one this long (C1061)
+            bool* on = a == "--hc-q8" ? &o.hc_q8 : a == "--arena-place" ? &o.arena_place : nullptr;
+            if (on != nullptr) {
+                *on = true;
+                continue;
+            }
         }
         {   // the rope scaling knobs, outside the chain below as well
             double* knob = a == "--rope-scale" ? &o.rope_scale : a == "--rope-freq-base" ? &o.rope_freq_base
@@ -2961,6 +2970,70 @@ int main(int argc, char** argv) {
             host_res2.clear();
         }
     }
+    // The largest loan the main GPU's prompt path can take: its buffers for the longest chunk with a whole layer
+    // streamed (the prefetch area grows with the experts the cache does not hold).  The elastic K/V stays below it.
+    auto worst_loan = [&](bool off) {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        uint64_t stride = 0;
+        for (int64_t l = 0; l < lay.n_layers; ++l)
+            stride = std::max<uint64_t>(stride, ((uint64_t) lay.blob_bytes(l) + 255) & ~(uint64_t) 255);
+        // (with pinned experts and the second GPU's share of the prompt path, no layer streams here: the loan is its
+        // buffers alone, Prefill::bytes_for)
+        const uint64_t worst_pre = !pin1.empty() && off ? 0 : stride * (uint64_t) g.n_expert;
+        return strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk, off) + worst_pre + worst_pre / 10;
+    };
+    // --arena-place: the RAM's slow places go to the experts that stay on a GPU: below the slots each GPU's prompt
+    // path borrows at every batched prompt (its cache's last ones) and, with the elastic K/V, below the slots the whole
+    // context's K/V takes under the main GPU's loan (after the PLE table's load, whose reads would slow the timing)
+    if (o.arena_place && srcp == &arena_src) {
+        if (ple_table.is_open() && ple_table.mode() == strata::kernels::PleIo::Ram && !ple_table.ram_ready())
+            ple_table.wait_ram_load();
+        const bool off = o.second_gpu >= 0 && !o.no_prompt_offload;
+        auto below_loan = [&](strata::core::ExpertCache& c, size_t pinned, uint64_t need) -> int64_t {
+            SlotLoan l;
+            l.cache = &c;
+            l.keep = (int64_t) pinned;
+            return l.plan(need) ? (int64_t) l.first : c.slots();
+        };
+        // each GPU's loan for the longest chunk (Prefill::bytes_for, ExpertRunner::bytes_for)
+        using strata::prefill::ExpertRunner;
+        const int64_t chunk = o.prefill_chunk;
+        const int32_t* res1 = host_res.empty() ? nullptr : host_res.data();
+        const int32_t* res2 = host_res2.empty() ? nullptr : host_res2.data();
+        const uint64_t need1 = strata::prefill::Prefill::bytes_needed(g, ss, chunk, off) +
+                               (off ? 0 : std::min(ExpertRunner::prefetch_need(res1, nullptr, g.n_expert, true),
+                                                   ExpertRunner::area_cap(chunk, false)));
+        const uint64_t need2 = ExpertRunner::bytes_needed(chunk, g.n_expert, true, true) +
+                               std::min(ExpertRunner::prefetch_need(res2, res1, g.n_expert, true),
+                                        ExpertRunner::area_cap(chunk, true));
+        const bool borrow = !o.no_prefill_borrow && d_res != nullptr;
+        int64_t stay1 = host_res.empty() ? 0 : !borrow ? xcache.slots() : below_loan(xcache, pin1.size(), need1);
+        if (strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr && stay1 > 0) {
+            if (borrow) stay1 = std::min(stay1, below_loan(xcache, 0, worst_loan(off)));
+            const uint64_t G = strata::core::vmm_granularity();
+            const uint64_t kv = (uint64_t) strata::core::qsa_kv_elastic_need(o.max_context + 64) * G + G;
+            const uint64_t top = xcache.slot_offset(stay1);
+            while (stay1 > (int64_t) pin1.size() && top - xcache.slot_offset(stay1) < kv) --stay1;
+        }
+        const int64_t stay2 = host_res2.empty() ? 0 : !(off && borrow) ? gpu2.cache().slots()
+                                                    : below_loan(gpu2.cache(), pin2.size(), need2);
+        const size_t n = (size_t) (g.n_layers * g.n_expert);
+        std::vector<int32_t> rank(n, -1);
+        for (size_t k = 0; k < profile.size(); ++k) {
+            int32_t& r = rank[(size_t) profile[k].first * (size_t) g.n_expert + (size_t) profile[k].second];
+            if (r < 0) r = (int32_t) k;
+        }
+        std::vector<uint8_t> on_gpu(n, 0);
+        for (size_t i = 0; i < n; ++i)
+            on_gpu[i] = (!host_res.empty() && host_res[i] >= 0 && host_res[i] < stay1) ||
+                        (!host_res2.empty() && host_res2[i] >= 0 && host_res2[i] < stay2);
+        std::fprintf(stderr, "strata generate: --arena-place: the experts in the main GPU's slots below %lld and the "
+                             "second's below %lld stay there\n", (long long) stay1, (long long) stay2);
+        std::string line;
+        const bool ok = arena_src.place(rank, on_gpu, line);
+        std::fprintf(stderr, "strata generate: %s\n", line.c_str());
+        if (!ok) return 1;
+    }
     // the second tier ranks after the first on the same counts, and decays them
     std::string adapt_err;
     auto adapt = [&]() -> bool {
@@ -3169,20 +3242,11 @@ int main(int argc, char** argv) {
             // streamed, not the loan at start (that one let a later, larger loan reach the given-up slots).
             int64_t top = xcache.slots();
             if (pbuf.lend) {
-                const auto& lay = strata::kernels::cpu::expert_layout();
-                uint64_t stride = 0;
-                for (int64_t l = 0; l < lay.n_layers; ++l)
-                    stride = std::max<uint64_t>(stride, ((uint64_t) lay.blob_bytes(l) + 255) & ~(uint64_t) 255);
-                // (with pinned experts and the second GPU's share of the prompt path, no layer streams here: the
-                // loan is its buffers alone, Prefill::bytes_for)
-                const uint64_t worst_pre = !pin1.empty() && pbuf.offload != nullptr ? 0 : stride * (uint64_t) g.n_expert;
-                const uint64_t worst = strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk,
-                                                                              pbuf.offload != nullptr) +
-                                       worst_pre + worst_pre / 10;
                 SlotLoan probe;
                 probe.cache = &xcache;
-                top = probe.plan(worst) ? std::min<int64_t>(probe.first, pbuf.loan.first >= 0 ? pbuf.loan.first : top)
-                                        : 0;   // no room for the worst loan: nothing can be given up
+                top = probe.plan(worst_loan(pbuf.offload != nullptr))
+                          ? std::min<int64_t>(probe.first, pbuf.loan.first >= 0 ? pbuf.loan.first : top)
+                          : 0;   // no room for the worst loan: nothing can be given up
             }
             if (const char* v = std::getenv("STRATA_KV_GROW_STEP"); v != nullptr && std::atoll(v) > 0) kvg.step = std::atoll(v);
             // tests: the cache keeps this many slots (at or above the bound: the K/V grows into new VRAM only)

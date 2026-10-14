@@ -399,6 +399,14 @@ public:
     bool read_file_blob(int64_t layer, int64_t expert, uint8_t* dst, std::string& err) const;
     /// The bytes the arena left out (set_vram_only).
     uint64_t vram_only_bytes() const { return vram_only_bytes_; }
+    /// --arena-place (off by default: for RAM whose regions read at different rates, as unpaired DIMMs make):
+    /// times each blob's place in the pinned blocks (every physical core reading it; the slow ones again), then swaps
+    /// the experts on no GPU out of the slow places with GPU-resident ones in fast places of the same size, in any
+    /// pinned layer: the GPU-resident ones the hottest first (the last to move to the CPU as the tiers adapt), the
+    /// others the coldest first.  `rank` and `on_gpu` per (layer, expert): the profile's rank (lower: routed more),
+    /// whether it stays on a GPU.  Before generation (nothing may read the arena meanwhile).  `line`: what it found
+    /// and did, for the startup print; false: STRATA_LOAD_VERIFY found a moved blob unlike the model's.
+    bool place(const std::vector<int32_t>& rank, const std::vector<uint8_t>& on_gpu, std::string& line);
 
     /// What backing was obtained and why, for the startup print.  "The engine adapts to the machine it is on" is
     /// only true if the engine says what it got.
@@ -430,6 +438,8 @@ private:
     /// per (layer, expert): its place among its layer's blobs in the arena, -1 for one only in VRAM (empty: all
     /// in the arena, at their expert index)
     std::vector<int32_t> idx_;
+    /// per (layer, expert): the pinned block its blob is in once place() moved some (empty: its layer's)
+    std::vector<int32_t> blk_;
     uint64_t vram_only_bytes_ = 0;
     std::vector<std::pair<size_t, uint64_t>> spans_;   ///< per (layer, role): its shard and the tensor's offset
     std::vector<int> fds_;                              ///< the shards, open for read_file_blob

@@ -292,15 +292,19 @@ uint64_t ExpertRunner::prefetch_area(int64_t chunk, const int32_t* skip) const {
 
 uint64_t ExpertRunner::prefetch_need(const int32_t* skip) const {
     const Impl& m = *impl_;
-    if (!m.streams) return 0;
+    return prefetch_need(m.res, skip, m.n_expert, m.streams);
+}
+
+uint64_t ExpertRunner::prefetch_need(const int32_t* res, const int32_t* skip, int64_t n_expert, bool streams) {
+    if (!streams) return 0;
     const auto& lay = strata::kernels::cpu::expert_layout();
     uint64_t most = 0;
     for (int64_t l = 0; l < lay.n_layers; ++l) {
         const size_t stride = ((size_t) lay.blob_bytes(l) + 255) & ~(size_t) 255;
         uint64_t sum = 0;
-        for (int64_t e = 0; e < m.n_expert; ++e) {
-            const size_t i = (size_t) (l * m.n_expert + e);
-            if ((m.res == nullptr || m.res[i] < 0) && (skip == nullptr || skip[i] < 0)) sum += stride;
+        for (int64_t e = 0; e < n_expert; ++e) {
+            const size_t i = (size_t) (l * n_expert + e);
+            if ((res == nullptr || res[i] < 0) && (skip == nullptr || skip[i] < 0)) sum += stride;
         }
         most = std::max(most, sum);
     }

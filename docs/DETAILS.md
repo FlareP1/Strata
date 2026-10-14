@@ -1603,6 +1603,18 @@ thinking / after a 16K prompt / an edit quoting its prompt):
   (the tier copied 4-7x fewer MB over the 3090's link), UD-Q4_K_XL -0.6 / -2.5 / -4.7 / +13.2% (on the edit text its
   hits fell from 80% to 61%); 8 GiB the same. Needs `--expert-profile`, a native pack read from its GGUF and the
   token graph's GPU hits.
+- **`--arena-place`: the experts the CPU reads kept out of the RAM's slow region.** For RAM whose regions read at
+  different rates, as unpaired DIMMs make (two 32 GB and two 48 GB modules here: 32 GB sit on one channel and read at
+  ~37 GB/s against ~58 with 8 cores). Where the OS puts the pinned expert arena varies with what ran before: 2-25 GiB
+  of UD-Q4_K_XL's 72 GiB were slow in back-to-back starts. At the start the engine times each expert's place in the
+  arena (every physical core reading it; ~2.3 s for 72 GiB), then swaps the experts the CPU reads out of the slow
+  places with ones that stay on a GPU (below the cache slots the prompt path borrows and, with `--kv-grow`, the ones
+  the whole context's K/V takes) in fast places of the same size, in any layer (~2.3 s). Fixed text, 4 runs each
+  against the timing alone (`STRATA_ARENA_PLACE_DRY=1`), 15-25 GiB slow: UD-Q4_K_XL code +5.4%, edit +6.7%, after a
+  16K prompt +2.1% (the GPU tiers move experts as a text goes on: 8-17% of the CPU's expert reads still came from
+  slow places, 18-30% without the moves); the prompts' speed unchanged. IQ3_S within 0.1% (its CPU kernels read ~40
+  GB/s, about the slow region's own rate). On RAM without a slow region it finds little or nothing to move, and the
+  start is ~2 s longer for the timing.
 - **`STRATA_POOL_FUSED=1`: a native layer's gate/up and down rows in one CPU pool phase** (an expert's down rows start
   once its own hidden row is quantized, no barrier between the halves; the same bytes). IQ3_S -0.8 / -0.5 / -0.3 / -0.7%,
   UD-Q4_K_XL +2.2 / -0.2 / +0.6 / 0.0%.

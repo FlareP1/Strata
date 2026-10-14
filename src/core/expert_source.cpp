@@ -1156,6 +1156,7 @@ void ArenaExpertSource::close() {
     blobs_ = 0;
     n_expert_ = 0;
     idx_.clear();
+    blk_.clear();
     vram_only_bytes_ = 0;
     spans_.clear();
 #if !defined(_WIN32)
@@ -1170,18 +1171,23 @@ bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
 
 const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) const {
     if (!pinned(layer, expert) || layer_dev_[(size_t) layer] == nullptr) return nullptr;
-    const int64_t at = idx_.empty() ? expert : idx_[(size_t) (layer * n_expert_ + expert)];
-    return layer_dev_[(size_t) layer] + (uint64_t) at * strata::kernels::cpu::expert_layout().blob_bytes(layer);
+    const size_t i = (size_t) (layer * n_expert_ + expert);
+    const int64_t at = idx_.empty() ? expert : idx_[i];
+    // (place() moves blobs between mapped blocks only)
+    return layer_dev_[blk_.empty() ? (size_t) layer : (size_t) blk_[i]] +
+           (uint64_t) at * strata::kernels::cpu::expert_layout().blob_bytes(layer);
 }
 
 const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     if (layer < 0 || layer >= (int64_t) layer_base_.size() || expert < 0 || expert >= n_expert_) return nullptr;
-    const int64_t at = idx_.empty() ? expert : idx_[(size_t) (layer * n_expert_ + expert)];
+    const size_t i = (size_t) (layer * n_expert_ + expert);
+    const int64_t at = idx_.empty() ? expert : idx_[i];
     if (at < 0) return nullptr;   // only in VRAM
     ++reads_;
     // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of
     // this class over `FileExpertSource`.
-    return layer_base_[(size_t) layer] + (uint64_t) at * strata::kernels::cpu::expert_layout().blob_bytes(layer);
+    return layer_base_[blk_.empty() ? (size_t) layer : (size_t) blk_[i]] +
+           (uint64_t) at * strata::kernels::cpu::expert_layout().blob_bytes(layer);
 }
 
 bool ArenaExpertSource::read_file_blob(int64_t layer, int64_t expert, uint8_t* dst, std::string& err) const {
@@ -1200,6 +1206,10 @@ bool ArenaExpertSource::read_file_blob(int64_t layer, int64_t expert, uint8_t* d
         const auto& [shard, offset] = spans_[(size_t) (3 * layer + r)];
         const uint64_t from = offset + (uint64_t) expert * per[r];
 #if !defined(_WIN32)
+        if (shard >= fds_.size()) {
+            err = "ArenaExpertSource: the model's files are open only with experts only in VRAM";
+            return false;
+        }
         for (uint64_t got = 0; got < per[r];) {
             const ssize_t n = ::pread(fds_[shard], dst + at[r] + got, (size_t) (per[r] - got), (off_t) (from + got));
             if (n <= 0) {

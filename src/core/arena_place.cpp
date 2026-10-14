@@ -6,8 +6,8 @@
 // back-to-back starts, whole layers' blocks at a time.  The CPU reads only the experts no GPU holds; the ones that stay
 // on a GPU (the caller's: below the slots its prompt path borrows) take the slow places.  Blocks of the same blob size
 // take each other's experts, so a layer whose whole block is slow keeps its CPU experts elsewhere.  The GPU tiers
-// still move experts as a conversation goes: on fixed text 8-17% of the CPU's expert reads were from slow places
-// afterwards, 18-30% without the moves.
+// still move experts as a conversation goes (on fixed text 8-17% of the CPU's expert reads were from slow places
+// afterwards, 18-30% without the moves): between requests the swaps follow them (replan, replace_some).
 #include "strata/core/expert_source.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -99,6 +99,63 @@ void read_words(const uint8_t* p, uint64_t bytes) {
 
 }  // namespace
 
+int64_t ArenaExpertSource::place_block(size_t q) const {
+    return (int64_t) (std::upper_bound(place_off_.begin(), place_off_.end(), (int64_t) q) - place_off_.begin()) - 1;
+}
+
+uint8_t* ArenaExpertSource::place_addr(size_t q) const {
+    const int64_t b = place_block(q);
+    return layer_base_[(size_t) b] +
+           (uint64_t) ((int64_t) q - place_off_[(size_t) b]) * strata::kernels::cpu::expert_layout().blob_bytes(b);
+}
+
+void ArenaExpertSource::note_swap(size_t q1, size_t q2) {
+    const int64_t b1 = place_block(q1), b2 = place_block(q2);
+    const int32_t i1 = place_occ_[q1], i2 = place_occ_[q2];
+    idx_[(size_t) i1] = (int32_t) ((int64_t) q2 - place_off_[(size_t) b2]);
+    blk_[(size_t) i1] = (int32_t) b2;
+    idx_[(size_t) i2] = (int32_t) ((int64_t) q1 - place_off_[(size_t) b1]);
+    blk_[(size_t) i2] = (int32_t) b1;
+    place_occ_[q1] = i2;
+    place_occ_[q2] = i1;
+}
+
+std::vector<std::pair<size_t, size_t>> ArenaExpertSource::plan_swaps(const std::vector<int32_t>& rank,
+                                                                     const std::vector<uint8_t>& on_gpu) const {
+    // in each class of blocks with equal blobs, the fast places for the experts that deserve them: the CPU's hottest,
+    // its coldest, then the GPUs' coldest; the swaps move the others' out of the slow places
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const int64_t L = (int64_t) layer_base_.size(), E = n_expert_;
+    std::map<uint64_t, std::vector<int64_t>> classes;
+    for (int64_t b = 0; b < L; ++b)
+        if (place_off_[(size_t) b + 1] > place_off_[(size_t) b]) classes[lay.blob_bytes(b)].push_back(b);
+    auto key = [&](int32_t i) {
+        const int64_t r = rank[(size_t) i] >= 0 ? rank[(size_t) i] : L * E + i;
+        return on_gpu[(size_t) i] != 0 ? 4 * L * E - r : r;
+    };
+    std::vector<std::pair<size_t, size_t>> swaps;   // (slow place, fast place)
+    for (const auto& [bb, blocks] : classes) {
+        std::vector<size_t> by_key;
+        for (const int64_t b : blocks)
+            for (int64_t q = place_off_[(size_t) b]; q < place_off_[(size_t) b + 1]; ++q) by_key.push_back((size_t) q);
+        std::sort(by_key.begin(), by_key.end(),
+                  [&](size_t a, size_t c) { return key(place_occ_[a]) < key(place_occ_[c]); });
+        size_t nf = 0;
+        for (const size_t q : by_key) nf += place_slow_[q] == 0;
+        std::vector<size_t> out, in;   // fast experts in slow places, slow experts in fast places (as many)
+        for (size_t k = 0; k < by_key.size(); ++k) {
+            if (k < nf && place_slow_[by_key[k]]) out.push_back(by_key[k]);
+            if (k >= nf && !place_slow_[by_key[k]]) in.push_back(by_key[k]);
+        }
+        for (size_t k = 0; k < out.size() && k < in.size(); ++k) swaps.emplace_back(out[k], in[k]);
+    }
+    // the CPU's hottest expert's first, over all classes (replace_some makes them in this order)
+    std::stable_sort(swaps.begin(), swaps.end(), [&](const auto& a, const auto& b) {
+        return key(place_occ_[a.first]) < key(place_occ_[b.first]);
+    });
+    return swaps;
+}
+
 bool ArenaExpertSource::place(const std::vector<int32_t>& rank, const std::vector<uint8_t>& on_gpu, std::string& line) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     const int64_t L = (int64_t) layer_base_.size(), E = n_expert_;
@@ -106,9 +163,9 @@ bool ArenaExpertSource::place(const std::vector<int32_t>& rank, const std::vecto
         line = "--arena-place: no arena, or a ranking for a different geometry";
         return true;
     }
-    // STRATA_ARENA_PLACE_DRY=1 (the A/B arm): times and reports, moves nothing
+    // STRATA_ARENA_PLACE_DRY=1 (the A/B arm): times and reports, moves nothing, now or between requests
     const char* dry_env = std::getenv("STRATA_ARENA_PLACE_DRY");
-    const bool dry = dry_env != nullptr && std::atoi(dry_env) != 0;
+    place_dry_ = dry_env != nullptr && std::atoi(dry_env) != 0;
     if (idx_.empty()) {   // each blob at its expert index
         idx_.resize((size_t) (L * E));
         for (int64_t i = 0; i < L * E; ++i) idx_[(size_t) i] = (int32_t) (i % E);
@@ -117,27 +174,21 @@ bool ArenaExpertSource::place(const std::vector<int32_t>& rank, const std::vecto
         blk_.resize((size_t) (L * E));
         for (int64_t i = 0; i < L * E; ++i) blk_[(size_t) i] = (int32_t) (i / E);
     }
-    // the places: the mapped blocks' blobs, `off` each block's first, `occ` the (layer, expert) in each
-    std::vector<int64_t> off((size_t) L + 1, 0);
+    // the places: the mapped blocks' blobs, each block's first and the (layer, expert) in each
+    place_off_.assign((size_t) L + 1, 0);
     for (int64_t i = 0; i < L * E; ++i)
-        if (idx_[(size_t) i] >= 0 && layer_mapped(blk_[(size_t) i])) ++off[(size_t) blk_[(size_t) i] + 1];
-    for (int64_t b = 0; b < L; ++b) off[(size_t) b + 1] += off[(size_t) b];
-    const size_t n = (size_t) off[(size_t) L];
+        if (idx_[(size_t) i] >= 0 && layer_mapped(blk_[(size_t) i])) ++place_off_[(size_t) blk_[(size_t) i] + 1];
+    for (int64_t b = 0; b < L; ++b) place_off_[(size_t) b + 1] += place_off_[(size_t) b];
+    const size_t n = (size_t) place_off_[(size_t) L];
     if (n == 0) {
+        place_off_.clear();
         line = "--arena-place: no pinned, mapped blocks";
         return true;
     }
-    std::vector<int32_t> occ(n, -1);
+    place_occ_.assign(n, -1);
     for (int64_t i = 0; i < L * E; ++i)
         if (idx_[(size_t) i] >= 0 && layer_mapped(blk_[(size_t) i]))
-            occ[(size_t) (off[(size_t) blk_[(size_t) i]] + idx_[(size_t) i])] = (int32_t) i;
-    auto block_of = [&](size_t q) {
-        return (int64_t) (std::upper_bound(off.begin(), off.end(), (int64_t) q) - off.begin()) - 1;
-    };
-    auto addr = [&](size_t q) {
-        const int64_t b = block_of(q);
-        return layer_base_[(size_t) b] + (uint64_t) ((int64_t) q - off[(size_t) b]) * lay.blob_bytes(b);
-    };
+            place_occ_[(size_t) (place_off_[(size_t) blk_[(size_t) i]] + idx_[(size_t) i])] = (int32_t) i;
 
     Crew crew;
     const int T = crew.size();
@@ -151,8 +202,8 @@ bool ArenaExpertSource::place(const std::vector<int32_t>& rank, const std::vecto
         read_words(p + from, t == T - 1 ? bytes - from : per);
     };
     auto time_place = [&](size_t q) {
-        p = addr(q);
-        bytes = lay.blob_bytes(block_of(q));
+        p = place_addr(q);
+        bytes = lay.blob_bytes(place_block(q));
         const auto s = Clock::now();
         crew.run(read);
         const double sec = std::chrono::duration<double>(Clock::now() - s).count();
@@ -164,77 +215,49 @@ bool ArenaExpertSource::place(const std::vector<int32_t>& rank, const std::vecto
     const float fast = sorted[n * 9 / 10], cut = 0.85f * fast;
     for (size_t q = 0; q < n; ++q)
         if (gbs[q] < cut) time_place(q);
-    std::vector<char> slow(n, 0);
+    place_slow_.assign(n, 0);
     std::vector<float> slow_gbs;
+    uint64_t slow_bytes = 0;
     for (size_t q = 0; q < n; ++q) {
-        slow[q] = gbs[q] < cut;
-        if (slow[q]) slow_gbs.push_back(gbs[q]);
+        place_slow_[q] = gbs[q] < cut;
+        if (place_slow_[q]) {
+            slow_gbs.push_back(gbs[q]);
+            slow_bytes += lay.blob_bytes(place_block(q));
+        }
     }
     std::sort(slow_gbs.begin(), slow_gbs.end());
     const double t_time = std::chrono::duration<double>(Clock::now() - t0).count();
-
-    // ---- in each class of blocks with equal blobs, the fast places for the experts that deserve them: the CPU's
-    // hottest, its coldest, then the GPUs' coldest; the swaps move the others' out of the slow places
-    std::map<uint64_t, std::vector<int64_t>> classes;
-    for (int64_t b = 0; b < L; ++b)
-        if (off[(size_t) b + 1] > off[(size_t) b]) classes[lay.blob_bytes(b)].push_back(b);
-    auto key = [&](int32_t i) {
-        const int64_t r = rank[(size_t) i] >= 0 ? rank[(size_t) i] : L * E + i;
-        return on_gpu[(size_t) i] != 0 ? 4 * L * E - r : r;
+    auto cpu_in_slow = [&] {
+        int64_t k = 0;
+        for (size_t q = 0; q < n; ++q) k += place_slow_[q] && on_gpu[(size_t) place_occ_[q]] == 0;
+        return k;
     };
-    std::vector<std::pair<size_t, size_t>> swaps;   // (slow place, fast place)
-    int64_t cpu_n = 0, cpu_slow = 0;
-    uint64_t slow_bytes = 0;
-    for (const auto& [bb, blocks] : classes) {
-        std::vector<size_t> by_key;
-        for (const int64_t b : blocks)
-            for (int64_t q = off[(size_t) b]; q < off[(size_t) b + 1]; ++q) by_key.push_back((size_t) q);
-        std::sort(by_key.begin(), by_key.end(), [&](size_t a, size_t c) { return key(occ[a]) < key(occ[c]); });
-        size_t nf = 0;
-        for (const size_t q : by_key) {
-            nf += !slow[q];
-            slow_bytes += slow[q] ? bb : 0;
-            cpu_n += on_gpu[(size_t) occ[q]] == 0;
-            cpu_slow += slow[q] && on_gpu[(size_t) occ[q]] == 0;
-        }
-        std::vector<size_t> out, in;   // fast experts in slow places, slow experts in fast places (as many)
-        for (size_t k = 0; k < by_key.size(); ++k) {
-            if (k < nf && slow[by_key[k]]) out.push_back(by_key[k]);
-            if (k >= nf && !slow[by_key[k]]) in.push_back(by_key[k]);
-        }
-        for (size_t k = 0; k < out.size() && k < in.size(); ++k) swaps.emplace_back(out[k], in[k]);
-    }
+    int64_t cpu_n = 0;
+    for (size_t q = 0; q < n; ++q) cpu_n += on_gpu[(size_t) place_occ_[q]] == 0;
+    const int64_t cpu_slow = cpu_in_slow();
+    const std::vector<std::pair<size_t, size_t>> swaps = plan_swaps(rank, on_gpu);
 
     // ---- the swaps, through a buffer per thread
     const auto t1 = Clock::now();
     uint64_t moved = 0;
-    if (!dry) {
+    if (!place_dry_) {
         std::atomic<size_t> next{0};
         std::vector<std::vector<uint8_t>> tmp((size_t) T, std::vector<uint8_t>(lay.max_blob));
         crew.run([&](int t) {
             for (size_t k; (k = next++) < swaps.size();) {
-                uint8_t* p1 = addr(swaps[k].first);
-                uint8_t* p2 = addr(swaps[k].second);
-                const size_t bb = (size_t) lay.blob_bytes(block_of(swaps[k].first));
+                uint8_t* p1 = place_addr(swaps[k].first);
+                uint8_t* p2 = place_addr(swaps[k].second);
+                const size_t bb = (size_t) lay.blob_bytes(place_block(swaps[k].first));
                 std::memcpy(tmp[(size_t) t].data(), p1, bb);
                 std::memcpy(p1, p2, bb);
                 std::memcpy(p2, tmp[(size_t) t].data(), bb);
             }
         });
         for (const auto& [q1, q2] : swaps) {
-            const int64_t b1 = block_of(q1), b2 = block_of(q2);
-            const int32_t i1 = occ[q1], i2 = occ[q2];
-            idx_[(size_t) i1] = (int32_t) ((int64_t) q2 - off[(size_t) b2]);
-            blk_[(size_t) i1] = (int32_t) b2;
-            idx_[(size_t) i2] = (int32_t) ((int64_t) q1 - off[(size_t) b1]);
-            blk_[(size_t) i2] = (int32_t) b1;
-            occ[q1] = i2;
-            occ[q2] = i1;
-            moved += 2 * lay.blob_bytes(b1);
+            note_swap(q1, q2);
+            moved += 2 * lay.blob_bytes(place_block(q1));
         }
     }
-    int64_t cpu_slow_after = 0;
-    for (size_t q = 0; q < n; ++q) cpu_slow_after += slow[q] && on_gpu[(size_t) occ[q]] == 0;
     char buf[512];
     int len = std::snprintf(buf, sizeof buf, "--arena-place: %zu places timed in %.1f s on %d cores, the fast ones ~%.1f "
                                              "GB/s; %zu slow", n, t_time, T, (double) fast, slow_gbs.size());
@@ -243,17 +266,17 @@ bool ArenaExpertSource::place(const std::vector<int32_t>& rank, const std::vecto
                              (double) slow_bytes / 1073741824.0, (double) slow_gbs[slow_gbs.size() / 2]);
     std::snprintf(buf + len, sizeof buf - (size_t) len,
                   "; of the %lld experts on no GPU, %lld were in them, %lld are; %zu pairs %s (%.2f GiB in %.1f s)",
-                  (long long) cpu_n, (long long) cpu_slow, (long long) cpu_slow_after, swaps.size(),
-                  dry ? "to swap (STRATA_ARENA_PLACE_DRY: none moved)" : "swapped", (double) moved / 1073741824.0,
-                  std::chrono::duration<double>(Clock::now() - t1).count());
+                  (long long) cpu_n, (long long) cpu_slow, (long long) cpu_in_slow(), swaps.size(),
+                  place_dry_ ? "to swap (STRATA_ARENA_PLACE_DRY: none moved)" : "swapped",
+                  (double) moved / 1073741824.0, std::chrono::duration<double>(Clock::now() - t1).count());
     line = buf;
     // STRATA_LOAD_VERIFY=1: every moved blob read again from the model and compared (a test)
-    if (const char* v = std::getenv("STRATA_LOAD_VERIFY"); v != nullptr && std::atoi(v) != 0 && !dry) {
+    if (const char* v = std::getenv("STRATA_LOAD_VERIFY"); v != nullptr && std::atoi(v) != 0 && !place_dry_) {
         std::vector<uint8_t> want(lay.max_blob);
         std::string err;
         int64_t checked = 0;
         for (const auto& [q1, q2] : swaps)
-            for (const int32_t i : {occ[q1], occ[q2]}) {
+            for (const int32_t i : {place_occ_[q1], place_occ_[q2]}) {
                 const int64_t l = i / E, e = i % E;
                 if (!read_file_blob(l, e, want.data(), err)) {
                     line += "; STRATA_LOAD_VERIFY: " + err;
@@ -269,6 +292,45 @@ bool ArenaExpertSource::place(const std::vector<int32_t>& rank, const std::vecto
         line += "; STRATA_LOAD_VERIFY: " + std::to_string(checked) + " moved blobs equal to the model's";
     }
     return true;
+}
+
+size_t ArenaExpertSource::replan(const std::vector<int32_t>& rank, const std::vector<uint8_t>& on_gpu) {
+    pending_.clear();
+    pending_at_ = 0;
+    if (place_dry_ || place_occ_.empty() || rank.size() != idx_.size() || on_gpu.size() != idx_.size()) return 0;
+    pending_ = plan_swaps(rank, on_gpu);
+    return pending_.size();
+}
+
+size_t ArenaExpertSource::replace_some(size_t max) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (swap_buf_.size() < lay.max_blob) swap_buf_.resize(lay.max_blob);
+    // STRATA_LOAD_VERIFY=1: both moved blobs read again from the model and compared (a test)
+    static const bool verify = [] {
+        const char* v = std::getenv("STRATA_LOAD_VERIFY");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    for (size_t k = 0; k < max && pending_at_ < pending_.size(); ++k) {
+        const auto [q1, q2] = pending_[pending_at_++];
+        uint8_t* p1 = place_addr(q1);
+        uint8_t* p2 = place_addr(q2);
+        const size_t bb = (size_t) lay.blob_bytes(place_block(q1));
+        std::memcpy(swap_buf_.data(), p1, bb);
+        std::memcpy(p1, p2, bb);
+        std::memcpy(p2, swap_buf_.data(), bb);
+        note_swap(q1, q2);
+        for (const int32_t i : {place_occ_[q1], place_occ_[q2]}) {
+            if (!verify) break;
+            const int64_t l = i / n_expert_, e = i % n_expert_;
+            std::string err;
+            if (!read_file_blob(l, e, swap_buf_.data(), err) || std::memcmp(swap_buf_.data(), blob(l, e), bb) != 0) {
+                std::fprintf(stderr, "ArenaExpertSource: STRATA_LOAD_VERIFY: layer %lld expert %lld differs from the "
+                                     "model after a swap between requests %s\n", (long long) l, (long long) e, err.c_str());
+                std::abort();
+            }
+        }
+    }
+    return pending_.size() - pending_at_;
 }
 
 }  // namespace strata::core

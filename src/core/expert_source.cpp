@@ -1157,6 +1157,11 @@ void ArenaExpertSource::close() {
     n_expert_ = 0;
     idx_.clear();
     blk_.clear();
+    place_off_.clear();
+    place_slow_.clear();
+    place_occ_.clear();
+    pending_.clear();
+    pending_at_ = 0;
     vram_only_bytes_ = 0;
     spans_.clear();
 #if !defined(_WIN32)

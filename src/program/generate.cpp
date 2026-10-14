@@ -2985,6 +2985,16 @@ int main(int argc, char** argv) {
     // --arena-place: the RAM's slow places go to the experts that stay on a GPU: below the slots each GPU's prompt
     // path borrows at every batched prompt (its cache's last ones) and, with the elastic K/V, below the slots the whole
     // context's K/V takes under the main GPU's loan (after the PLE table's load, whose reads would slow the timing)
+    int64_t stay1 = 0, stay2 = 0;   // the slots below which the GPUs' experts stay there
+    std::vector<int32_t> profile_rank;
+    // per (layer, expert): whether it stays on a GPU, from the residency as it is now
+    auto arena_on_gpu = [&] {
+        std::vector<uint8_t> on((size_t) (g.n_layers * g.n_expert), 0);
+        for (size_t i = 0; i < on.size(); ++i)
+            on[i] = (!host_res.empty() && host_res[i] >= 0 && host_res[i] < stay1) ||
+                    (!host_res2.empty() && host_res2[i] >= 0 && host_res2[i] < stay2);
+        return on;
+    };
     if (o.arena_place && srcp == &arena_src) {
         if (ple_table.is_open() && ple_table.mode() == strata::kernels::PleIo::Ram && !ple_table.ram_ready())
             ple_table.wait_ram_load();
@@ -3007,7 +3017,7 @@ int main(int argc, char** argv) {
                                std::min(ExpertRunner::prefetch_need(res2, res1, g.n_expert, true),
                                         ExpertRunner::area_cap(chunk, true));
         const bool borrow = !o.no_prefill_borrow && d_res != nullptr;
-        int64_t stay1 = host_res.empty() ? 0 : !borrow ? xcache.slots() : below_loan(xcache, pin1.size(), need1);
+        stay1 = host_res.empty() ? 0 : !borrow ? xcache.slots() : below_loan(xcache, pin1.size(), need1);
         if (strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr && stay1 > 0) {
             if (borrow) stay1 = std::min(stay1, below_loan(xcache, 0, worst_loan(off)));
             const uint64_t G = strata::core::vmm_granularity();
@@ -3015,22 +3025,17 @@ int main(int argc, char** argv) {
             const uint64_t top = xcache.slot_offset(stay1);
             while (stay1 > (int64_t) pin1.size() && top - xcache.slot_offset(stay1) < kv) --stay1;
         }
-        const int64_t stay2 = host_res2.empty() ? 0 : !(off && borrow) ? gpu2.cache().slots()
-                                                    : below_loan(gpu2.cache(), pin2.size(), need2);
-        const size_t n = (size_t) (g.n_layers * g.n_expert);
-        std::vector<int32_t> rank(n, -1);
+        stay2 = host_res2.empty() ? 0 : !(off && borrow) ? gpu2.cache().slots()
+                                      : below_loan(gpu2.cache(), pin2.size(), need2);
+        profile_rank.assign((size_t) (g.n_layers * g.n_expert), -1);
         for (size_t k = 0; k < profile.size(); ++k) {
-            int32_t& r = rank[(size_t) profile[k].first * (size_t) g.n_expert + (size_t) profile[k].second];
+            int32_t& r = profile_rank[(size_t) profile[k].first * (size_t) g.n_expert + (size_t) profile[k].second];
             if (r < 0) r = (int32_t) k;
         }
-        std::vector<uint8_t> on_gpu(n, 0);
-        for (size_t i = 0; i < n; ++i)
-            on_gpu[i] = (!host_res.empty() && host_res[i] >= 0 && host_res[i] < stay1) ||
-                        (!host_res2.empty() && host_res2[i] >= 0 && host_res2[i] < stay2);
         std::fprintf(stderr, "strata generate: --arena-place: the experts in the main GPU's slots below %lld and the "
                              "second's below %lld stay there\n", (long long) stay1, (long long) stay2);
         std::string line;
-        const bool ok = arena_src.place(rank, on_gpu, line);
+        const bool ok = arena_src.place(profile_rank, arena_on_gpu(), line);
         std::fprintf(stderr, "strata generate: %s\n", line.c_str());
         if (!ok) return 1;
     }
@@ -3531,8 +3536,46 @@ int main(int argc, char** argv) {
             in_eof = true;
             in_cv.notify_one();
         }).detach();
+        // --arena-place: after a request, the arena's swaps for the residency the tiers left, a slice at a time while
+        // no request waits (the GPUs' copies from the arena are done first: nothing reads it meanwhile)
+        const char* replace_env = std::getenv("STRATA_ARENA_REPLACE");   // =0: the A/B arm without it
+        const bool replace = o.arena_place && srcp == &arena_src && !profile_rank.empty() &&
+                             !(replace_env != nullptr && std::atoi(replace_env) == 0);
+        size_t replace_left = 0, replace_planned = 0;
+        Clock::time_point replace_t0{};
+        auto replan = [&] {
+            for (const int d : {o.main_gpu, o.second_gpu})
+                if (d >= 0) {
+                    cudaSetDevice(d);
+                    cudaDeviceSynchronize();
+                }
+            cudaSetDevice(o.main_gpu);
+            // the CPU's experts the most routed lately first (the tiers' counts), the profile's order between equals
+            const size_t n = profile_rank.size();
+            std::vector<int32_t> order(n), rank(n);
+            for (size_t i = 0; i < n; ++i) order[i] = (int32_t) i;
+            const std::vector<float>& u = drive.d.usage;
+            std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+                const float ua = u.empty() ? 0.0f : u[(size_t) a], ub = u.empty() ? 0.0f : u[(size_t) b];
+                return ua != ub ? ua > ub : profile_rank[(size_t) a] < profile_rank[(size_t) b];
+            });
+            for (size_t k = 0; k < n; ++k) rank[(size_t) order[k]] = (int32_t) k;
+            replace_planned = replace_left = arena_src.replan(rank, arena_on_gpu());
+            replace_t0 = Clock::now();
+        };
         auto next_line = [&](std::string& out) -> bool {
             std::unique_lock<std::mutex> lk(in_mu);
+            while (replace_left > 0 && in_lines.empty() && !in_eof) {
+                lk.unlock();
+                replace_left = arena_src.replace_some(16);
+                if (replace_left == 0)
+                    std::fprintf(stderr, "strata serve: --arena-place: %zu swaps between requests in %.0f ms\n",
+                                 replace_planned, std::chrono::duration<double, std::milli>(Clock::now() - replace_t0).count());
+                lk.lock();
+            }
+            if (replace_left > 0)
+                std::fprintf(stderr, "strata serve: --arena-place: %zu of %zu swaps made before the request\n",
+                             replace_planned - replace_left, replace_planned);
             in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
             if (in_lines.empty()) return false;
             out = std::move(in_lines.front());
@@ -4205,6 +4248,7 @@ int main(int argc, char** argv) {
             if (pcache.enabled()) std::fprintf(stderr, "strata serve: prompt cache: %s\n", pcache.summary().c_str());
             check_stack_limit(o.main_gpu, o.main_gpu);
             if (o.second_gpu >= 0) check_stack_limit(o.second_gpu, o.main_gpu);
+            if (replace) replan();
         }
         return 0;
     }

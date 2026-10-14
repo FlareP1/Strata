@@ -407,6 +407,11 @@ public:
     /// whether it stays on a GPU.  Before generation (nothing may read the arena meanwhile).  `line`: what it found
     /// and did, for the startup print; false: STRATA_LOAD_VERIFY found a moved blob unlike the model's.
     bool place(const std::vector<int32_t>& rank, const std::vector<uint8_t>& on_gpu, std::string& line);
+    /// Between requests, after place(): the swaps for `rank` and `on_gpu` as they are now, on the places it timed
+    /// (none with STRATA_ARENA_PLACE_DRY), the CPU's hottest experts' first; returns how many.  replace_some() makes
+    /// up to `max` of them on the calling thread (nothing may read the arena meanwhile) and returns how many are left.
+    size_t replan(const std::vector<int32_t>& rank, const std::vector<uint8_t>& on_gpu);
+    size_t replace_some(size_t max);
 
     /// What backing was obtained and why, for the startup print.  "The engine adapts to the machine it is on" is
     /// only true if the engine says what it got.
@@ -440,6 +445,20 @@ private:
     std::vector<int32_t> idx_;
     /// per (layer, expert): the pinned block its blob is in once place() moved some (empty: its layer's)
     std::vector<int32_t> blk_;
+    /// place()'s places (the mapped blocks' blobs): each block's first, whether each is slow, the (layer, expert) in
+    /// each; the swaps replan() left to make
+    std::vector<int64_t> place_off_;
+    std::vector<uint8_t> place_slow_;
+    std::vector<int32_t> place_occ_;
+    std::vector<std::pair<size_t, size_t>> pending_;
+    size_t pending_at_ = 0;
+    std::vector<uint8_t> swap_buf_;
+    bool place_dry_ = false;
+    int64_t place_block(size_t q) const;
+    uint8_t* place_addr(size_t q) const;
+    void note_swap(size_t q1, size_t q2);
+    std::vector<std::pair<size_t, size_t>> plan_swaps(const std::vector<int32_t>& rank,
+                                                      const std::vector<uint8_t>& on_gpu) const;
     uint64_t vram_only_bytes_ = 0;
     std::vector<std::pair<size_t, uint64_t>> spans_;   ///< per (layer, role): its shard and the tensor's offset
     std::vector<int> fds_;                              ///< the shards, open for read_file_blob

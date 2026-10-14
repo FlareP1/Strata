@@ -61,8 +61,15 @@ public:
     /// Bytes of prefetch area that hold a layer's streamed experts: the largest layer's experts that neither its
     /// cache nor `skip` (another GPU's residency, n_layers x n_expert, or null) holds, and a margin.
     uint64_t prefetch_need(const int32_t* skip) const;
-    /// The same before a runner exists: `res` its cache's residency, `streams` as init's.
-    static uint64_t prefetch_need(const int32_t* res, const int32_t* skip, int64_t n_expert, bool streams);
+    /// The same before a runner exists: `res` its cache's residency, `streams` as init's, `shift` set_shift's.
+    static uint64_t prefetch_need(const int32_t* res, const int32_t* skip, int64_t n_expert, bool streams,
+                                  double shift = 0.0);
+    /// --prompt-shift (Prefill::set_shift): a layer's prefetch area also holds that share of the experts `skip` holds,
+    /// for chunks of kShiftMinTokens and more.
+    void set_shift(double fraction);
+    /// The shortest chunk --prompt-shift applies to: below it (IQ3_S, both GPUs: +3.3% time at 2K tokens, +1.4% at 4K,
+    /// -1.1% at 8K) copying an expert costs the second GPU more than computing it saves the first.
+    static constexpr int64_t kShiftMinTokens = 8192;
     /// Copies ahead while the dense steps run.  `prefetch_begin`, before the routing of a layer of a chunk of `chunk`
     /// tokens: the experts to copy, the likeliest first (those its cache holds are skipped), up to the area's bytes
     /// and the chunk's area_cap.  A second GPU's runner then takes them a piece at a time in that order:

@@ -198,6 +198,8 @@ struct Prefill::Impl {
     std::vector<int32_t> steps_host, cnt, off, entry_of;
     // this GPU's experts; the second GPU's, the tokens of the first half and of the second (run_layer's passes)
     std::vector<int32_t> ex1, off1, src1, ex2[2], off2[2], src2[2];
+    double shift = 0.0;              // set_shift
+    std::vector<uint8_t> shifted;    // per expert of the layer: held here, computed by the second GPU (set_shift)
     std::vector<float> w1, w2[2];
     // a chunk's PLE rows, read on a thread while the chunk before runs: two pinned buffers, their row indices
     float* ple_host[2] = {};
@@ -273,6 +275,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
 void set_hc_q8(bool on) { g_hc_q8 = on; }
 
 void Prefill::set_order(std::vector<int32_t> order) { impl_->order = std::move(order); }
+void Prefill::set_shift(double fraction) { impl_->shift = std::min(1.0, std::max(0.0, fraction)); }
 const std::vector<uint32_t>& Prefill::routed() const { return impl_->routed; }
 void Prefill::clear_routed() { std::fill(impl_->routed.begin(), impl_->routed.end(), 0u); }
 
@@ -532,10 +535,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             // the experts this GPU's cache lacks stream to the second GPU (or here): the likeliest are copied ahead
             // while the dense steps run (the second GPU's a piece at a time, below)
             ExpertRunner* const streamer = m.offload ? m.offload : &m.local;
+            // --prompt-shift: the likeliest of the experts held here go to the second GPU as well
+            m.shifted.assign((size_t) NE, 0);
+            if (m.offload && m.shift > 0 && T >= ExpertRunner::kShiftMinTokens && m.host_res && m.cache) {
+                int64_t held = 0;
+                for (int32_t e = 0; e < NE; ++e) held += m.host_res[(size_t) l * NE + e] >= 0;
+                int64_t k = (int64_t) (m.shift * (double) held);
+                for (int32_t i = 0; i < NE && k > 0; ++i) {
+                    const int32_t e = m.order.empty() ? i : m.order[(size_t) l * NE + i];
+                    if (m.host_res[(size_t) l * NE + e] >= 0) { m.shifted[(size_t) e] = 1; --k; }
+                }
+            }
             m.ex1.clear();
             for (int32_t i = 0; i < NE; ++i) {
                 const int32_t e = m.order.empty() ? i : m.order[(size_t) l * NE + i];
-                if (!(m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0)) m.ex1.push_back(e);
+                if (!(m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0) || m.shifted[(size_t) e]) m.ex1.push_back(e);
             }
             if (!streamer->prefetch_begin(l, T, m.ex1, err)) return false;
             mark(kPsPle);
@@ -789,7 +803,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             for (int32_t e = 0; e < NE; ++e) {
                 if (m.cnt[(size_t) e] == 0) continue;
-                const bool here = !m.offload || (m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0);
+                const bool here = !m.offload || (m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0 &&
+                                                 !m.shifted[(size_t) e]);
                 for (int h = 0; h < (here ? 1 : 2); ++h) {
                     std::vector<int32_t>& ex = here ? m.ex1 : m.ex2[h];
                     std::vector<int32_t>& of = here ? m.off1 : m.off2[h];

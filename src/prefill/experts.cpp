@@ -79,6 +79,7 @@ size_t up_bytes(int64_t chunk, int64_t n_expert) {
 struct ExpertRunner::Impl {
     int dev = -1, main = 0;
     bool remote = false, streams = false;
+    double shift = 0.0;   // set_shift
     core::ExpertSource* src = nullptr;
     const core::ExpertCache* cache = nullptr;
     const int32_t* res = nullptr;
@@ -287,25 +288,33 @@ uint64_t ExpertRunner::area_cap(int64_t chunk, bool remote) {
 }
 
 uint64_t ExpertRunner::prefetch_area(int64_t chunk, const int32_t* skip) const {
-    return std::min(prefetch_need(skip), area_cap(chunk, impl_->remote));
+    const Impl& m = *impl_;
+    const double shift = chunk >= kShiftMinTokens ? m.shift : 0.0;
+    return std::min(prefetch_need(m.res, skip, m.n_expert, m.streams, shift), area_cap(chunk, m.remote));
 }
 
 uint64_t ExpertRunner::prefetch_need(const int32_t* skip) const {
     const Impl& m = *impl_;
-    return prefetch_need(m.res, skip, m.n_expert, m.streams);
+    return prefetch_need(m.res, skip, m.n_expert, m.streams, m.shift);
 }
 
-uint64_t ExpertRunner::prefetch_need(const int32_t* res, const int32_t* skip, int64_t n_expert, bool streams) {
+void ExpertRunner::set_shift(double fraction) { impl_->shift = std::min(1.0, std::max(0.0, fraction)); }
+
+uint64_t ExpertRunner::prefetch_need(const int32_t* res, const int32_t* skip, int64_t n_expert, bool streams,
+                                     double shift) {
     if (!streams) return 0;
     const auto& lay = strata::kernels::cpu::expert_layout();
     uint64_t most = 0;
     for (int64_t l = 0; l < lay.n_layers; ++l) {
         const size_t stride = ((size_t) lay.blob_bytes(l) + 255) & ~(size_t) 255;
         uint64_t sum = 0;
+        int64_t held = 0;   // by the other GPU (`skip`): --prompt-shift's share of them streams here too
         for (int64_t e = 0; e < n_expert; ++e) {
             const size_t i = (size_t) (l * n_expert + e);
             if ((res == nullptr || res[i] < 0) && (skip == nullptr || skip[i] < 0)) sum += stride;
+            held += skip != nullptr && skip[i] >= 0;
         }
+        sum += (uint64_t) (shift * (double) held) * stride;
         most = std::max(most, sum);
     }
     return most + most / 10;   // the slots lent for the prompt make a few more experts stream

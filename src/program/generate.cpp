@@ -285,6 +285,8 @@ struct Options {
     /// The arena's blobs placed by the RAM's measured read rate once the GPUs' experts are known
     /// (ArenaExpertSource::place): for RAM with slower regions, off by default.
     bool arena_place = false;
+    /// The prompt path's share of the experts the main GPU holds that the second GPU computes (Prefill::set_shift).
+    double prompt_shift = 0.0;
     /// The elastic K/V (--kv-grow, STRATA_KV_GROW=1): the K/V takes VRAM as the context grows, the expert cache the rest.
     bool kv_grow = false;
     bool hc_q8 = false;   ///< the hyper-connection matrices only in 8 bits (core::HcQ8)
@@ -453,6 +455,9 @@ void usage() {
                  "                       VRAM: its lowest slots keep them for good and the RAM arena leaves them out\n"
                  "                       (experts that outgrow the RAM then fit; native packs read from the GGUF)\n"
                  "  --second-gpu-pin-gib G  the next ones, up to G GiB, only in the second GPU's VRAM\n"
+                 "  --prompt-shift F     with --second-gpu: in prompt chunks of 8K tokens and more the second GPU also\n"
+                 "                       computes the likeliest F (0..1) of each layer's experts the main GPU holds, copied\n"
+                 "                       ahead with the ones it streams (when the main GPU's share is the longer; default 0)\n"
                  "  --arena-place        at the start, time each expert's place in the RAM arena and move the experts\n"
                  "                       no GPU holds out of the slow places, into the GPU-resident ones' (RAM with\n"
                  "                       slower regions, as unpaired DIMMs make; ~2-4 s).  Off by default\n"
@@ -1043,8 +1048,9 @@ int main(int argc, char** argv) {
                 continue;
             }
         }
-        {   // the rope scaling knobs, outside the chain below as well
-            double* knob = a == "--rope-scale" ? &o.rope_scale : a == "--rope-freq-base" ? &o.rope_freq_base
+        {   // the rope scaling knobs and --prompt-shift, outside the chain below as well
+            double* knob = a == "--prompt-shift" ? &o.prompt_shift
+                         : a == "--rope-scale" ? &o.rope_scale : a == "--rope-freq-base" ? &o.rope_freq_base
                          : a == "--rope-freq-scale" ? &o.rope_freq_scale : a == "--yarn-orig-ctx" ? &o.yarn_orig_ctx
                          : a == "--yarn-ext-factor" ? &o.yarn_ext_factor : a == "--yarn-attn-factor" ? &o.yarn_attn_factor
                          : a == "--yarn-beta-fast" ? &o.yarn_beta_fast : a == "--yarn-beta-slow" ? &o.yarn_beta_slow
@@ -3014,7 +3020,8 @@ int main(int argc, char** argv) {
                                (off ? 0 : std::min(ExpertRunner::prefetch_need(res1, nullptr, g.n_expert, true),
                                                    ExpertRunner::area_cap(chunk, false)));
         const uint64_t need2 = ExpertRunner::bytes_needed(chunk, g.n_expert, true, true) +
-                               std::min(ExpertRunner::prefetch_need(res2, res1, g.n_expert, true),
+                               std::min(ExpertRunner::prefetch_need(res2, res1, g.n_expert, true,
+                                                                    chunk >= ExpertRunner::kShiftMinTokens ? o.prompt_shift : 0.0),
                                         ExpertRunner::area_cap(chunk, true));
         const bool borrow = !o.no_prefill_borrow && d_res != nullptr;
         stay1 = host_res.empty() ? 0 : !borrow ? xcache.slots() : below_loan(xcache, pin1.size(), need1);
@@ -3102,6 +3109,10 @@ int main(int argc, char** argv) {
                 for (size_t x = 0; x < ne; ++x)
                     if (!seen[l * ne + x]) order[l * ne + at[l]++] = (int32_t) x;
             prefill.set_order(std::move(order));
+        }
+        if (off) {   // --prompt-shift (without a profile the order is by id)
+            prefill.set_shift(o.prompt_shift);
+            offload.set_shift(o.prompt_shift);
         }
         pbuf.prefill = &prefill;
         pbuf.offload = off ? &offload : nullptr;

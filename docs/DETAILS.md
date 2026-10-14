@@ -1619,6 +1619,12 @@ thinking / after a 16K prompt / an edit quoting its prompt):
   within 0.1% (its CPU kernels read ~40 GB/s, about the slow region's own rate); on one GPU, where the CPU reads most
   experts, within 1%. On RAM without a slow region it finds little or nothing to move, and the start is ~2 s longer
   for the timing.
+- **`--prompt-shift F`: the second GPU takes part of the first GPU's experts in long prompts.** With `--second-gpu`,
+  the first GPU computes each layer's experts it holds while the second computes the rest in two halves; when the
+  first holds many experts (small ones fill more of its cache), its share is the longer. In prompt chunks of 8K tokens
+  and more the second GPU then also computes the likeliest F (0..1) of each layer's experts the first holds, copied
+  ahead with the ones it streams (shorter chunks: the copies cost more than they save, +3.3% time at 2K tokens). IQ3_S
+  with 0.2: prompts of 16K +2.1%, 64K +2.0%; UD-Q4_K_XL at 0.15 even. This fork's IQ3_S config sets 0.2.
 - **`STRATA_POOL_FUSED=1`: a native layer's gate/up and down rows in one CPU pool phase** (an expert's down rows start
   once its own hidden row is quantized, no barrier between the halves; the same bytes). IQ3_S -0.8 / -0.5 / -0.3 / -0.7%,
   UD-Q4_K_XL +2.2 / -0.2 / +0.6 / 0.0%.

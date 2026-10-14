@@ -60,4 +60,9 @@ quantized tensors, the experts and most projections, from the GGUF files at star
 
    (`START-HERE.bat` starts setup's own config.)
 
+This PC's UD-Q4_K_XL config also has `--arena-place`, left out here: for RAM whose regions read at different rates,
+as unpaired DIMMs make (two 32 GB and two 48 GB modules), the engine times its RAM arena at the start and keeps the
+experts the CPU reads out of the slow region, again between requests ([DETAILS.md](../docs/DETAILS.md)). On such a
+PC add it to a config's arguments; elsewhere it finds nothing to move and costs ~2 s at the start.
+
 On Linux the engine is `./build/strata` and Python `.venv/bin/python`.

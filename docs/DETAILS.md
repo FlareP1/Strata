@@ -1612,9 +1612,13 @@ thinking / after a 16K prompt / an edit quoting its prompt):
   the whole context's K/V takes) in fast places of the same size, in any layer (~2.3 s). Fixed text, 4 runs each
   against the timing alone (`STRATA_ARENA_PLACE_DRY=1`), 15-25 GiB slow: UD-Q4_K_XL code +5.4%, edit +6.7%, after a
   16K prompt +2.1% (the GPU tiers move experts as a text goes on: 8-17% of the CPU's expert reads still came from
-  slow places, 18-30% without the moves); the prompts' speed unchanged. IQ3_S within 0.1% (its CPU kernels read ~40
-  GB/s, about the slow region's own rate). On RAM without a slow region it finds little or nothing to move, and the
-  start is ~2 s longer for the timing.
+  slow places, 18-30% without the moves); the prompts' speed unchanged. A server swaps again after each request, from
+  the residency the tiers left, while no request waits (0.6-2 s; a new request stops it, the hottest experts move
+  first): over 6 requests 4 s apart the last one's code text ran 126 against 109 t/s without that
+  (`STRATA_ARENA_REPLACE=0`), since the startup's slow places hold experts the tiers later send back to the CPU. IQ3_S
+  within 0.1% (its CPU kernels read ~40 GB/s, about the slow region's own rate); on one GPU, where the CPU reads most
+  experts, within 1%. On RAM without a slow region it finds little or nothing to move, and the start is ~2 s longer
+  for the timing.
 - **`STRATA_POOL_FUSED=1`: a native layer's gate/up and down rows in one CPU pool phase** (an expert's down rows start
   once its own hidden row is quantized, no barrier between the halves; the same bytes). IQ3_S -0.8 / -0.5 / -0.3 / -0.7%,
   UD-Q4_K_XL +2.2 / -0.2 / +0.6 / 0.0%.

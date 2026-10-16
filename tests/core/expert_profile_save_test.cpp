@@ -1,8 +1,15 @@
 // #477: --expert-profile-save's profile - rank_learned_profile's order (resident first, then the counted routing, then
-// the profile the engine started from) and write_expert_profile's file, byte for byte tools/make_profile.py's format,
-// read back by read_expert_profile.  CPU only: no device is touched.
+// the profile the engine started from), blend_learned_profile's (each layer's counted share plus the prior's estimated
+// one) and write_expert_profile's file, byte for byte tools/make_profile.py's format, read back by read_expert_profile.
+// CPU only: no device is touched.
+//
+//     expert_profile_save_test [<dump> <prior profile> <expected profile>]
+//
+// With files: blend_learned_profile over a run's counts (scratch/bh/patch_dump.py's dump) against a profile ranked from
+// them by scratch/bh/rank.py blend:1.
 #include "strata/core/expert_cache.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -20,8 +27,28 @@ void check(bool ok, const char* what) {
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     using Pair = std::pair<int32_t, int32_t>;
+    if (argc == 4) {   // a run's counts against rank.py's blend of them
+        std::FILE* f = std::fopen(argv[1], "rb");
+        int32_t n = 0;
+        if (f == nullptr || std::fread(&n, 4, 1, f) != 1 || n <= 0) { std::puts("FAIL: the dump"); return 1; }
+        std::vector<double> heat((size_t) n);
+        const bool ok = std::fread(heat.data(), 8, (size_t) n, f) == (size_t) n;
+        std::fclose(f);
+        std::vector<Pair> prior, want;
+        int64_t slots = 0;
+        std::string err;
+        const int64_t layers = 48, experts = n / 48;
+        if (!ok || !strata::core::read_expert_profile(argv[2], layers, experts, prior, slots, err) ||
+            !strata::core::read_expert_profile(argv[3], layers, experts, want, slots, err)) {
+            std::printf("FAIL: %s\n", err.c_str());
+            return 1;
+        }
+        const bool same = strata::core::blend_learned_profile(layers, experts, heat, prior) == want;
+        std::puts(same ? "expert_profile_save_test: the blend is rank.py's" : "FAIL: the blend differs from rank.py's");
+        return same ? 0 : 1;
+    }
     const int64_t L = 3, E = 4;   // 12 pairs, index = layer * 4 + expert
     std::vector<uint8_t> resident(12, 0);
     resident[5] = 1;              // (1, 1)
@@ -75,6 +102,22 @@ int main() {
     check(strata::core::read_expert_profile(path, L, E, back, slots, err) && back == r0,
           "a refused save keeps the file");
     std::filesystem::remove_all(dir);
+
+    // the blend, one layer: prior ranks e2 0, e0 1, e3 2, e1 3 -> estimated shares 0.48, 0.24, 0.16, 0.12; counted
+    // shares e1 0.75, e3 0.25 -> scores e1 0.87, e2 0.48, e3 0.41, e0 0.24
+    const std::vector<Pair> prior1 = {{0, 2}, {0, 0}, {0, 3}, {0, 1}};
+    const std::vector<double> heat1 = {0.0, 6.0, 0.0, 2.0};
+    check(strata::core::blend_learned_profile(1, 4, heat1, prior1) == std::vector<Pair>{{0, 1}, {0, 2}, {0, 3}, {0, 0}},
+          "the blend: counted and estimated shares added");
+    check(strata::core::blend_learned_profile(1, 4, {}, prior1) == prior1, "the blend without counts: the prior");
+    check(strata::core::blend_learned_profile(1, 4, heat1, prior1, 0.0) ==
+              std::vector<Pair>{{0, 1}, {0, 3}, {0, 2}, {0, 0}},
+          "the blend at w 0: the counts, then the prior");
+    // two layers ranked across: layer 1's shares outrank layer 0's prior-only pairs
+    const std::vector<Pair> prior2 = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};
+    const std::vector<double> heat2 = {0.0, 0.0, 0.0, 5.0};
+    const std::vector<Pair> b2 = strata::core::blend_learned_profile(2, 2, heat2, prior2);
+    check(b2.size() == 4 && b2[0] == Pair(1, 1) && b2[1] == Pair(0, 0), "the blend ranks across layers by score");
     if (fails == 0) std::puts("expert_profile_save_test: OK");
     return fails == 0 ? 0 : 1;
 }

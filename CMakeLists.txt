@@ -121,7 +121,7 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 # guard above has already refused anything but sm_120 by the time this runs.
 if(STRATA_ENABLE_CUDA)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
-                               src/core/layout.cpp)
+                               src/core/layout.cpp src/platform/console_quit.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   # CUDA::cudart is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
@@ -274,7 +274,11 @@ if(STRATA_ENABLE_CUDA)
   add_executable(adaptive_policy_test tests/core/adaptive_policy_test.cpp)
   target_include_directories(adaptive_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(adaptive_policy_test PRIVATE strata_artifact)
+  # #477: the learned expert profile (--expert-profile-save): its order and make_profile.py's file format (CPU only)
+  add_executable(expert_profile_save_test tests/core/expert_profile_save_test.cpp)
+  target_link_libraries(expert_profile_save_test PRIVATE strata_engine)
   if(STRATA_BUILD_TESTS)
+    add_test(NAME expert_profile_save_test COMMAND expert_profile_save_test)
     add_test(NAME adaptive_policy_test COMMAND adaptive_policy_test)
     add_test(NAME deterministic_adapt_help COMMAND strata --deterministic-adapt --help)
     set_tests_properties(deterministic_adapt_help PROPERTIES

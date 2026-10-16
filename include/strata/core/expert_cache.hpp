@@ -65,6 +65,16 @@ std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, 
                                                               const std::vector<double>& heat,
                                                               const std::vector<std::pair<int32_t, int32_t>>& prior);
 
+/// The fork's learned profile: every (layer, expert) pair ranked by its share of its layer's routing counted in this run
+/// (`heat`, n_layers x n_expert) plus `w` times a share estimated from `prior` (the profile the engine started from: a
+/// pair's 1 / (rank + 1), normalized over its layer), then by its prior rank, then by index. Against upstream's order
+/// (the experts resident in VRAM first, then the counts) it keeps the generally routed experts a start places on the
+/// GPUs: on content other than the run's it lost less (UD-Q4_K_XL after a 16K prompt +2.0% a round against +8.0%).
+std::vector<std::pair<int32_t, int32_t>> blend_learned_profile(int64_t n_layers, int64_t n_expert,
+                                                               const std::vector<double>& heat,
+                                                               const std::vector<std::pair<int32_t, int32_t>>& prior,
+                                                               double w = 1.0);
+
 /// #477: writes `ranked` in tools/make_profile.py's format, byte for byte: `STRP`, `1, n_layers, n_expert,
 /// n_ranked, n_ranked` (uint32), the pairs (uint16 layer, uint16 expert), then the n_layers x n_expert int32 table
 /// of each pair's rank (-1: not ranked).  Atomically: a `<path>.tmp` beside it, renamed over `path` once complete,

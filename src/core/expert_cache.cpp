@@ -167,6 +167,39 @@ std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, 
     return ranked;
 }
 
+std::vector<std::pair<int32_t, int32_t>> blend_learned_profile(int64_t n_layers, int64_t n_expert,
+                                                               const std::vector<double>& heat,
+                                                               const std::vector<std::pair<int32_t, int32_t>>& prior,
+                                                               double w) {
+    const size_t n = (size_t) (n_layers * n_expert), ne = (size_t) n_expert;
+    std::vector<int64_t> prior_rank(n, (int64_t) n);   // a pair the prior lacks ranks after all it holds
+    for (size_t r = prior.size(); r-- > 0;) {           // a pair's first place
+        const auto [l, e] = prior[r];
+        if (l >= 0 && l < n_layers && e >= 0 && e < n_expert) prior_rank[(size_t) l * ne + (size_t) e] = (int64_t) r;
+    }
+    std::vector<double> score(n, 0.0);
+    for (size_t l0 = 0; l0 < n; l0 += ne) {
+        double h = 0, p = 0;
+        for (size_t i = l0; i < l0 + ne; ++i) {
+            h += i < heat.size() ? heat[i] : 0.0;
+            p += 1.0 / (double) (prior_rank[i] + 1);
+        }
+        for (size_t i = l0; i < l0 + ne; ++i)
+            score[i] = (h > 0 && i < heat.size() ? heat[i] / h : 0.0) + w / (double) (prior_rank[i] + 1) / p;
+    }
+    std::vector<int64_t> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = (int64_t) i;
+    std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+        if (score[(size_t) a] != score[(size_t) b]) return score[(size_t) a] > score[(size_t) b];
+        if (prior_rank[(size_t) a] != prior_rank[(size_t) b]) return prior_rank[(size_t) a] < prior_rank[(size_t) b];
+        return a < b;
+    });
+    std::vector<std::pair<int32_t, int32_t>> ranked(n);
+    for (size_t r = 0; r < n; ++r)
+        ranked[r] = {(int32_t) (order[r] / n_expert), (int32_t) (order[r] % n_expert)};
+    return ranked;
+}
+
 bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                           const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err) {
     if (n_layers <= 0 || n_expert <= 0 || n_layers > 65535 || n_expert > 65535) {

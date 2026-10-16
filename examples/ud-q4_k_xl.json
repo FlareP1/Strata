@@ -44,5 +44,7 @@
   "tokenizer": "../Strata-data/packs/ud-q4_k_xl/tokenizer",
   "model_name": "qwen3.8-flash-next-ud-q4_k_xl",
   "log": "./strata-ud-q4_k_xl.log",
-  "lib_dirs": []
+  "lib_dirs": [],
+  "expert_profile_save": "./ud-q4_k_xl-learned.bin",
+  "expert_profile_save_every": 1
 }

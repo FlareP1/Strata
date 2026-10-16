@@ -36,6 +36,8 @@ td.log
 /run-*.sh
 /strata-*.json
 /strata-*.log
+# the examples' learned expert profiles (expert_profile_save)
+/*-learned.bin
 # the web app's settings shared with other apps, written next to the config the server runs (examples/)
 *.shared-settings.json
 /build-strata.bat

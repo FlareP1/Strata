@@ -44,5 +44,7 @@
   "tokenizer": "../Strata-data/packs/iq3_s/tokenizer",
   "model_name": "qwen3.8-flash-next-iq3_s",
   "log": "./strata-iq3_s.log",
-  "lib_dirs": []
+  "lib_dirs": [],
+  "expert_profile_save": "./iq3_s-learned.bin",
+  "expert_profile_save_every": 1
 }

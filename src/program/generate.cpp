@@ -53,6 +53,7 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
+#include "strata/platform/console_quit.hpp"
 
 #include <cuda_runtime.h>
 
@@ -216,6 +217,12 @@ struct Options {
     /// trace is what the plan's `h = 0.6447` refers to, and compulsory-miss measured 0.4864 because it fills
     /// with whatever the prompt touched FIRST.  Empty means no profile.
     std::string expert_profile;
+    /// #477 (--serve): where to save what the run learned, as a profile `--expert-profile` reads (the routing counted
+    /// since the start blended with the profile it started from: blend_learned_profile); at QUIT and, once
+    /// `expert_profile_save_min` minutes have passed since the last save, between requests (0: at QUIT only).
+    /// Empty (the default): nothing is counted or written.
+    std::string expert_profile_save;
+    double expert_profile_save_min = 10.0;
     /// R4.2d: **ON by default**, because the measurement is unambiguous and the alternative is known-broken.
     /// Without it, 17 of 10,562 layers had the hit work done when the pool returned; with it, 9,190.  The
     /// A/B arm is `--no-hit-poke`.
@@ -504,6 +511,11 @@ void usage() {
                  "                       real graph that --stage-timing cannot give.  Prints and exits.\n"
                  "  --expert-profile P   R4.2e: pre-load the VRAM tier from a `profile.bin` (see\n"
                  "                       tools/make_profile.py) instead of admitting on first use.\n"
+                 "  --expert-profile-save P  --serve, #477: save what the run learned (the routing counted since\n"
+                 "                       the start, blended with the profile it started from) as a profile at P,\n"
+                 "                       at QUIT (or Ctrl+C) and between requests once --expert-profile-save-every\n"
+                 "                       MIN minutes have passed since the last save (default 10; 0 = at QUIT\n"
+                 "                       only); start from it with --expert-profile P\n"
                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
                  "                       launch so the GPU starts while the CPU pool runs; without it the work\n"
                  "                       waits for the next driver entry and does not overlap at all.\n"
@@ -895,14 +907,15 @@ struct SlotLoan {
 /// them, while the prompt's most-routed experts pass the tiers' threshold (2) for their first updates.  (400 a
 /// layer: the first answer on new content as fast on average, IQ3_S's slower.)
 constexpr float kPromptUsage = 120.0f;
-static void add_prompt_usage(std::vector<float>& usage, const std::vector<uint32_t>& routed, int64_t n_expert) {
+template <class T>
+static void add_prompt_usage(std::vector<T>& usage, const std::vector<uint32_t>& routed, int64_t n_expert) {
     const float total = kPromptUsage;
     if (usage.size() != routed.size()) return;
     for (size_t l0 = 0; l0 < routed.size(); l0 += (size_t) n_expert) {
         double sum = 0;
         for (size_t e = 0; e < (size_t) n_expert; ++e) sum += routed[l0 + e];
         if (sum > 0)
-            for (size_t e = 0; e < (size_t) n_expert; ++e) usage[l0 + e] += (float) (total * routed[l0 + e] / sum);
+            for (size_t e = 0; e < (size_t) n_expert; ++e) usage[l0 + e] += (T) (total * routed[l0 + e] / sum);
     }
 }
 
@@ -1049,8 +1062,13 @@ int main(int argc, char** argv) {
                 continue;
             }
         }
-        {   // the rope scaling knobs and --prompt-shift, outside the chain below as well
+        {   // the rope scaling knobs, --prompt-shift and the learned profile, outside the chain below as well
+            if (a == "--expert-profile-save") {
+                o.expert_profile_save = next("--expert-profile-save");
+                continue;
+            }
             double* knob = a == "--prompt-shift" ? &o.prompt_shift
+                         : a == "--expert-profile-save-every" ? &o.expert_profile_save_min
                          : a == "--rope-scale" ? &o.rope_scale : a == "--rope-freq-base" ? &o.rope_freq_base
                          : a == "--rope-freq-scale" ? &o.rope_freq_scale : a == "--yarn-orig-ctx" ? &o.yarn_orig_ctx
                          : a == "--yarn-ext-factor" ? &o.yarn_ext_factor : a == "--yarn-attn-factor" ? &o.yarn_attn_factor
@@ -3518,6 +3536,37 @@ int main(int argc, char** argv) {
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
         ver.set_pcie_share(drive.d.pcie_num > 0);
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        // ---- #477 --expert-profile-save: the routing counted since the start (the verify windows' entries, and each
+        // prompt's as the tiers take it: kPromptUsage a layer), saved as a profile.  Off: nothing is counted or written.
+        std::vector<double> prompt_heat;
+        if (!o.expert_profile_save.empty()) {
+            if (drive.d.usage.empty())
+                std::fprintf(stderr, "strata serve: --expert-profile-save needs the adaptive tiers (--adapt-every and "
+                                     "--adapt-swaps above 0): nothing will be saved\n");
+            else {
+                drive.d.routed.assign(drive.d.usage.size(), 0);
+                prompt_heat.assign(drive.d.usage.size(), 0.0);
+            }
+        }
+        Clock::time_point profile_saved_at = Clock::now();
+        bool profile_dirty = false;   // a request ran since the last save
+        // the counted routing blended with the profile the engine started from (blend_learned_profile); through <P>.tmp
+        auto save_profile = [&](const char* why) {
+            if (prompt_heat.empty()) return;
+            const auto t0 = Clock::now();
+            std::vector<double> heat(prompt_heat.size());
+            for (size_t i = 0; i < heat.size(); ++i) heat[i] = (double) drive.d.routed[i] + prompt_heat[i];
+            const auto ranked = strata::core::blend_learned_profile(g.n_layers, g.n_expert, heat, profile);
+            std::string e;
+            if (strata::core::write_expert_profile(o.expert_profile_save, g.n_layers, g.n_expert, ranked, e))
+                std::fprintf(stderr, "strata serve: expert profile saved to %s (%s, %.0f ms)\n",
+                             o.expert_profile_save.c_str(), why,
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            else
+                std::fprintf(stderr, "strata serve: the expert profile was not saved: %s\n", e.c_str());
+            profile_saved_at = Clock::now();
+            profile_dirty = false;
+        };
         // ---- the prompt cache (strata/core/prompt_cache.hpp)
         std::vector<strata::core::QsaState*> kv_states;
         for (int64_t i = 0; i < g.n_qsa_layers(); ++i) kv_states.push_back(&ss.qsa_states[i]);
@@ -3549,6 +3598,14 @@ int main(int argc, char** argv) {
             in_eof = true;
             in_cv.notify_one();
         }).detach();
+        // Ctrl+C in the console (the server's, which runs the engine) ends the engine as QUIT does, before any request
+        // queued: the running one stops at its next chunk or window, then the exit work runs (the learned profile)
+        const strata::platform::ConsoleQuit console_quit([&] {
+            stop_req.store(true);
+            std::lock_guard<std::mutex> lk(in_mu);
+            in_lines.push_front("QUIT");
+            in_cv.notify_one();
+        });
         // --arena-place: after a request, the arena's swaps for the residency the tiers left, a slice at a time while
         // no request waits (the GPUs' copies from the arena are done first: nothing reads it meanwhile)
         const char* replace_env = std::getenv("STRATA_ARENA_REPLACE");   // =0: the A/B arm without it
@@ -3589,7 +3646,23 @@ int main(int argc, char** argv) {
             if (replace_left > 0)
                 std::fprintf(stderr, "strata serve: --arena-place: %zu of %zu swaps made before the request\n",
                              replace_planned - replace_left, replace_planned);
-            in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
+            // the learned profile, while no request waits, once its interval has passed since the last save
+            const bool periodic = !prompt_heat.empty() && o.expert_profile_save_min > 0;
+            const auto every = std::chrono::duration_cast<Clock::duration>(
+                std::chrono::duration<double>(o.expert_profile_save_min * 60.0));
+            while (in_lines.empty() && !in_eof) {
+                if (!periodic || !profile_dirty) {
+                    in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
+                    break;
+                }
+                if (Clock::now() >= profile_saved_at + every) {
+                    lk.unlock();
+                    save_profile("between requests");
+                    lk.lock();
+                } else {
+                    in_cv.wait_until(lk, profile_saved_at + every, [&] { return !in_lines.empty() || in_eof; });
+                }
+            }
             if (in_lines.empty()) return false;
             out = std::move(in_lines.front());
             in_lines.pop_front();
@@ -4020,6 +4093,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 add_prompt_usage(drive.d.usage, prefill.routed(), g.n_expert);
+                add_prompt_usage(prompt_heat, prefill.routed(), g.n_expert);   // (empty: no learned profile)
                 tr("prompt done (slots refilled)");
             }
             // A window whose logits held a NaN or an infinity (upstream #879): nothing of it is used, the request
@@ -4262,7 +4336,9 @@ int main(int argc, char** argv) {
             check_stack_limit(o.main_gpu, o.main_gpu);
             if (o.second_gpu >= 0) check_stack_limit(o.second_gpu, o.main_gpu);
             if (replace) replan();
+            profile_dirty = true;
         }
+        if (profile_dirty) save_profile("exit");   // QUIT, Ctrl+C, or the server closed stdin
         return 0;
     }
 

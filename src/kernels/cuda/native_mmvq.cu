@@ -995,9 +995,13 @@ struct SmallTraits {
 
 // NW warps per block and ROWS rows per block. The EXACT layout (NW = 4, ROWS = 1, or 4 for small K) is the
 // ncols = 1 layout and keeps every column bitwise equal to a single-column call. The UPSTREAM layout is
-// llama.cpp's generic multi-column table (ncols 2-4: 4 warps; 5-8: 2 warps; always 2 rows per block): faster,
-// equal to ncols = 1 only to float rounding (the cross-warp reduction groups partial sums differently).
-bool g_multi_exact = true;   // until the upstream layout is timed on an idle GPU (plan rule: default only what is measured)
+// llama.cpp's generic multi-column table (ncols 2-4: 4 warps; 5-8: 2 warps; always 2 rows per block): faster
+// where it was first timed, equal to ncols = 1 only to float rounding (the cross-warp reduction groups partial
+// sums differently); timed on sm_86 on 2026-10-14, it showed no gain over the exact layout - see g_multi_exact.
+bool g_multi_exact = true;   // TIMED 2026-10-14 (sm_86, RTX 3090, both cards free, six shapes): the upstream layout is
+                             // 1.6% behind the exact one on decode (69.25 against 70.40 tok/s geomean) and +2.3% on the
+                             // 3090+5060 Ti pair (whose bits differ between the arms), so the exact layout is the
+                             // measured default; the numbers and the method are in the PR that added this note
 
 template<typename F, int NCOLS, int NW, int ROWS>
 __launch_bounds__(NW * WARP, 1)

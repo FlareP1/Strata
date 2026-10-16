@@ -42,10 +42,6 @@
 #include <string>
 #include <vector>
 
-namespace strata::prefill::mmq {
-class Context;
-}
-
 namespace strata::core {
 
 class NativeHead;
@@ -328,12 +324,6 @@ private:
     float* grs_ = nullptr;                                    // the hyper-connection reads' scratch (zeroed with the arena)
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
     uint8_t* xil_ = nullptr;                                  // their interleaved copy (2+ tokens)
-    // 7-8 tokens: the large projections through llama.cpp's MMQ, a context (its stream-k scratch) and a q8_1 buffer for
-    // each stream that runs them at once (cs, shs_); their scratch is filled before the first capture (warm_mmq)
-    std::unique_ptr<strata::prefill::mmq::Context> mmq_[2];
-    uint8_t* xqm_[2] = {};
-    bool mmq_warm_ = false;
-    bool warm_mmq(std::string& err);
     float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer
     float *z_ = nullptr, *y_ = nullptr;
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;

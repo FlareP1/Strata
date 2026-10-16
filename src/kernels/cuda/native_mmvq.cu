@@ -24,6 +24,7 @@
 // SOFTWARE.
 
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/native_mma.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -1837,6 +1838,7 @@ void native_mmvq_il_tune(int rows, bool one) {
 
 void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void* x_il, float* y, int n_in,
                     int n_out, int ncols, void* stream) {
+    if (ncols >= 2 && !g_tune_rows && native_mma(ggml_type, weights, x_il, y, n_in, n_out, ncols, stream)) return;
     const bool il = ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 8;
     const int r = g_tune_rows && (ncols > 1 || g_tune_one) ? g_tune_rows : il_rows(ggml_type, ncols, n_out);
     if (r == 0 || (!il && !iq_mmvq_il_supported(ggml_type))) {

@@ -174,6 +174,7 @@ if(STRATA_ENABLE_CUDA)
                           src/kernels/cuda/elementwise.cu
                           src/kernels/cuda/bf16_gemv.cu
                           src/kernels/cuda/native_mmvq.cu
+                          src/kernels/cuda/native_mma.cu
                           src/kernels/cuda/native_bf16.cu
                           src/kernels/cuda/native_gr_norm.cu
                           src/kernels/cuda/native_moe.cu
@@ -205,7 +206,7 @@ if(STRATA_ENABLE_CUDA)
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
   # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
-  set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
+  set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_mma.cu src/kernels/cuda/native_bf16.cu
     src/kernels/cuda/native_gr_norm.cu
     src/kernels/cuda/native_moe.cu
     src/kernels/cuda/native_gdn.cu

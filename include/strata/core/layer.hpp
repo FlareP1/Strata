@@ -230,10 +230,10 @@ struct QsaState {
 
     float* idx_tail = nullptr;       ///< (idx_block - 1, idx_dim): the raw tail of the block being filled
     float* idx_dead = nullptr;       ///< (idx_dim,): the spare slot's key, CONSTANT for the sequence
-    float* idx_pooled = nullptr;     ///< (max_cells/idx_block + 2, idx_dim)
+    float* idx_pooled = nullptr;     ///< (max_cells/idx_block + 2, idx_dim); elastic: in the K/V's range
     int32_t* idx_block_pos = nullptr;
 
-    float* cos_tab = nullptr;        ///< (max_cells, n_rot/2), built on the HOST in float64
+    float* cos_tab = nullptr;        ///< (max_cells, n_rot/2), built on the HOST in float64; elastic: mapped as the K/V
     float* sin_tab = nullptr;
 
     /// THE PER-TOKEN COUNTS, IN DEVICE MEMORY - the whole reason this layer can be a graph.  `qsa_step_fill`
@@ -287,10 +287,11 @@ struct KvArray {
 };
 std::vector<KvArray> qsa_kv_arrays(const QsaState& st, const ModelGeometry& g);
 
-/// THE ELASTIC K/V (--kv-grow; vmm.hpp; after Niko1221/Strata 0.1.40).  A state's K/V pools get addresses for every
-/// cell of the context but physical memory only for the first `init_cells`; `qsa_kv_elastic_grow` maps more as the
-/// context grows (from chunks the expert cache gives up) and `qsa_kv_elastic_shrink` hands them back.  The addresses
-/// never move, so the captured graphs stay valid.  Set before sizing and initializing the session and the drafter.
+/// THE ELASTIC K/V (--kv-grow; vmm.hpp; after Niko1221/Strata 0.1.40).  A state's K/V pools and its indexer's pooled
+/// keys get addresses for every cell of the context but physical memory only for the first `init_cells`, and so do the
+/// rotary tables (a chunk's rows built on the host as it is mapped); `qsa_kv_elastic_grow` maps more as the context
+/// grows (from chunks the expert cache gives up) and `qsa_kv_elastic_shrink` hands them back.  The addresses never
+/// move, so the captured graphs stay valid.  Set before sizing and initializing the session and the drafter.
 void qsa_set_kv_elastic(bool enabled, int64_t init_cells);
 bool qsa_kv_elastic();
 /// Cells every elastic state can hold now (INT64_MAX when none is elastic).

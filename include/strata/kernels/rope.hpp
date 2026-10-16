@@ -5,7 +5,7 @@
 //
 // The cos/sin table is built on the HOST in float64 (see src/kernels/cuda/rope.cu for why) and the kernel is
 // a pure rotation over it.  The table depends on (n_rot, theta, position) and not on the token, so it is worth
-// caching; `build_rope_table` fills `max_pos` positions of `n_rot/2` pairs each.
+// caching; `build_rope_table` fills positions [p0, max_pos) of `n_rot/2` pairs each, position p in row p - p0.
 //
 // ROPE SCALING RIDES IN THE TABLE, NOT IN THE KERNEL.  The kernels below read cos/sin values and
 // cannot tell a scaled table from an unscaled one - with scaling on, the scaled angles (and YaRN's
@@ -44,13 +44,14 @@ STRATA_ROPE_HD inline void rope_neox_pair(float a, float b, float c, float s, fl
     ob = a * s + b * c;
 }
 
-void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, float* sin_tab);
+void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, float* sin_tab, int p0 = 0);
 
 /// The same table under the process's rope scaling (rope_scaling.hpp).  For `RopeScalingType::None`
 /// this IS the five-argument builder above - the parity test holds the two to be bit-identical - and
 /// for linear/YaRN the scaled angles (YaRN's mscale included) replace them.  The math is ggml's,
 /// transcribed; see the header of `rope_scaling.hpp` for what arrives from where.
-void build_rope_table(int n_rot, const RopeScaling& scaling, int max_pos, float* cos_tab, float* sin_tab);
+void build_rope_table(int n_rot, const RopeScaling& scaling, int max_pos, float* cos_tab, float* sin_tab,
+                      int p0 = 0);
 
 // `x` and `out` are (rows, head_dim) and `pos` is (rows,) - one position per row, so a batch of heads at
 // different sequence positions is one call.  `cos_tab`/`sin_tab` are (max_pos, n_rot/2).  `out` may equal `x`.

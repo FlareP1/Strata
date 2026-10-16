@@ -497,58 +497,87 @@ std::vector<uint64_t> kv_row_bytes(KvFormat kv, uint64_t hd) {
 }
 
 // ---- the elastic K/V (--kv-grow; after Niko1221/Strata 0.1.40): one VMM range per state, each pool array at a chunk
-// boundary in it, mapped in whole pages from the first cell on (the page table is the identity)
+// boundary in it, mapped in whole pages from the first cell on (the page table is the identity).  A state's range holds
+// its K/V arrays and the indexer's pooled keys; one more range holds the rotary tables, filled as they are mapped.
 bool g_kv_elastic = false;
 int64_t g_kv_elastic_init = 16384;
 struct ElasticPool {
     VmmRange range;
-    std::vector<uint64_t> off, per_page;   // each array's offset in the range (whole chunks) and bytes per page
+    // each array's offset in the range (whole chunks), bytes per page, and bytes past its pages (the pooled keys' spare
+    // rows: the row after the last block)
+    std::vector<uint64_t> off, per_page, extra;
     int64_t n_pages = 0, page_size = 0;
+    /// Writes array a's bytes [lo, hi) to `dst` as they are mapped; none: they are zeroed.
+    std::function<bool(size_t a, uint64_t lo, uint64_t hi, uint8_t* dst)> fill;
+    /// Appends an array (after n_pages is set).
+    void add(uint64_t page_bytes, uint64_t extra_bytes = 0) {
+        off.push_back(bytes());
+        per_page.push_back(page_bytes);
+        extra.push_back(extra_bytes);
+    }
+    /// The range's size: every array in whole chunks.
+    uint64_t bytes() const {
+        const uint64_t G = vmm_granularity();
+        return off.empty() ? 0 : off.back() + ((uint64_t) n_pages * per_page.back() + extra.back() + G - 1) / G * G;
+    }
 };
 std::vector<std::unique_ptr<ElasticPool>> g_pools;
 
 int64_t pool_chunks(const ElasticPool& p, size_t a, int64_t pages) {
     const uint64_t G = vmm_granularity();
-    return (int64_t) (((uint64_t) pages * p.per_page[a] + G - 1) / G);
+    return (int64_t) (((uint64_t) pages * p.per_page[a] + p.extra[a] + G - 1) / G);
+}
+/// Array a's bytes mapped from its start.
+uint64_t pool_mapped_bytes(const ElasticPool& p, size_t a) {
+    const uint64_t G = vmm_granularity();
+    const int64_t c0 = (int64_t) (p.off[a] / G);
+    const int64_t end = a + 1 < p.off.size() ? (int64_t) (p.off[a + 1] / G) : p.range.chunks();
+    int64_t c = 0;
+    while (c0 + c < end && p.range.mapped(c0 + c)) ++c;
+    return std::min<uint64_t>((uint64_t) c * G, (uint64_t) p.n_pages * p.per_page[a] + p.extra[a]);
 }
 int64_t pool_pages(const ElasticPool& p, int64_t cells) {
     return std::min<int64_t>(p.n_pages, std::max<int64_t>((cells + p.page_size - 1) / p.page_size, 1));
 }
 /// Whole pages every array of the pool has mapped.
 int64_t pool_pages_mapped(const ElasticPool& p) {
-    const uint64_t G = vmm_granularity();
     int64_t pages = p.n_pages;
     for (size_t a = 0; a < p.off.size(); ++a) {
-        const int64_t c0 = (int64_t) (p.off[a] / G);
-        const int64_t end = a + 1 < p.off.size() ? (int64_t) (p.off[a + 1] / G) : p.range.chunks();
-        int64_t c = 0;
-        while (c0 + c < end && p.range.mapped(c0 + c)) ++c;
-        pages = std::min<int64_t>(pages, (int64_t) ((uint64_t) c * G / p.per_page[a]));
+        const uint64_t m = pool_mapped_bytes(p, a);
+        pages = std::min<int64_t>(pages, m < p.extra[a] ? 0 : (int64_t) ((m - p.extra[a]) / p.per_page[a]));
     }
     return pages;
 }
 bool pool_grow(ElasticPool& p, int64_t cells, const std::function<VmmChunk()>& take) {
     const uint64_t G = vmm_granularity();
     const int64_t pages = pool_pages(p, cells);
+    std::vector<std::vector<int64_t>> fresh(p.off.size());
+    size_t most = 0;
     for (size_t a = 0; a < p.off.size(); ++a) {
         const int64_t c0 = (int64_t) (p.off[a] / G), c1 = c0 + pool_chunks(p, a, pages);
-        std::vector<int64_t> fresh;
         for (int64_t c = c0; c < c1; ++c)
-            if (!p.range.mapped(c)) fresh.push_back(c);
-        if (fresh.empty()) continue;
+            if (!p.range.mapped(c)) fresh[a].push_back(c);
+        if (fresh[a].empty()) continue;
+        most = std::max(most, fresh[a].size());
         if (!p.range.map_range(c0, c1, take)) {
             std::fprintf(stderr, "strata: the elastic K/V could not map %zu chunks (the driver has no VRAM left)\n",
-                         fresh.size());
+                         fresh[a].size());
             return false;
         }
-        // what the chunk held before (another pool's cells, an expert) is not K/V: zeroed, as a new session is
-        for (const int64_t c : fresh)
-            if (cudaMemset(p.range.base() + (uint64_t) c * G, 0, (size_t) G) != cudaSuccess) {
-                std::fprintf(stderr, "strata: the elastic K/V could not clear a chunk: %s\n",
+    }
+    // what a chunk held before (another pool's cells, an expert) is not K/V: zeroed, as a new session is.  Or filled
+    // (the rotary tables): the k-th new chunk of every array in turn, so cos's and sin's of one range follow each other
+    for (size_t k = 0; k < most; ++k)
+        for (size_t a = 0; a < p.off.size(); ++a) {
+            if (k >= fresh[a].size()) continue;
+            uint8_t* dst = p.range.base() + (uint64_t) fresh[a][k] * G;
+            const uint64_t lo = (uint64_t) fresh[a][k] * G - p.off[a];
+            if (p.fill ? !p.fill(a, lo, lo + G, dst) : cudaMemset(dst, 0, (size_t) G) != cudaSuccess) {
+                std::fprintf(stderr, "strata: the elastic K/V could not clear or fill a chunk: %s\n",
                              cudaGetErrorString(cudaGetLastError()));
                 return false;
             }
-    }
+        }
     return true;
 }
 }  // namespace
@@ -617,12 +646,12 @@ n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;
 // tail
 n += (uint64_t) s.idx_dim * 4;
 // dead
-n += (uint64_t) ((max_cells / s.idx_block) + 2) * s.idx_dim * 4;
-// pooled
+if (!g_kv_elastic) n += (uint64_t) ((max_cells / s.idx_block) + 2) * s.idx_dim * 4;
+// pooled (the elastic keys are in the K/V's range)
 n += 16;
 // block_pos
-if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;
-// cos + sin tables
+if (with_rope && !g_kv_elastic) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;
+// cos + sin tables (the elastic ones are in their own range)
 n += strata::kernels::qsa_step_bytes() + 16; // counts and aligned attention status
 // the per-token counts
 n += (uint64_t) s.n_head * 4;
@@ -639,18 +668,18 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.kv_elastic = -1;
     if (g_kv_elastic) {
         // the elastic K/V: each array at a chunk boundary of the state's own range, the first cells mapped
-        auto pool = std::make_unique<ElasticPool>();
-        const uint64_t G = vmm_granularity();
-        uint64_t at = 0;
-        for (const uint64_t b : kv_row_bytes(kv, (uint64_t) s.head_dim)) {
-            const uint64_t per = (uint64_t) s.n_head_kv * s.page_size * b;
-            pool->off.push_back(at);
-            pool->per_page.push_back(per);
-            at += ((uint64_t) pages * per + G - 1) / G * G;
+        // (then the indexer's pooled keys: a row per idx_block cells, and the spare's past the last)
+        if (s.page_size % s.idx_block != 0) {
+            std::fprintf(stderr, "strata: the elastic K/V needs whole indexer blocks in a page\n");
+            return 0;
         }
+        auto pool = std::make_unique<ElasticPool>();
         pool->n_pages = pages;
         pool->page_size = s.page_size;
-        if (!pool->range.reserve(at) || !pool_grow(*pool, g_kv_elastic_init, [] { return (VmmChunk) 0; })) {
+        for (const uint64_t b : kv_row_bytes(kv, (uint64_t) s.head_dim)) pool->add((uint64_t) s.n_head_kv * s.page_size * b);
+        const uint64_t row = (uint64_t) s.idx_dim * 4;
+        pool->add((uint64_t) (s.page_size / s.idx_block) * row, 2 * row);
+        if (!pool->range.reserve(pool->bytes()) || !pool_grow(*pool, g_kv_elastic_init, [] { return (VmmChunk) 0; })) {
             std::fprintf(stderr, "strata: the elastic K/V could not reserve or map its pools\n");
             return 0;
         }
@@ -660,7 +689,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     } else {
         for (const uint64_t b : kv_row_bytes(kv, (uint64_t) s.head_dim))
             a.push_back(c.take_bytes((uint64_t) pages * s.n_head_kv * s.page_size * b));
+        a.push_back((uint8_t*) c.take<float>((uint64_t) ((max_cells / s.idx_block) + 2) * s.idx_dim));
     }
+    st.idx_pooled = (float*) a.back();
+    a.pop_back();
     switch (kv) {
     case KvFormat::Int8:
         st.k_q = (int8_t*) a[0]; st.v_q = (int8_t*) a[1]; st.k_scale = (uint16_t*) a[2]; st.v_scale = (uint16_t*) a[3];
@@ -673,7 +705,33 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         break;
     default: st.k_pool = (uint16_t*) a[0]; st.v_pool = (uint16_t*) a[1];
     }
-    st.page_table = c.take<int32_t>((uint64_t) pages);    st.n_pages = pages;    st.max_cells = max_cells;    st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);    st.idx_dead = c.take<float>((uint64_t) s.idx_dim);    st.idx_pooled = c.take<float>((uint64_t) ((max_cells / s.idx_block) + 2) * s.idx_dim);    st.idx_block_pos = c.take<int32_t>(1);    if (share_rope != nullptr) {        st.cos_tab = share_rope->cos_tab;        st.sin_tab = share_rope->sin_tab;    } else {        st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));        st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));    }    st.step = c.take<int32_t>((uint64_t) strata::kernels::kStepCount); st.attention_status = c.take<int32_t>(1);    st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
+    st.page_table = c.take<int32_t>((uint64_t) pages);    st.n_pages = pages;    st.max_cells = max_cells;    st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);    st.idx_dead = c.take<float>((uint64_t) s.idx_dim);    st.idx_block_pos = c.take<int32_t>(1);    if (share_rope != nullptr) {        st.cos_tab = share_rope->cos_tab;        st.sin_tab = share_rope->sin_tab;    } else if (g_kv_elastic) {
+        // the elastic rotary tables, cos and sin: a chunk's positions built on the host as it is mapped
+        auto pool = std::make_unique<ElasticPool>();
+        pool->n_pages = pages;
+        pool->page_size = s.page_size;
+        const uint64_t row = (uint64_t) (s.n_rot / 2) * 4;
+        pool->add((uint64_t) s.page_size * row);
+        pool->add((uint64_t) s.page_size * row);
+        // a range's positions built once: pool_grow fills cos's chunk, then sin's of the same range
+        pool->fill = [n_rot = (int) s.n_rot, sc = strata::kernels::rope_scaling(), row, hc = std::vector<float>(),
+                      hs = std::vector<float>(), at = ~0ull](size_t a, uint64_t lo, uint64_t hi, uint8_t* dst) mutable {
+            if (lo != at) {
+                hc.resize((size_t) ((hi - lo) / 4));
+                hs.resize(hc.size());
+                strata::kernels::build_rope_table(n_rot, sc, (int) (hi / row), hc.data(), hs.data(), (int) (lo / row));
+                at = lo;
+            }
+            return cudaMemcpy(dst, (a == 0 ? hc : hs).data(), (size_t) (hi - lo), cudaMemcpyHostToDevice) == cudaSuccess;
+        };
+        if (!pool->range.reserve(pool->bytes()) || !pool_grow(*pool, g_kv_elastic_init, [] { return (VmmChunk) 0; })) {
+            std::fprintf(stderr, "strata: the elastic rotary tables could not reserve or map their range\n");
+            return 0;
+        }
+        st.cos_tab = (float*) (pool->range.base() + pool->off[0]);
+        st.sin_tab = (float*) (pool->range.base() + pool->off[1]);
+        g_pools.push_back(std::move(pool));
+    } else {        st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));        st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));    }    st.step = c.take<int32_t>((uint64_t) strata::kernels::kStepCount); st.attention_status = c.take<int32_t>(1);    st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
 // the pinned staging the uploads copy FROM - see the note on `host_step` in the header
 if (cudaHostAlloc((void**) &st.host_step, strata::kernels::qsa_step_bytes() + sizeof(int32_t), cudaHostAllocMapped | cudaHostAllocPortable) !=            cudaSuccess ||        cudaHostAlloc((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {        return 0;
 // the caller sees a zero byte count; a half-built state is worse than none
@@ -682,7 +740,14 @@ st.host_step[strata::kernels::kStepCount] = 0;
 // THE ROPE TABLE IS BUILT ON THE HOST IN FLOAT64 and uploaded once, because the reference computes its
 // frequencies in float64 and reproducing that on device means double-precision `pow`/`cos` that need not
 // agree with the host's libm.  A table shorter than the sequence would have the rotation read past it.
-if (share_rope == nullptr) {    std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));    strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::rope_scaling(), (int) max_cells,                                      hc.data(), hs.data());    cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);    cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+if (share_rope == nullptr) {
+    if (!g_kv_elastic) {   // (the elastic tables are built as they are mapped)
+        std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
+        strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::rope_scaling(), (int) max_cells, hc.data(),
+                                          hs.data());
+        cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+    }
     // the native and prompt-path rope kernels read it with STRATA_ROPE_TABLE=1 (mrope.hpp)
     if (s.n_rot == 64)
         strata::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, strata::kernels::rope_scaling());
@@ -742,11 +807,17 @@ void qsa_kv_append_steps(const QsaState& st, const ModelGeometry& g, const int32
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     cudaStream_t cs = (cudaStream_t) stream;
-    // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
-    const int64_t live_pages = st.kv_elastic >= 0 ? pool_pages_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_pages;
-    const size_t rows = (size_t) live_pages * s.n_head_kv * s.page_size;
-    for (const KvArray& a : qsa_kv_arrays(st, g)) cudaMemsetAsync(a.data, 0, rows * a.row_bytes, cs);
-    cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);    cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);    cudaMemsetAsync(st.idx_pooled, 0, (size_t) ((st.max_cells / s.idx_block) + 2) * s.idx_dim * 4, cs);}
+    if (st.kv_elastic >= 0) {
+        // an elastic state zeroes what is mapped, the K/V and the pooled keys (the rest is zeroed when it is mapped)
+        const ElasticPool& p = *g_pools[(size_t) st.kv_elastic];
+        for (size_t a = 0; a < p.off.size(); ++a)
+            cudaMemsetAsync(p.range.base() + p.off[a], 0, (size_t) pool_mapped_bytes(p, a), cs);
+    } else {
+        const size_t rows = (size_t) st.n_pages * s.n_head_kv * s.page_size;
+        for (const KvArray& a : qsa_kv_arrays(st, g)) cudaMemsetAsync(a.data, 0, rows * a.row_bytes, cs);
+        cudaMemsetAsync(st.idx_pooled, 0, (size_t) ((st.max_cells / s.idx_block) + 2) * s.idx_dim * 4, cs);
+    }
+    cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);    cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);}
 uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    uint64_t n = 0;    n += (uint64_t) q8k_bytes(g.n_embd);    n += (uint64_t) (g.n_embd / 32) * 34;
 // block_q8_0
 n += (uint64_t) g.n_embd * 2;    n += (uint64_t) g.n_head * 2 * g.head_dim * 4;    n += (uint64_t) g.n_head * g.head_dim * 4;    n += (uint64_t) g.n_head_kv * g.head_dim * 4 * 2;    n += (uint64_t) g.idx_key_dim * 4;    n += (uint64_t) g.idx_q_heads * g.idx_key_dim * 4;    n += (uint64_t) max_cells * 4;    n += (uint64_t) cap * 4;    n += (uint64_t) cap * g.n_head_kv * g.head_dim * 2 * 2;    n += (uint64_t) g.n_head * g.head_dim * 4;

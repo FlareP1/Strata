@@ -12,13 +12,12 @@ may write into its own configs: the layer split and the helper GPUs' caches (`--
 low-RAM modes, the file tier and the RAM budget (`--resident-budget-gib`), the experimental speed projection (control
 vectors), upstream's conversation cache (`--conversation-cache-mib`; the prompt cache here keeps replaced conversations
 in RAM), session files, parallel requests (`--batch`), token biases, prompt lookup chained after the drafts
-(`--lookup-chain`), the learned expert profile (`--expert-profile-save`), a context past the trained 262K
-(`--rope-scaling` rotates as upstream's, but the QSA selection stops at 262,144 cells, and `--max-context` with it),
-upstream's routing approximations (the route tail skip, on by default in upstream's CUDA server), the adaptive tier's
-overlapped copies (`STRATA_ADAPT_OVERLAP`), the engine's own watchdog and stall report, the PLE read probe, 0.1.44's
-NVFP4 experts, Qwen3.6-35B-A3B engine and batched commit graph, and the AMD, Intel, Metal (Mac), Turing, Volta and
-Pascal builds. A server config with `parallel`, `vram_elastic` or `expert_profile_save` passes the engine a flag it
-refuses; with `slot_save_path`, a save request ends the engine.
+(`--lookup-chain`), the learned expert profile (`--expert-profile-save`), upstream's routing approximations (the
+route tail skip, on by default in upstream's CUDA server), the adaptive tier's overlapped copies
+(`STRATA_ADAPT_OVERLAP`), the engine's own watchdog and stall report, the PLE read probe, 0.1.44's NVFP4 experts,
+Qwen3.6-35B-A3B engine and batched commit graph, and the AMD, Intel, Metal (Mac), Turing, Volta and Pascal builds. A
+server config with `parallel`, `vram_elastic` or `expert_profile_save` passes the engine a flag it refuses; with
+`slot_save_path`, a save request ends the engine.
 
 Their paths are relative to the Strata folder, where the server starts: the engine in `build/`; the model files, the
 packs and the MTP draft layer in setup's data folder, `../Strata-data` (unless setup was given another: `--data-dir`).

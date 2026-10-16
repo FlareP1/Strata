@@ -37,8 +37,9 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 /// the RTX 3090 (two per SM); longer contexts go round.
 constexpr int64_t qsa_score_grid_blocks = 10496;
 
-/// The most cells qsa_block_topk selects over (64 rows of 1024 blocks of 4 cells): --max-context's limit.
-constexpr int64_t qsa_select_max_cells = 262144;
+/// The most cells qsa_block_topk selects over on the current device, --max-context's limit: its tables take 512 bytes
+/// of shared memory per 4,096 cells (1,466,368 on the RTX 3090's 99 KiB, 630,784 on a 48 KiB card).
+int64_t qsa_select_max_cells(const QsaShapes& s);
 
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,

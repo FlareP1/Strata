@@ -376,7 +376,7 @@ void usage() {
                  "  --native-rope         experimental pinned text-only CUDA rotary arithmetic\n"
                  "  --rope-scaling T      rotate for a context past the trained one: none, linear (position\n"
                  "                        interpolation) or yarn, as llama.cpp does. Fixed at startup: K in the\n"
-                 "                        cache is post-RoPE. The QSA selection still stops at 262144 cells.\n"
+                 "                        cache is post-RoPE.\n"
                  "  --rope-scale F        the extension factor (>= 1), e.g. 2 for 524288 over a 262144 training run\n"
                  "  --rope-freq-base N    the rotation base (0 = 1e7)   --rope-freq-scale F  the raw shrink (0 = 1/F)\n"
                  "  --yarn-orig-ctx N     trained context (0 = 262144)  --yarn-ext-factor F  < 0 = auto (1 for yarn)\n"
@@ -401,7 +401,8 @@ void usage() {
                  "  --disable-hit        every routed expert on the CPU (the cache stays allocated): exact's reference\n"
                  "  --verify-cache       compare every profile-filled cache slot with its source bytes\n"
                  "  --max-new N          tokens to generate (default 16)\n"
-                 "  --max-context N      KV/state capacity (default 4096, at most 262144: the QSA selection)\n"
+                 "  --max-context N      KV/state capacity (default 4096; at most the QSA selection's capacity, set\n"
+                 "                       by the GPU's shared memory: 1,466,368 cells on 99 KiB, 630,784 on 48 KiB)\n"
                  "  --greedy             argmax (the default)\n"
                  "  --seed S             enable sampling with this Philox seed\n"
                  "  --top-k N --top-p F --temperature F\n"
@@ -1347,9 +1348,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --max-context must be below 2^31\n");
         return 2;
     }
-    if (o.max_context > strata::kernels::qsa_select_max_cells) {
-        std::fprintf(stderr, "strata generate: --max-context %lld is past the QSA selection's %lld cells\n",
-                     (long long) o.max_context, (long long) strata::kernels::qsa_select_max_cells);
+    if (const int64_t cells = strata::kernels::qsa_select_max_cells(strata::kernels::qsa_real_shapes());
+        o.max_context > cells) {
+        std::fprintf(stderr, "strata generate: --max-context %lld is past the QSA selection's %lld cells on this GPU\n",
+                     (long long) o.max_context, (long long) cells);
         return 2;
     }
     if (o.max_new <= 0 || o.max_context <= 0 || o.max_new > o.max_context ||

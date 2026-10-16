@@ -1,7 +1,8 @@
 // src/kernels/qsa_select_parity.cu - the QSA block scores and top-k (qsa_select.cu) against the kernels they
 // replaced, kept here as the reference: scores bitwise, selections identical, for decode windows (1-8 queries,
-// the captured graph's fixed grid) and the prompt path's batches (up to 256 queries), from the identity case to 200K
-// cells, with exact score ties, zero scores and every tail length.  --bench times both.
+// the captured graph's fixed grid) and the prompt path's batches (up to 256 queries), from the identity case to the
+// trained 262,144 cells, then past it under the GPU's whole selection capacity (qsa_select_max_cells), with exact score
+// ties, zero scores and every tail length.  --bench times both.
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
 
@@ -190,12 +191,13 @@ template <typename T> T* dev(size_t n) {
     return p;
 }
 
-constexpr int64_t kMaxCells = 262144;   // the trained context, the top-k's capacity
+constexpr int64_t kTrainedCells = 262144;
 constexpr int QD = 512;                 // a query's floats: 4 heads x 128
 
 struct Data {
+    explicit Data(int64_t cells) : max_cells(cells), max_blocks(cells / 4 + 2) {}
     QsaShapes s = qsa_real_shapes();
-    int64_t max_blocks = kMaxCells / 4 + 2;
+    int64_t max_cells, max_blocks;
     int64_t cap = qsa_selection_width(kTopkMaxCells, qsa_real_shapes());
     float *pooled = nullptr, *dead = nullptr, *q = nullptr, *sc_ref = nullptr, *sc_new = nullptr;
     int32_t *steps = nullptr, *ids_ref = nullptr, *ids_new = nullptr;
@@ -230,6 +232,12 @@ void fill(Data& d, std::mt19937& rng) {
     d.steps = dev<int32_t>((size_t) d.max_q * kStepCount);
     d.ids_ref = dev<int32_t>((size_t) d.max_q * d.cap);
     d.ids_new = dev<int32_t>((size_t) d.max_q * d.cap);
+}
+
+void free_data(Data& d) {
+    for (void* p : {(void*) d.pooled, (void*) d.dead, (void*) d.q, (void*) d.sc_ref, (void*) d.sc_new, (void*) d.steps,
+                    (void*) d.ids_ref, (void*) d.ids_new})
+        cudaFree(p);
 }
 
 std::vector<int32_t> steps_from(const Data& d, int64_t pos0, int64_t nq) {
@@ -294,7 +302,7 @@ int selftest(Data& d, cudaStream_t s) {
     const int64_t pos_dec[] = {0, 3, 2046, 2047, 2050, 2051, 2052, 8190, 16381, 32766, 65533, 131070, 200180, 262136};
     for (int64_t p : pos_dec)
         for (int64_t nq : {1, 2, 3, 4, 8}) {
-            if (p + nq > kMaxCells) continue;
+            if (p + nq > d.max_cells) continue;
             bad += compare(d, p, nq, qsa_score_grid_blocks, s, "decode");
             ++cases;
         }
@@ -308,7 +316,34 @@ int selftest(Data& d, cudaStream_t s) {
         bad += compare(d, p, nq, (last + 1) / 4 + 1, s, "prompt");
         ++cases;
     }
-    std::printf("qsa_select: %s (%d cases: scores bitwise, selections equal)\n", bad ? "MISMATCH" : "PASS", cases);
+    std::printf("qsa_select: %s (%d cases at %lld cells: scores bitwise, selections equal)\n", bad ? "MISMATCH" : "PASS",
+                cases, (long long) d.max_cells);
+    return bad;
+}
+
+// Past the trained context, under the GPU's whole capacity: the (row, warp) tables past their 64 rows in the
+// histograms' room, short queries under that capacity, and the last cells it holds
+int selftest_long(Data& d, cudaStream_t s) {
+    int bad = 0, cases = 0;
+    const int64_t m = d.max_cells;
+    const int64_t pos_dec[] = {0, 2051, 131070, 262136, 262140, 262143, 262144, 266237, 300001, 393213, 524284,
+                               786431, 1048572, m - 8};
+    for (int64_t p : pos_dec)
+        for (int64_t nq : {1, 4, 8}) {
+            if (p + nq > m) continue;
+            bad += compare(d, p, nq, qsa_score_grid_blocks, s, "decode (long)");
+            ++cases;
+        }
+    const int64_t pos_pre[][2] = {{16384, 256},          {262144 - 128, 256}, {393216 - 256, 256},
+                                  {524288 - 256, 256},   {700001, 37},        {m - 256, 256}};
+    for (const auto& pq : pos_pre) {
+        const int64_t p = pq[0], nq = pq[1], last = p + nq - 1;
+        if (last >= m) continue;
+        bad += compare(d, p, nq, (last + 1) / 4 + 1, s, "prompt (long)");
+        ++cases;
+    }
+    std::printf("qsa_select long: %s (%d cases at %lld cells, the GPU's capacity)\n", bad ? "MISMATCH" : "PASS",
+                cases, (long long) m);
     return bad;
 }
 
@@ -347,8 +382,16 @@ void bench(Data& d, cudaStream_t s) {
                        {"decode 1 q, 131K cells", 131072, 1, false},  {"prompt 256 q at 16K", 16384 - 256, 256, true},
                        {"prompt 256 q at 64K", 65536 - 256, 256, true},
                        {"prompt 256 q at 131K", 131072 - 256, 256, true},
-                       {"prompt 16 q at 131K", 131072 - 16, 16, true},  {"prompt 64 q at 131K", 131072 - 64, 64, true}};
+                       {"prompt 16 q at 131K", 131072 - 16, 16, true},  {"prompt 64 q at 131K", 131072 - 64, 64, true},
+                       {"decode 4 q, 262K cells", 262144 - 4, 4, false},  {"decode 8 q, 262K cells", 262144 - 8, 8, false},
+                       {"decode 4 q, 393K cells", 393216, 4, false},    {"decode 8 q, 393K cells", 393216, 8, false},
+                       {"decode 4 q, 524K cells", 524288 - 4, 4, false},  {"decode 8 q, 524K cells", 524288 - 8, 8, false},
+                       {"prompt 256 q at 262K", 262144 - 256, 256, true},
+                       {"prompt 256 q at 393K", 393216 - 256, 256, true},
+                       {"prompt 256 q at 524K", 524288 - 256, 256, true}};
+    std::printf("(capacity %lld cells)\n", (long long) d.max_cells);
     for (const Case& c : cs) {
+        if (c.pos + c.nq > d.max_cells) continue;
         steps_from(d, c.pos, c.nq);
         const int64_t grid = c.prompt ? (c.pos + c.nq) / 4 + 1 : qsa_score_grid_blocks;
         const int reps = c.prompt ? 5 : 50;
@@ -382,9 +425,20 @@ int main(int argc, char** argv) {
     std::mt19937 rng(20260926);
     cudaStream_t s = nullptr;
     check(cudaStreamCreate(&s), "stream");
-    Data d;
-    fill(d, rng);
-    const int bad = selftest(d, s);
-    if (do_bench) bench(d, s);
+    int bad = 0;
+    {
+        Data d(kTrainedCells);
+        fill(d, rng);
+        bad += selftest(d, s);
+        if (do_bench) bench(d, s);
+        free_data(d);
+    }
+    {
+        Data d(qsa_select_max_cells(qsa_real_shapes()));
+        fill(d, rng);
+        bad += selftest_long(d, s);
+        if (do_bench) bench(d, s);
+        free_data(d);
+    }
     return bad ? 1 : 0;
 }

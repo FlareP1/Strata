@@ -6,7 +6,9 @@
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <type_traits>
+#include <unordered_map>
 
 namespace strata::kernels {
 namespace {
@@ -25,8 +27,7 @@ constexpr int QD = IDX_HEADS * IDX_DIM;                    // a query's floats
 constexpr int kBatchMinQueries = 12;                       // fewer (decode windows): block_scores_kernel
 constexpr int TOPK_T = 1024, TOPK_W = TOPK_T / 32;
 constexpr int TOPK_ROWS = 32;                              // rows of TOPK_T blocks held in registers
-constexpr int TOPK_MAX_ROWS = 64;                          // 65536 blocks: 262144 cells
-static_assert((int64_t) TOPK_MAX_ROWS * TOPK_T * R == qsa_select_max_cells, "the selection's capacity");
+constexpr int TOPK_TAB_ROWS = 64;                          // the (row, warp) tables' least rows: in the histograms' room
 
 __device__ __forceinline__ uint32_t order_key(float s) {
     const float v = s + 0.0f;
@@ -344,10 +345,12 @@ __device__ __forceinline__ void block_exclusive2(int a, int b, int& ea, int& eb,
 // row * TOPK_T + t, the first TOPK_ROWS rows in registers (read once, 131K cells), the others from memory in each
 // pass.  A block's cells then land at (cells above the threshold before it) + min(cells at it before it, budget):
 // ballots within a (row, warp), one scan over the (row, warp) totals.  The tail block (n_bid) is thread 0's.
+// Shared memory (topk_smem_bytes): the per-warp histograms, then in the same room the (row, warp) tables of `tab_rows`
+// rows and the output; past TOPK_TAB_ROWS rows the tables outgrow the histograms.
 __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restrict__ scores,
                                                             const int32_t* __restrict__ steps, int64_t max_blocks,
-                                                            int64_t cap, int32_t* __restrict__ ids) {
-    __shared__ int sm[TOPK_W * 256];                   // the per-warp histograms; then the scan table and the output
+                                                            int64_t cap, int tab_rows, int32_t* __restrict__ ids) {
+    extern __shared__ int sm[];                        // the per-warp histograms; then the scan table and the output
     __shared__ int hist[256];
     __shared__ int s_w[2 * TOPK_W + 2];
     __shared__ int s_digit, s_above;
@@ -445,8 +448,8 @@ __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restr
     const int budget = (int) (width - above);          // cells equal to thr that fit, lowest index first
     // ---- the cells above and at thr per (row, warp), their exclusive prefixes in block order
     int* tab_gt = sm;
-    int* tab_eq = sm + TOPK_MAX_ROWS * 32;
-    int* obuf = sm + 2 * TOPK_MAX_ROWS * 32;           // the selection, copied out coalesced
+    int* tab_eq = sm + tab_rows * 32;
+    int* obuf = sm + 2 * tab_rows * 32;                // the selection, copied out coalesced
     __syncthreads();                                   // the histograms are no longer read
     auto row_key = [&](int i) { return i < TOPK_ROWS ? 0u : order_key(sc[(int64_t) i * TOPK_T + t]); };
 #pragma unroll
@@ -465,13 +468,20 @@ __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restr
     __syncthreads();
     int gt_all, eq_all;
     {
-        const int e = nrows * 32, k0 = 2 * t;          // entries (row, warp) in block order, two per thread
-        const int g0 = k0 < e ? tab_gt[k0] : 0, e0 = k0 < e ? tab_eq[k0] : 0;
-        const int g1 = k0 + 1 < e ? tab_gt[k0 + 1] : 0, e1 = k0 + 1 < e ? tab_eq[k0 + 1] : 0;
+        // entries (row, warp) in block order, `per` consecutive ones a thread: two up to TOPK_TAB_ROWS rows
+        const int e = nrows * 32, per = e > 2 * TOPK_T ? (e + TOPK_T - 1) / TOPK_T : 2, k0 = per * t;
+        const int k1 = k0 + per < e ? k0 + per : e;
+        int gs = 0, es = 0;
+        for (int k = k0; k < k1; ++k) { gs += tab_gt[k]; es += tab_eq[k]; }
         int gx, ex;
-        block_exclusive2(g0 + g1, e0 + e1, gx, ex, gt_all, eq_all, s_w);
-        if (k0 < e) { tab_gt[k0] = gx; tab_eq[k0] = ex; }
-        if (k0 + 1 < e) { tab_gt[k0 + 1] = gx + g0; tab_eq[k0 + 1] = ex + e0; }
+        block_exclusive2(gs, es, gx, ex, gt_all, eq_all, s_w);
+        for (int k = k0; k < k1; ++k) {
+            const int g = tab_gt[k], q = tab_eq[k];
+            tab_gt[k] = gx;
+            tab_eq[k] = ex;
+            gx += g;
+            ex += q;
+        }
     }
     __syncthreads();
     // ---- the cells, into shared memory
@@ -540,17 +550,67 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
+namespace {
+
+// The rows the tables need for a capacity: the complete blocks, at most max_blocks - 2 (the callers' max_cells / 4 + 2
+// leaves room for the tail block and one more), at least TOPK_TAB_ROWS
+int64_t topk_tab_rows(int64_t max_blocks) {
+    const int64_t rows = (max_blocks - 2 + TOPK_T - 1) / TOPK_T;
+    return rows > TOPK_TAB_ROWS ? rows : TOPK_TAB_ROWS;
+}
+
+size_t topk_smem_bytes(int64_t tab_rows, int64_t cap) {
+    const int64_t tabs = 2 * tab_rows * 32 + cap, hists = (int64_t) TOPK_W * 256;
+    return (size_t) (tabs > hists ? tabs : hists) * sizeof(int);
+}
+
+// The dynamic shared memory a block of the kernel can have on the current device
+size_t topk_smem_limit() {
+    int dev = 0, optin = 0;
+    cudaFuncAttributes fa{};
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess ||
+        cudaFuncGetAttributes(&fa, block_topk_kernel) != cudaSuccess)
+        return 0;
+    return (size_t) optin > fa.sharedSizeBytes ? (size_t) optin - fa.sharedSizeBytes : 0;
+}
+
+}  // namespace
+
+int64_t qsa_select_max_cells(const QsaShapes& s) {
+    const int64_t ints = (int64_t) (topk_smem_limit() / sizeof(int)) - qsa_selection_width(kTopkMaxCells, s);
+    return ints > 0 ? ints / 64 * TOPK_T * R : 0;
+}
+
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream) {
     if (nq <= 0) return;
-    // the rows hold the complete blocks, at most max_blocks - 2 (the callers' max_cells / 4 + 2 leaves room for the
-    // tail block and one more): 262,144 cells fill 64 rows exactly
-    if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s) ||
-        max_blocks - 2 > (int64_t) TOPK_MAX_ROWS * TOPK_T) {
+    const int64_t tab_rows = topk_tab_rows(max_blocks);
+    const size_t smem = topk_smem_bytes(tab_rows, cap);
+    if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s) || max_blocks < 2) {
         std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
         std::exit(1);
     }
-    block_topk_kernel<<<(unsigned) nq, TOPK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+    if (smem > 48 * 1024) {
+        // once a device for the largest size asked: a function attribute, not a stream operation (capturable)
+        static std::mutex mu;
+        static std::unordered_map<int, size_t> set;
+        int dev = 0;
+        cudaGetDevice(&dev);
+        const std::lock_guard<std::mutex> lock(mu);
+        if (set[dev] < smem) {
+            if (smem > topk_smem_limit() ||
+                cudaFuncSetAttribute(block_topk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem) !=
+                    cudaSuccess) {
+                std::fprintf(stderr, "qsa_block_topk: %lld blocks are past this GPU's selection capacity\n",
+                             (long long) max_blocks);
+                std::exit(1);
+            }
+            set[dev] = smem;
+        }
+    }
+    block_topk_kernel<<<(unsigned) nq, TOPK_T, smem, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap,
+                                                                             (int) tab_rows, ids);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }

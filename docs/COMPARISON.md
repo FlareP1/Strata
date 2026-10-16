@@ -3,7 +3,8 @@
 Qwen3.8-Flash-Next in two quantizations, IQ3_S and UD-Q4_K_XL, through three engines on an RTX 3090 + RTX 5070 Ti PC,
 measured on 2026-10-13/14: llama.cpp's mainline build 11606, upstream Strata a0116b27 (engine 0.1.43.1) and this fork
 at e1ccfcbb (UD-Q4_K_XL's agreement with llama.cpp at 2ae47d0f, whose arithmetic there is the same); this fork's speeds
-through the API measured again on 2026-10-16 at 78652d23, and all of this fork's IQ3_S numbers at 83190f5a.
+through the API measured again on 2026-10-16 at 78652d23, and all of this fork's IQ3_S numbers and the sampled runs
+at 83190f5a.
 
 **In short**, with both GPUs:
 
@@ -13,6 +14,9 @@ through the API measured again on 2026-10-16 at 78652d23, and all of this fork's
   prompts 1.7-1.8x, answers 1.4-1.9x.
 - **UD-Q4_K_XL:** prompts 11.6-13.4x and answers 4.9-7.0x as fast as llama.cpp; against upstream's layer split prompts
   2.2-3.6x and answers 1.9-2.5x, on the 3090 alone prompts 1.9-2.6x and answers 1.5-2.1x.
+- Sampled with the configs' settings (temperature 0.7), this fork thinks 11-15% slower than greedy (fewer drafts
+  pass), writes code 3-11% slower and edits as fast; llama.cpp's speed does not change, so this fork thinks 4.2x as
+  fast as llama.cpp (greedy 4.7-5.0x).
 - A follow-up turn after a 16K-token prompt starts in 0.17-0.23 s (llama.cpp 0.61-0.72 s; upstream 0.26-0.42 s on
   the 3090, 0.45-1.06 s on both GPUs).
 - The next-token distributions match llama.cpp's about as closely as llama.cpp's own CPU and CUDA backends match each
@@ -103,6 +107,29 @@ the GPUs' memory taken, and the RAM taken as the drop in the system's available 
 | VRAM taken: 3090 / 5070 Ti (GiB) | 22.3 / 12.9 | 22.7 / 0.0 | 22.8 / 14.6 | 22.7 / 13.1 | 22.7 / 0.0 |
 | RAM taken (GB) | 84 | 69 | 69 | 81 | 80 |
 <!-- /matrix:api-ud-q4_k_xl -->
+
+## Sampled generation
+
+This fork's configs sample the requests that send no sampling settings: temperature 0.7, top_p 0.95, top_k 20, min_p
+0. The thinking, code and edit requests above, each greedy and sampled with these settings five times (seeds 1-5, the
+same seed to both engines; this fork got per seed the three greedy requests, then the three sampled ones, as its
+adaptive tiers keep the last request's experts): generation t/s as the median (range) of the five, the sampled median
+against the greedy one, and this fork's tokens a verify pass (median). A sampled token is drawn by its probability, and
+this fork keeps a draft only when it is the token drawn, so fewer drafts pass than when greedy takes the likeliest
+token: on thinking text 1.8 instead of 2.1 tokens a pass. The sampled code answers run 133-300 tokens (greedy's
+168-300); the edit quotes its prompt, where both pick the same tokens. llama.cpp runs no drafts, and sampling leaves
+its speed as it is. The sampled runs spread about as widely as the greedy ones.
+
+<!-- matrix:sampled -->
+| | IQ3_S: llama.cpp | IQ3_S: this fork | tokens a pass | UD-Q4_K_XL: llama.cpp | UD-Q4_K_XL: this fork | tokens a pass |
+|---|---|---|---|---|---|---|
+| Thinking, 3,000 tokens, greedy | 31.1 (29.2-31.8) | 154.9 (147.7-159.6) | 2.14 | 25.4 (25.3-25.6) | 119.6 (119.1-120.1) | 2.14 |
+| Thinking, 3,000 tokens, sampled | 31.3 (29.4-31.9; 1.01x) | 132.3 (132.2-141.9; 0.85x) | 1.79 | 25.5 (25.3-25.7; 1.00x) | 106.9 (104.8-109.8; 0.89x) | 1.81 |
+| Code, 28-token prompt, greedy | 30.7 (29.3-32.4) | 208.2 (190.5-211.2) | 3.47 | 25.1 (24.8-25.2) | 148.0 (139.3-154.1) | 3.45 |
+| Code, 28-token prompt, sampled | 30.7 (26.8-32.6; 1.00x) | 202.7 (183.4-211.9; 0.97x) | 3.41 | 25.3 (24.9-25.9; 1.01x) | 131.5 (124.6-152.8; 0.89x) | 3.21 |
+| Edit, the prompt's file returned, greedy | 31.4 (29.5-31.7) | 309.0 (306.1-310.3) | 7.51 | 25.2 (25.2-25.4) | 186.7 (185.6-190.5) | 7.51 |
+| Edit, the prompt's file returned, sampled | 31.2 (29.6-31.6; 0.99x) | 302.7 (302.5-303.9; 0.98x) | 7.49 | 25.2 (25.2-25.5; 1.00x) | 188.1 (186.7-193.7; 1.01x) | 7.51 |
+<!-- /matrix:sampled -->
 
 ## Generation on fixed text (this fork)
 

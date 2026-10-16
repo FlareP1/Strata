@@ -27,6 +27,11 @@ session of other code and reasoning requests, a round of fixed text took 9-14% l
 thinking and edits, 0 to +2.0% after a 16K-token prompt. Remove the two keys to start from the shipped profile every
 time.
 
+A request that sends no sampling fields is sampled with the configs' `sampling` block: temperature 0.7, top_p 0.95,
+top_k 20, min_p 0, with thinking on or off (the model card's thinking settings, with its temperature of 1.0 lowered to
+0.7). A request's own fields win, and `"temperature": 0` decodes greedy. Sampled generation's speed against greedy:
+[COMPARISON.md](../docs/COMPARISON.md).
+
 Their paths are relative to the Strata folder, where the server starts: the engine in `build/`; the model files, the
 packs and the MTP draft layer in setup's data folder, `../Strata-data` (unless setup was given another: `--data-dir`).
 A pack is what `tools/iq_pack.py` makes from a model's GGUF files in seconds (~1.5 GB): the tokenizer with the chat

@@ -25,10 +25,9 @@ namespace strata::kernels {
 // Input floats must be finite, and their block scales/sums representable in FP16.
 std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 
-// Layout for ncols > 1. false: llama.cpp's generic multi-column table (upstream), equal to ncols == 1 to
-// float rounding, speed not yet measured. true (default): the ncols == 1 layout, every column bitwise equal to a
-// single-column call. Set before
-// graph capture; captured graphs keep the kernels they captured.
+// Layout for ncols > 1. true (default): the ncols == 1 layout, every column bitwise equal to a single-column call.
+// false: llama.cpp's generic multi-column table (upstream), equal to ncols == 1 to float rounding, no faster on the
+// RTX 3090 (native_mmvq.cu). Set before graph capture; captured graphs keep the kernels they captured.
 void native_mmvq_set_multi_exact(bool exact);
 bool native_mmvq_multi_exact();
 

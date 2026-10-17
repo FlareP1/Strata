@@ -1012,10 +1012,14 @@ bool kv_complete(const QsaAttnPools& p, Kv kv) {
 template <bool SPLIT, bool KQ4, bool VQ4>
 void launch_mma(dim3 grid, cudaStream_t st, const float* q, const QsaAttnPools& pools, const int32_t* ids,
                 const int32_t* steps, const QsaShapes& s, float scale, float* attn, int64_t cap, const Partials& part) {
-    static const cudaError_t e = cudaFuncSetAttribute(attn_mma_kernel<SPLIT, KQ4, VQ4>,
-                                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                      (int) sizeof(pf::Smem<KQ4, VQ4>));
-    (void) e;
+    static bool set[64] = {};   // per device
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev >= 0 && dev < 64 && !set[dev]) {
+        cudaFuncSetAttribute(attn_mma_kernel<SPLIT, KQ4, VQ4>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int) sizeof(pf::Smem<KQ4, VQ4>));
+        set[dev] = true;
+    }
     attn_mma_kernel<SPLIT, KQ4, VQ4><<<grid, pf::NT, sizeof(pf::Smem<KQ4, VQ4>), st>>>(
         q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, attn, (int) cap, part);
 }

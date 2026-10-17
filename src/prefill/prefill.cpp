@@ -204,6 +204,18 @@ struct Prefill::Impl {
     // a chunk's PLE rows, read on a thread while the chunk before runs: two pinned buffers, their row indices
     float* ple_host[2] = {};
     std::vector<uint32_t> ple_rows[2];
+    // set_layers: the layers run here; the first stage's residual out (a sub-chunk written, then landed in host
+    // memory: the next chunk's embedding of that sub-chunk waits for it), the second stage's in
+    int64_t first = 0, last = -1;
+    SplitOut* out = nullptr;
+    std::vector<cudaEvent_t> ev_written, ev_out;
+    bool out_live = false;
+    std::vector<cudaEvent_t> in_ev;
+    bool fast_local = false;   // set_fast_link
+    // set_pacing: the sections of work queued on its GPU ahead of it (0: as fast as the host goes), an event a section
+    int pacing = 0;
+    std::vector<cudaEvent_t> pace_ev;
+    uint64_t pace_at = 0;
 };
 
 Prefill::Prefill() : impl_(new Impl) {}
@@ -215,8 +227,8 @@ Prefill::~Prefill() {
     if (m.xsum) cudaStreamSynchronize(m.xsum);
     if (m.ev_mixed) cudaEventDestroy(m.ev_mixed);
     if (m.ev_routed) cudaEventDestroy(m.ev_routed);
-    for (cudaEvent_t e : m.ev_in) if (e) cudaEventDestroy(e);
-    for (cudaEvent_t e : m.ev_piece) if (e) cudaEventDestroy(e);
+    for (auto* v : {&m.ev_in, &m.ev_piece, &m.ev_written, &m.ev_out, &m.pace_ev})
+        for (cudaEvent_t e : *v) if (e) cudaEventDestroy(e);
     if (m.xfer) cudaStreamDestroy(m.xfer);
     if (m.xsum) cudaStreamDestroy(m.xsum);
     for (float* h : m.ple_host) if (h) cudaFreeHost(h);
@@ -239,8 +251,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.max_blocks = ss.qsa_states[0].max_cells / m.s.idx_block + 2;
     m.ev_in.assign((size_t) ((max_chunk + SUB - 1) / SUB), nullptr);
     m.ev_piece.assign(m.ev_in.size(), nullptr);
+    m.ev_written.assign(m.ev_in.size(), nullptr);
+    m.ev_out.assign(m.ev_in.size(), nullptr);
+    m.pace_ev.assign(m.pacing > 0 ? (size_t) m.pacing + 2 : 0, nullptr);
     bool pieces = true;
-    for (auto* v : {&m.ev_in, &m.ev_piece})
+    for (auto* v : {&m.ev_in, &m.ev_piece, &m.ev_written, &m.ev_out, &m.pace_ev})
         for (cudaEvent_t& e : *v)
             pieces = pieces && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
     if (!pieces || cudaStreamCreateWithFlags(&m.xfer, cudaStreamNonBlocking) != cudaSuccess ||
@@ -258,7 +273,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.cnt.resize(NE);
     m.off.resize(NE + 1);
     m.entry_of.resize(T * K);
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 2 && m.first <= 1; ++i) {   // (a second stage never runs the PLE block: set_layers first)
         m.ple_rows[i].resize(T * strata::kernels::PLE_N_HEADS);
         if (cudaHostAlloc((void**) &m.ple_host[i], T * N * 4, cudaHostAllocDefault) != cudaSuccess) {
             err = "prefill: pinned PLE row buffers";
@@ -278,6 +293,24 @@ void Prefill::set_order(std::vector<int32_t> order) { impl_->order = std::move(o
 void Prefill::set_shift(double fraction) { impl_->shift = std::min(1.0, std::max(0.0, fraction)); }
 const std::vector<uint32_t>& Prefill::routed() const { return impl_->routed; }
 void Prefill::clear_routed() { std::fill(impl_->routed.begin(), impl_->routed.end(), 0u); }
+void Prefill::add_routed(const std::vector<uint32_t>& counts) {
+    std::vector<uint32_t>& r = impl_->routed;
+    for (size_t i = 0; i < r.size() && i < counts.size(); ++i) r[i] += counts[i];
+}
+void Prefill::set_layers(int64_t first, int64_t last, SplitOut* out) {
+    Impl& m = *impl_;
+    m.first = first;
+    m.last = last;
+    m.out = out;
+    m.out_live = false;
+}
+void Prefill::set_pacing(int sections) { impl_->pacing = std::max(0, sections); }
+void Prefill::set_fast_link(bool on) {
+    impl_->fast_local = on;
+    impl_->local.set_fast_link(on);
+}
+float* Prefill::residual() const { return impl_->b.R; }
+void Prefill::set_in_events(const cudaEvent_t* ev, int64_t n) { impl_->in_ev.assign(ev, ev + n); }
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool offload) {
     const strata::kernels::QsaShapes s = shapes_of(g);
@@ -289,8 +322,9 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
 
 uint64_t Prefill::bytes_for(int64_t chunk) const {
     const Impl& m = *impl_;
-    return bytes_needed(*m.g, *m.ss, chunk, m.offload != nullptr) +
-           (m.offload == nullptr ? m.local.prefetch_area(chunk, nullptr) : 0);
+    Alloc a;
+    layout(a, chunk, m.cap, m.max_blocks, m.offload != nullptr);   // as bind carves them
+    return a.used + (m.offload == nullptr ? m.local.prefetch_area(chunk, nullptr) : 0);
 }
 
 bool Prefill::bind(void* region, uint64_t bytes, int64_t chunk, std::string& err) {
@@ -396,7 +430,39 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     };
     // --prefill-profile: an event at the start of each section; the time to the next event is charged to it
     std::vector<std::pair<int, cudaEvent_t>> ev;
+    // set_pacing: at each section, until the GPU has started the section `pacing` sections back; the copies ahead of a
+    // local runner with an x16 link go out meanwhile.  (Work queued on a GPU under WDDM is handed to it as the host
+    // calls the driver, in submission order whatever the stream: what another stage queues on that GPU after a long
+    // queue of these waits for all of it.)
+    bool paced_ok = true;
+    auto pace = [&]() {
+        if (m.pacing <= 0 || !paced_ok) return;
+        const size_t nev = m.pace_ev.size();
+        cudaEventRecord(m.pace_ev[(size_t) (m.pace_at++ % nev)], m.cs);
+        if (m.pace_at <= (uint64_t) m.pacing) return;
+        const cudaEvent_t wait = m.pace_ev[(size_t) ((m.pace_at - 1 - (uint64_t) m.pacing) % nev)];
+        for (;;) {
+            const cudaError_t q = cudaEventQuery(wait);
+            if (q == cudaSuccess) return;
+            if (q != cudaErrorNotReady) {
+                err = std::string("prefill: ") + cudaGetErrorString(q);
+                paced_ok = false;
+                return;
+            }
+            if (m.fast_local && m.local.prefetch_left() && m.local.prefetch_pending() < 2) {
+                if (!m.local.prefetch_next(err)) { paced_ok = false; return; }
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    };
+    m.local.set_pace(m.pacing > 0 ? std::function<bool()>([&] { pace(); return paced_ok; }) : nullptr);
+    struct ClearPace {
+        ExpertRunner& r;
+        ~ClearPace() { r.set_pace(nullptr); }
+    } clear_pace{m.local};
     auto mark = [&](int section) {
+        pace();
         if (!profile) return;
         cudaEvent_t e;
         cudaEventCreate(&e);
@@ -408,9 +474,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     // embedding of the token at t + 1)), h = fc_hidden(rms(R_t)) per stream, h + e on every stream), the attention
     // hyper-connection read, then K (normed and rotated) and V into its cells, from the window's first cell on.  The
     // chunk's buffers are free once its last layer is done; its residual rows are normed in place.
-    const core::MtpPromptKv dk = draft != nullptr ? draft->prompt_kv() : core::MtpPromptKv{};
-    if (draft != nullptr && (!dk.norm_emb || !dk.norm_hidden || !dk.fc_emb || !dk.fc_hidden || !dk.hc_norm ||
-                             !dk.hc_down || !dk.hc_up || !dk.k_proj || !dk.v_proj || !dk.k_norm)) {
+    // set_layers: [L0, L1) here; the draft layer's K/V with the last layer
+    const int64_t L0 = m.first, L1 = m.last < 0 ? g.n_layers : m.last;
+    core::MtpDrafter* const drafter = L1 == g.n_layers ? draft : nullptr;
+    const core::MtpPromptKv dk = drafter == nullptr ? core::MtpPromptKv{} : draft_kv ? *draft_kv : drafter->prompt_kv();
+    if (drafter != nullptr && (!dk.norm_emb || !dk.norm_hidden || !dk.fc_emb || !dk.fc_hidden || !dk.hc_norm ||
+                               !dk.hc_down || !dk.hc_up || !dk.k_proj || !dk.v_proj || !dk.k_norm || !dk.kv)) {
         err = "prefill: a draft layer weight is missing";
         return false;
     }
@@ -482,7 +551,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             ple_read.ok = ss.ple.table->gather_batch(rows, (size_t) Tc, out, ple_read.err);
         });
     };
-    if (ss.ple.ready() && n > 0) ple_start(0, 0);
+    const bool ple_on = ss.ple.ready() && L0 <= 1 && 1 < L1;
+    if (ple_on && n > 0) ple_start(0, 0);
+    if (L0 > 0 && (int64_t) m.in_ev.size() < (std::min(m.T, n) + SUB - 1) / SUB) {
+        err = "prefill: the second stage's residual has no events";
+        return false;
+    }
 
     static const bool trace = std::getenv("STRATA_TRACE") != nullptr;
     processed_ = 0;
@@ -492,9 +566,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         if (trace) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
         ++stats_.chunks;
-        // ---- the embeddings, broadcast to the four streams
-        for (int64_t t0 = 0; t0 < T; t0 += SUB) {
-            const int64_t P = std::min(SUB, T - t0);
+        // ---- a sub-chunk's residual before the first layer here reads it: the embeddings broadcast to the four
+        // streams (once the last chunk's rows there have gone out to the second stage), or the first stage's rows
+        auto residual_in = [&](int64_t t0, int64_t P) -> bool {
+            if (L0 > 0) {
+                cudaStreamWaitEvent(m.cs, m.in_ev[(size_t) (t0 / SUB)], 0);
+                return true;
+            }
+            if (m.out_live) cudaStreamWaitEvent(m.cs, m.ev_out[(size_t) (t0 / SUB)], 0);
             for (int64_t t = t0; t < t0 + P; ++t) {
                 const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
                 if (row) {
@@ -507,8 +586,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 }
             }
             gr_broadcast(b.emb, b.R + t0 * D, P, m.cs);
-        }
-        const bool ple_on = ss.ple.ready();
+            return true;
+        };
         // ---- the QSA step records of every position in the chunk
         for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * SC, p0 + t, s);
         cudaMemcpyAsync(b.steps, m.steps_host.data(), (size_t) T * SC * 4, cudaMemcpyHostToDevice, m.cs);
@@ -527,8 +606,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             if (norm) gr_write_norm_rs(R, bo, inj, HC, norm, EPS, b.rs, b.xn16, P, m.cs, part);
             else gr_write(R, bo, inj, HC, P, m.cs, part);
         };
-        int64_t qsa_index = 0, gdn_index = 0;
-        for (int64_t l = 0; l < g.n_layers; ++l) {
+        int64_t qsa_index = 0, gdn_index = 0;   // from L0: the session state holds the layers from L0 on
+        for (int64_t l = L0; l < L1; ++l) {
             const core::LayerView v(*m.wt, l);
             const bool qsa = core::is_qsa_layer(g, l);
             new_layer();
@@ -611,6 +690,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             for (int64_t t0 = 0; t0 < T; t0 += SUB) {
                 const int64_t P = std::min(SUB, T - t0), pp = p0 + t0;
                 uint16_t* mixed_h = b.mixed_h + t0 * N;
+                if (l == L0 && !residual_in(t0, P)) return false;
                 for (int half = 0; half < 2; ++half) {
                     mark(half == 0 ? kPsHcRead : kPsHcFfn);
                     // ---- the hyper-connection read of this half (the FFN half's norm came with the mixer's write)
@@ -766,6 +846,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     std::this_thread::yield();
                 }
             }
+            // a local runner with an x16 link (a second stage) has all of its copies ahead out before its experts are
+            // queued: their batches would stream the rest behind waits, which hold up every copy queued after them on
+            // its GPU's copy engine (the first stage's too)
+            while (m.fast_local && streamer->prefetch_left()) {
+                if (streamer->prefetch_pending() < 2) {
+                    if (!streamer->prefetch_next(err)) return false;
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+            if (!paced_ok) return false;
             // ================ the routed experts of the whole chunk ================
             if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
                 err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
@@ -841,9 +932,25 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             pending = true;
         }
-        mark(kPsCombine);   // the last layer's write
-        for (int64_t t0 = 0; t0 < T; t0 += SUB) ffn_write(t0, std::min(SUB, T - t0), nullptr);
-        if (draft != nullptr && !draft_pass(tokens + c0, T, p0)) return false;
+        // the last layer's write; a first stage's residual then goes out a sub-chunk at a time
+        mark(kPsCombine);
+        float* host_out = nullptr;
+        if (m.out != nullptr && (host_out = m.out->out_begin(err)) == nullptr) return false;
+        for (int64_t t0 = 0; t0 < T; t0 += SUB) {
+            const int64_t P = std::min(SUB, T - t0);
+            ffn_write(t0, P, nullptr);
+            if (host_out == nullptr) continue;
+            const size_t k = (size_t) (t0 / SUB);
+            cudaEventRecord(m.ev_written[k], m.cs);
+            cudaStreamWaitEvent(m.xfer, m.ev_written[k], 0);
+            cudaMemcpyAsync(host_out + t0 * D, b.R + t0 * D, (size_t) P * D * 4, cudaMemcpyDeviceToHost, m.xfer);
+            cudaEventRecord(m.ev_out[k], m.xfer);
+        }
+        if (host_out != nullptr) {
+            m.out_live = true;
+            if (!m.out->out_end(tokens + c0, T, p0, m.ev_out.data(), SUB, c0 + T >= n, err)) return false;
+        }
+        if (drafter != nullptr && !draft_pass(tokens + c0, T, p0)) return false;
         if (profile) {
             mark(kPsPle);
             cudaEventSynchronize(ev.back().second);

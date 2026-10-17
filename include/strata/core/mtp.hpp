@@ -70,6 +70,9 @@ public:
     QsaState& kv_state() { return st_; }
     /// The weights and cells the batched prompt path computes the prompt's K/V with (after load and set_prompt_len).
     MtpPromptKv prompt_kv();
+    /// The bytes of the dense tensor at `p` (one of prompt_kv's weights), 0 if none starts there: for a copy on
+    /// another GPU (prefill/split.hpp).
+    uint64_t tensor_bytes(const void* p) const;
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 

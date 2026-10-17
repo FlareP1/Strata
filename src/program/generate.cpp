@@ -50,6 +50,7 @@
 #include "strata/core/prompt_cache.hpp"
 #include "strata/prefill/experts.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/split.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
@@ -294,6 +295,9 @@ struct Options {
     bool arena_place = false;
     /// The prompt path's share of the experts the main GPU holds that the second GPU computes (Prefill::set_shift).
     double prompt_shift = 0.0;
+    /// The prompt path in two stages (prefill/split.hpp): the second GPU runs each chunk's layers from this one on
+    /// while the main GPU runs the next chunk (0: off).  Prompts of more than one chunk.
+    double prompt_split = 0.0;
     /// The elastic K/V (--kv-grow, STRATA_KV_GROW=1): the K/V takes VRAM as the context grows, the expert cache the rest.
     bool kv_grow = false;
     bool hc_q8 = false;   ///< the hyper-connection matrices only in 8 bits (core::HcQ8)
@@ -466,6 +470,10 @@ void usage() {
                  "  --prompt-shift F     with --second-gpu: in prompt chunks of 8K tokens and more the second GPU also\n"
                  "                       computes the likeliest F (0..1) of each layer's experts the main GPU holds, copied\n"
                  "                       ahead with the ones it streams (when the main GPU's share is the longer; default 0)\n"
+                 "  --prompt-split L     with --second-gpu: a prompt of more than one chunk runs in two stages, the\n"
+                 "                       second GPU running each chunk's layers L.. whole (their weights and state\n"
+                 "                       copied into its lent cache slots) while the main GPU runs the next chunk\n"
+                 "                       through the first ones (0: off, the default)\n"
                  "  --arena-place        at the start, time each expert's place in the RAM arena and move the experts\n"
                  "                       no GPU holds out of the slow places, into the GPU-resident ones' (RAM with\n"
                  "                       slower regions, as unpaired DIMMs make; ~2-4 s).  Off by default\n"
@@ -968,10 +976,13 @@ static std::vector<std::array<int32_t, 3>> refill_plan(const SlotLoan& loan, con
 struct PromptBuffers {
     strata::prefill::Prefill* prefill = nullptr;
     strata::prefill::ExpertRunner* offload = nullptr;   // the second GPU's share, or null
+    strata::prefill::PromptSplit* split = nullptr;      // --prompt-split, or null
     const strata::core::ModelGeometry* g = nullptr;
     const strata::core::SessionState* ss = nullptr;
     SlotLoan loan, loan2;   // each GPU's cache (a null cache lends nothing)
     bool lend = false, lend2 = false;
+    void* split_region = nullptr;   // take's region of the second GPU's loan for the split (null: none this prompt)
+    uint64_t split_bytes = 0;
 
     /// After the prompt path and its second GPU's runner have been initialized.
     bool init(int64_t max_chunk, bool borrow, std::string& err) {
@@ -982,20 +993,29 @@ struct PromptBuffers {
         return (lend || prefill->bind(nullptr, 0, max_chunk, err)) &&
                (offload == nullptr || lend2 || offload->bind(nullptr, 0, max_chunk, err));
     }
-    /// Before a prompt whose chunks hold up to `chunk` tokens.
-    bool take(int64_t chunk, std::string& err) {
+    /// Before a prompt whose chunks hold up to `chunk` tokens; `split_need`: the split's bytes on the second GPU too
+    /// (PromptSplit::bytes_for), which `split_region` then holds when its cache could lend them.
+    bool take(int64_t chunk, std::string& err, uint64_t split_need = 0) {
         // sized before either loan, from the residency both GPUs' prefetch areas are sized for
         const uint64_t need = lend ? prefill->bytes_for(chunk) : 0;
         const uint64_t need2 = lend2 ? offload->bytes_for(chunk, loan.res ? loan.res->data() : nullptr) : 0;
+        split_region = nullptr;
+        split_bytes = 0;
         if (lend) {
             loan.plan(need);
             loan.lend();
             if (!prefill->bind(loan.base(), loan.bytes(), chunk, err)) return false;
         }
         if (lend2) {
-            loan2.plan(need2);
+            const uint64_t r2 = (need2 + 255) & ~255ull;
+            const bool with_split = split_need > 0 && loan2.plan(r2 + split_need);
+            if (!with_split) loan2.plan(need2);
             loan2.lend();
-            if (!offload->bind(loan2.base(), loan2.bytes(), chunk, err)) return false;
+            if (!offload->bind(loan2.base(), with_split ? r2 : loan2.bytes(), chunk, err)) return false;
+            if (with_split) {
+                split_region = (uint8_t*) loan2.base() + r2;
+                split_bytes = loan2.bytes() - r2;
+            }
         }
         return true;
     }
@@ -1067,7 +1087,7 @@ int main(int argc, char** argv) {
                 o.expert_profile_save = next("--expert-profile-save");
                 continue;
             }
-            double* knob = a == "--prompt-shift" ? &o.prompt_shift
+            double* knob = a == "--prompt-shift" ? &o.prompt_shift : a == "--prompt-split" ? &o.prompt_split
                          : a == "--expert-profile-save-every" ? &o.expert_profile_save_min
                          : a == "--rope-scale" ? &o.rope_scale : a == "--rope-freq-base" ? &o.rope_freq_base
                          : a == "--rope-freq-scale" ? &o.rope_freq_scale : a == "--yarn-orig-ctx" ? &o.yarn_orig_ctx
@@ -3093,7 +3113,7 @@ int main(int argc, char** argv) {
 
     // ---- the batched prompt path, and the second GPU's share of its experts (not --no-prompt-offload)
     auto setup_prompt_path = [&](strata::prefill::Prefill& prefill, strata::prefill::ExpertRunner& offload,
-                                 PromptBuffers& pbuf, std::string& e) -> bool {
+                                 PromptBuffers& pbuf, strata::prefill::PromptSplit& split, std::string& e) -> bool {
         const bool off = o.second_gpu >= 0 && !o.no_prompt_offload;
         // a cache too small to lend the buffers would make them allocate on top of a card the cache filled to its
         // reserve, which then pages: the chunk halves until they fit in the lendable slots (it only reads slower)
@@ -3128,6 +3148,7 @@ int main(int argc, char** argv) {
             for (size_t l = 0; l < (size_t) g.n_layers; ++l)
                 for (size_t x = 0; x < ne; ++x)
                     if (!seen[l * ne + x]) order[l * ne + at[l]++] = (int32_t) x;
+            split.set_order(order);
             prefill.set_order(std::move(order));
         }
         if (off) {   // --prompt-shift (without a profile the order is by id)
@@ -3136,6 +3157,22 @@ int main(int argc, char** argv) {
         }
         pbuf.prefill = &prefill;
         pbuf.offload = off ? &offload : nullptr;
+        // --prompt-split: the second GPU's stage (without its pinned buffers, no split)
+        if (off && o.prompt_split > 0) {
+            const auto ts = Clock::now();
+            std::string se;
+            if (split.init(prefill, wt, g, ss, o.mtp.empty() ? nullptr : &mtp, (int64_t) o.prompt_split, o.second_gpu,
+                           o.main_gpu, srcp, &gpu2.cache(), host_res2.empty() ? nullptr : host_res2.data(),
+                           o.prefill_chunk, se)) {
+                pbuf.split = &split;
+                std::fprintf(stderr, "strata generate: --prompt-split: the second GPU runs layers %lld-%lld of a prompt's "
+                                     "chunks, their %.0f MiB of weights copied from this GPU at each prompt (%.0f ms)\n",
+                             (long long) split.at(), (long long) g.n_layers - 1, (double) split.weight_bytes / 1048576.0,
+                             std::chrono::duration<double, std::milli>(Clock::now() - ts).count());
+            } else {
+                std::fprintf(stderr, "strata generate: --prompt-split off: %s\n", se.c_str());
+            }
+        }
         pbuf.g = &g;
         pbuf.ss = &ss;
         if (d_res != nullptr) {
@@ -3242,8 +3279,9 @@ int main(int argc, char** argv) {
         }
         strata::prefill::Prefill prefill;
         strata::prefill::ExpertRunner offload;
+        strata::prefill::PromptSplit psplit;   // (its second stage refers to the first: destroyed before it)
         PromptBuffers pbuf;
-        if (!setup_prompt_path(prefill, offload, pbuf, err)) {
+        if (!setup_prompt_path(prefill, offload, pbuf, psplit, err)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
@@ -4058,7 +4096,19 @@ int main(int argc, char** argv) {
             if (batched_end > reuse) {
                 tier.apply_pending(true);   // no copy may still land in a lent slot
                 tier2.apply_pending(true);
-                if (!pbuf.take(std::min(o.prefill_chunk, batched_end - reuse), err)) { report(err); return 1; }
+                // --prompt-split: a prompt of more than one chunk, when the second GPU can lend the split's bytes
+                const int64_t chunk = std::min(o.prefill_chunk, batched_end - reuse);
+                const bool split_try = pbuf.split != nullptr && batched_end - reuse > o.prefill_chunk;
+                if (!pbuf.take(chunk, err, split_try ? psplit.bytes_for(chunk, batched_end) : 0)) { report(err); return 1; }
+                const bool split_on = pbuf.split_region != nullptr;
+                if (split_on) {
+                    if (!psplit.begin(pbuf.split_region, pbuf.split_bytes, chunk, reuse, batched_end, track, err)) {
+                        report(err);
+                        return 1;
+                    }
+                    pcache.split_from = psplit.at();
+                    pcache.split_save = [&psplit](int64_t pos, void* host) { psplit.checkpoint(pos, host); };
+                }
                 prefill.clear_routed();
                 if (kvg.on && pbuf.lend && pbuf.loan.first >= 0 && pbuf.loan.first < kvg.top && kvg.lo < kvg.top) {
                     report("the prompt path's loan reached the slots the elastic K/V took (a bug: --no-kv-grow)");
@@ -4083,7 +4133,14 @@ int main(int argc, char** argv) {
                         pcache.set(a0, ids.data() + a0, b0 - a0);
                         pcache.checkpoint(b0);
                     }
+                    if (split_on) psplit.ran(b0);
                     a0 = b0;
+                }
+                if (split_on) {   // the second stage's last chunk, and its layers' state back in the session
+                    pcache.split_from = 0;
+                    pcache.split_save = nullptr;
+                    if (!psplit.finish(err)) { report(err); return 1; }
+                    tr("prompt split done");
                 }
                 // the tiers' moves (deterministic modes: refilled before the windows, as they were)
                 const bool through_tiers = o.adapt_every > 0 && !o.deterministic_adapt;
@@ -4348,13 +4405,16 @@ int main(int argc, char** argv) {
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
     strata::prefill::Prefill prefill;
     strata::prefill::ExpertRunner offload;
+    strata::prefill::PromptSplit psplit;   // (its second stage refers to the first: destroyed before it)
     PromptBuffers pbuf;
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
-        if (!setup_prompt_path(prefill, offload, pbuf, err) || !pbuf.take(std::min(o.prefill_chunk, n_batched), err)) {
+        const int64_t chunk = std::min(o.prefill_chunk, n_batched);
+        if (!setup_prompt_path(prefill, offload, pbuf, psplit, err) ||
+            !pbuf.take(chunk, err, pbuf.split != nullptr && n_batched > o.prefill_chunk ? psplit.bytes_for(chunk, n_batched) : 0)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -4372,10 +4432,21 @@ int main(int argc, char** argv) {
             prefill.draft = &mtp;   // cell i pairs R_i with the token at i + 1 (every such token is in the prompt)
         }
         prefill.profile = o.prefill_profile;
+        const bool split_on = pbuf.split_region != nullptr;
+        psplit.set_profile(o.prefill_profile);
         const Clock::time_point tp0 = Clock::now();
-        if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
+        // STRATA_PREFILL_CUT=n (tests): the prompt in two runs split at position n, as a follow-up turn continues a
+        // cached prefix (the split's second stage copies that prefix's state in)
+        const char* cut_env = std::getenv("STRATA_PREFILL_CUT");
+        const int64_t cut = cut_env != nullptr ? std::min<int64_t>(std::max<int64_t>(std::atoll(cut_env), 0), n_batched) : 0;
+        for (int64_t a = 0; a < n_batched;) {
+            const int64_t b = a < cut ? cut : n_batched;
+            if ((split_on && !psplit.begin(pbuf.split_region, pbuf.split_bytes, chunk, a, n_batched, false, err)) ||
+                !prefill.run(o.tokens.data() + a, b - a, a, err) || (split_on && !psplit.finish(err))) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            a = b;
         }
         // refill the lent slots from the arena and give them back to the decode tiers
         const size_t n_lent[2] = {pbuf.loan.lent.size(), pbuf.loan2.lent.size()};
@@ -4408,12 +4479,24 @@ int main(int argc, char** argv) {
                                  "resident %lld; %.1f ms queuing, %.1f ms GPU\n", (long long) offload.experts_streamed,
                          (long long) offload.experts_prefetched, (long long) offload.experts_resident, offload.ms_host,
                          offload.ms_gpu);
+        if (split_on) {
+            const strata::prefill::PrefillStats& s2 = psplit.stats();
+            std::fprintf(stderr, "strata generate: prefill split at layer %lld: the second stage %.1f ms (its experts "
+                                 "streamed %lld (%lld ahead), resident %lld, host %.1f ms), the first waited %.1f ms to "
+                                 "hand a chunk on, the end %.1f ms, the state's copy in %.1f ms\n",
+                         (long long) psplit.at(), s2.ms_total, (long long) s2.experts_streamed,
+                         (long long) s2.experts_prefetched, (long long) s2.experts_resident, s2.ms_experts_host,
+                         psplit.ms_first_waited, psplit.ms_finish, psplit.ms_copy_in);
+        }
         if (o.prefill_profile) {
-            std::fprintf(stderr, "strata generate: prefill GPU ms by section:");
-            for (int i = 0; i < strata::prefill::kPsCount; ++i)
-                std::fprintf(stderr, "%s %s %.0f", i ? ";" : "", strata::prefill::prefill_section_name(i),
-                             ps.ms_section[i]);
-            std::fprintf(stderr, "\n");
+            for (int st = 0; st < (split_on ? 2 : 1); ++st) {
+                const strata::prefill::PrefillStats& px = st == 0 ? ps : psplit.stats();
+                std::fprintf(stderr, "strata generate: prefill GPU ms by section%s:", st == 0 ? "" : " (the second stage)");
+                for (int i = 0; i < strata::prefill::kPsCount; ++i)
+                    std::fprintf(stderr, "%s %s %.0f", i ? ";" : "", strata::prefill::prefill_section_name(i),
+                                 px.ms_section[i]);
+                std::fprintf(stderr, "\n");
+            }
         }
     }
 

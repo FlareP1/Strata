@@ -611,6 +611,12 @@ MtpPromptKv MtpDrafter::prompt_kv() {
     return k;
 }
 
+uint64_t MtpDrafter::tensor_bytes(const void* p) const {
+    for (const auto& t : tensors_)
+        if (dense_ + t.off == (const uint8_t*) p) return t.bytes;
+    return 0;
+}
+
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, float min_p, int* n_drafts) {
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }

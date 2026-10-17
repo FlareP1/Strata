@@ -47,6 +47,11 @@ public:
     /// The elastic K/V (--kv-grow): called before any copy of `cells` K/V cells to or from the device (a stashed
     /// sequence's restore, the live one's stash), so the pools can grow to hold them first.  false: no room.
     std::function<bool(int64_t cells)> ensure_kv;
+    /// Item bf, while a split prompt path runs (prefill/split.hpp): a checkpoint saves the layers below `split_from`
+    /// itself and hands its buffer to `split_save`, whose stage writes the rest once that chunk is through it (the
+    /// prompt's end waits for that).  0: not split.
+    int64_t split_from = 0;
+    std::function<void(int64_t pos, void* host)> split_save;
     /// Cells the live sequence holds (a later stash reads all of them).
     int64_t live_cells() const { return (int64_t) live_.tokens.size(); }
     uint64_t ckpt_bytes() const { return ckpt_bytes_; }

@@ -818,6 +818,67 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
         cudaMemsetAsync(st.idx_pooled, 0, (size_t) ((st.max_cells / s.idx_block) + 2) * s.idx_dim * 4, cs);
     }
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);    cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);}
+
+uint64_t qsa_kv_cell_bytes(const ModelGeometry& g, KvFormat kv) {
+    uint64_t n = 0;
+    for (const uint64_t b : kv_row_bytes(kv, (uint64_t) g.head_dim)) n += b;
+    return n * (uint64_t) g.n_head_kv;
+}
+
+uint64_t qsa_state_prompt_bytes(const ModelGeometry& g, int64_t max_cells, int64_t first_page, bool indexer,
+                                KvFormat kv) {
+    const QsaShapes s = qsa_shapes(g);
+    const int64_t pages = (max_cells + s.page_size - 1) / s.page_size, held = std::max<int64_t>(pages - first_page, 1);
+    uint64_t n = 0;
+    for (const uint64_t b : kv_row_bytes(kv, (uint64_t) s.head_dim))
+        n += align_up16((uint64_t) held * s.n_head_kv * s.page_size * b);
+    n += align_up16((uint64_t) pages * 4);
+    if (indexer)
+        n += align_up16((uint64_t) (s.idx_block - 1) * s.idx_dim * 4) + align_up16((uint64_t) s.idx_dim * 4) +
+             align_up16((uint64_t) ((max_cells / s.idx_block) + 2) * s.idx_dim * 4) + 16;
+    return n;
+}
+
+uint64_t qsa_state_prompt_init(const ModelGeometry& g, int64_t max_cells, int64_t first_page, bool indexer, KvFormat kv,
+                               void* base, QsaState& st, void* stream) {
+    const QsaShapes s = qsa_shapes(g);
+    const int64_t pages = (max_cells + s.page_size - 1) / s.page_size, held = std::max<int64_t>(pages - first_page, 1);
+    cudaStream_t cs = (cudaStream_t) stream;
+    Cursor c{(uint8_t*) base};
+    st = QsaState{};
+    st.kv = kv;
+    st.kv_int8 = kv == KvFormat::Int8;
+    std::vector<uint8_t*> a;
+    for (const uint64_t b : kv_row_bytes(kv, (uint64_t) s.head_dim)) {
+        const uint64_t bytes = (uint64_t) held * s.n_head_kv * s.page_size * b;
+        a.push_back(c.take_bytes(bytes));
+        cudaMemsetAsync(a.back(), 0, (size_t) bytes, cs);
+    }
+    switch (kv) {
+    case KvFormat::Int8: st.k_q = (int8_t*) a[0]; st.v_q = (int8_t*) a[1]; st.k_scale = (uint16_t*) a[2]; st.v_scale = (uint16_t*) a[3]; break;
+    case KvFormat::Q4: st.k_q4 = a[0]; st.v_q4 = a[1]; st.k_q4s = (uint16_t*) a[2]; st.v_q4s = (uint16_t*) a[3]; break;
+    case KvFormat::K8V4: st.k_q = (int8_t*) a[0]; st.k_scale = (uint16_t*) a[1]; st.v_q4 = a[2]; st.v_q4s = (uint16_t*) a[3]; break;
+    default: st.k_pool = (uint16_t*) a[0]; st.v_pool = (uint16_t*) a[1];
+    }
+    st.page_table = c.take<int32_t>((uint64_t) pages);
+    st.n_pages = held;
+    st.max_cells = max_cells;
+    if (indexer) {
+        st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
+        st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
+        st.idx_pooled = c.take<float>((uint64_t) ((max_cells / s.idx_block) + 2) * s.idx_dim);
+        st.idx_block_pos = c.take<int32_t>(1);
+        cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
+        cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
+        cudaMemsetAsync(st.idx_pooled, 0, (size_t) ((max_cells / s.idx_block) + 2) * s.idx_dim * 4, cs);
+        cudaMemsetAsync(st.idx_block_pos, 0, 4, cs);
+    }
+    std::vector<int32_t> tab((size_t) pages);
+    for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) std::max<int64_t>(i - first_page, 0);
+    if (cudaMemcpy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    return c.used;
+}
+
 uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    uint64_t n = 0;    n += (uint64_t) q8k_bytes(g.n_embd);    n += (uint64_t) (g.n_embd / 32) * 34;
 // block_q8_0
 n += (uint64_t) g.n_embd * 2;    n += (uint64_t) g.n_head * 2 * g.head_dim * 4;    n += (uint64_t) g.n_head * g.head_dim * 4;    n += (uint64_t) g.n_head_kv * g.head_dim * 4 * 2;    n += (uint64_t) g.idx_key_dim * 4;    n += (uint64_t) g.idx_q_heads * g.idx_key_dim * 4;    n += (uint64_t) max_cells * 4;    n += (uint64_t) cap * 4;    n += (uint64_t) cap * g.n_head_kv * g.head_dim * 2 * 2;    n += (uint64_t) g.n_head * g.head_dim * 4;

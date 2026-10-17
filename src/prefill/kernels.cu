@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -862,14 +863,16 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 }
 void gdn_scan(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T, void* stream) {
     if (T <= 0) return;
-    static const bool smem_set = [] {   // 97 KB
-        return cudaFuncSetAttribute(gdn_chunk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, GDN_SMEM) ==
-               cudaSuccess;
-    }();
-    if (!smem_set) {
+    static std::atomic<bool> smem_set[64] = {};   // 97 KB, opted in on each device (a split prompt path runs on two)
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64 || (!smem_set[dev].load() && cudaFuncSetAttribute(gdn_chunk_kernel,
+                                                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                                                GDN_SMEM) != cudaSuccess)) {
         std::fprintf(stderr, "gdn_scan: the kernel's shared memory\n");
         std::exit(1);
     }
+    smem_set[dev].store(true);
     gdn_chunk_kernel<<<dim3(HK, S / GCW), GWALK + GPREP + GLOAD, GDN_SMEM, (cudaStream_t) stream>>>(state, h, gate, beta,
                                                                                                    y, (int) T);
     check("gdn_scan");

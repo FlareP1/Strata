@@ -73,6 +73,8 @@ struct SessionState {
     PleRun ple;
 };
 
+/// The floats of one GDN layer's state, its recurrence and conv history (`gdn_state` holds one per GDN layer).
+uint64_t gdn_state_floats(const ModelGeometry& g);
 /// Bytes for a whole session at `max_cells` of context.  Every layer's state is sized at once, because P2.T10
 /// requires ZERO token-path allocations - a `cudaMalloc` that happened on the first token of a longer sequence
 /// would satisfy every test here and fail that one.
@@ -96,6 +98,11 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
 uint64_t session_ckpt_bytes(const ModelGeometry& g);
 /// Copies the sequence state at `pos` (positions [0, pos) processed) into `host`; synchronous.
 bool session_ckpt_save(const SessionState& s, const ModelGeometry& g, int64_t pos, void* host, void* stream);
+/// The same for the layers [lo, hi) only (the PLE's with layer 1, the token window with lo == 0), from a state whose
+/// GDN and QSA states are indexed from layer `first` (a split prompt path's second stage: prefill/split.hpp; the
+/// other stage saves the rest of the same buffer).
+bool session_ckpt_save_layers(const SessionState& s, const ModelGeometry& g, int64_t pos, void* host, void* stream,
+                              int64_t lo, int64_t hi, int64_t first);
 /// The inverse: the session continues at `pos`.  The K/V cells [0, pos) must still hold the same prefix.
 bool session_ckpt_load(SessionState& s, const ModelGeometry& g, int64_t pos, const void* host, void* stream);
 

@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -50,9 +51,13 @@ public:
     /// they are now: at most what the chunk's dense steps leave time to copy ahead (area_cap), at most prefetch_need.
     /// A larger area lends more cache slots, refilled after the prompt.
     uint64_t prefetch_area(int64_t chunk, const int32_t* skip) const;
-    /// ~0.3 MB a token on a second GPU (its link takes ~50 GB/s while the main GPU spends ~5.6 us a token on a
-    /// layer's dense steps and the transfers of its input and sums), ~0.03 MB on the main GPU (its x4 link, ~6 GB/s).
-    static uint64_t area_cap(int64_t chunk, bool remote);
+    /// ~0.3 MB a token on a GPU with an x16 link (`fast`: a second GPU, or set_fast_link; its link takes ~50 GB/s
+    /// while the main GPU spends ~5.6 us a token on a layer's dense steps and the transfers of its input and sums),
+    /// ~0.03 MB on the main GPU (its x4 link, ~6 GB/s).
+    static uint64_t area_cap(int64_t chunk, bool fast);
+    /// A local runner on a GPU with an x16 link (the split prompt path's second stage, prefill/split.hpp): its copies
+    /// ahead go in pieces as a second GPU's do, into an area sized as a second GPU's.  Before init.
+    void set_fast_link(bool on);
     /// The buffers for chunks of up to `chunk` tokens, carved from `region` (`bytes` long, e.g. lent cache slots), or
     /// with a null region allocated for `max_chunk` tokens (once).  Before the first layer of every prompt that
     /// uses a region.  `area`: device memory for the prefetched blobs; null: what the region has left.
@@ -101,6 +106,8 @@ public:
                    const std::vector<int32_t>& off, const std::vector<int32_t>& src, const std::vector<float>& w,
                    int64_t piece, const uint16_t* input, float* sum, std::string& err);
     cudaEvent_t piece_done(int64_t k) const;
+    /// Called after each batch's work is queued (Prefill::set_pacing; false: stop, the caller's error), or null.
+    void set_pace(std::function<bool()> f);
 
     int64_t experts_resident = 0;   ///< expert-layer groups served from its cache
     int64_t experts_streamed = 0;   ///< expert blobs copied from the arena

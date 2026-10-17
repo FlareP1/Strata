@@ -1625,6 +1625,26 @@ thinking / after a 16K prompt / an edit quoting its prompt):
   and more the second GPU then also computes the likeliest F (0..1) of each layer's experts the first holds, copied
   ahead with the ones it streams (shorter chunks: the copies cost more than they save, +3.3% time at 2K tokens). IQ3_S
   with 0.2: prompts of 16K +2.1%, 64K +2.0%; UD-Q4_K_XL at 0.15 even. This fork's IQ3_S config sets 0.2.
+- **`--prompt-split L`: a prompt of more than one chunk in two stages, one on each GPU.** With `--second-gpu`, the
+  second GPU runs each chunk's layers L.. whole (their dense steps and every expert: its own, the rest streamed over
+  its link) while the first runs the next chunk through layers 0..L-1, the experts it lacks still on the second (at a
+  higher stream priority). A chunk's residual crosses once (FP32, through pinned memory); the second GPU works on
+  copies of its layers' weights and session state (K/V cells, indexers, GDN states, and the draft layer's cells of
+  the chunk) in cache slots it lends for the prompt, the state at the prompt's start copied in from the first GPU
+  and each chunk's new cells sent back; prompt-cache checkpoints are saved by both. Its GPU queue is kept short
+  (under WDDM, work queued after a long queue waits for all of it, the first stage's too) and its copies go out only
+  once they can run (its one copy engine holds every later copy behind a waiting one). An RTX 5070 Ti runs a 16K
+  chunk's dense steps 1.44x as fast as an RTX 3090 here (2.6 against 3.7 s), so a layer of the chunk takes it about
+  as long whole as the 3090 with help. Split at layer 26, through the API with the prompt cache off (two servers
+  each way): IQ3_S prompts of 32K / 64K / 128K tokens 3,130 / 3,320 / 3,240 -> 3,880 / 4,740 / 5,030 t/s (1.24 /
+  1.43 / 1.55x), UD-Q4_K_XL 3,170 / 3,410 / 3,330 -> 3,590 / 4,420 / 4,780 (1.13 / 1.30 / 1.43x); layers 24 and 28
+  within 3%. The answers after them as fast for IQ3_S, 2-5% slower over 400 tokens for UD-Q4_K_XL (its larger loan
+  refills while the first windows run). Shorter prompts are not split. Costs: 0.7 GiB more pinned RAM (a chunk's
+  residual and a staging buffer), ~0.3 GiB of the second GPU's VRAM outside its cache, and during a split prompt
+  6-8 GiB of its cache lent (64K-128K tokens: IQ3_S 6.0-6.3 GiB, UD-Q4_K_XL 7.7-8.1). The second GPU's kernels and its FP32 expert sums (its shares
+  of the first GPU's layers return FP16) round otherwise: after a 131K-token prompt, along llama.cpp's text, KL
+  against llama.cpp 3.0e-3 split and 4.1e-3 not (5 of 300 argmaxes moved, all near-ties); the same prompt read in
+  two requests gives the same logits as in one. This fork's configs leave it off.
 - **`STRATA_POOL_FUSED=1`: a native layer's gate/up and down rows in one CPU pool phase** (an expert's down rows start
   once its own hidden row is quantized, no barrier between the halves; the same bytes). IQ3_S -0.8 / -0.5 / -0.3 / -0.7%,
   UD-Q4_K_XL +2.2 / -0.2 / +0.6 / 0.0%.

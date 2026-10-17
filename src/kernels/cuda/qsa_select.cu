@@ -530,12 +530,18 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     if (nq >= kBatchMinQueries) {
         // one block an SM (the prompt path's GPU), each with the same share of the units
         constexpr int smem = (BATCH_TILE * IDX_DIM + BATCH_QC * QD) * (int) sizeof(float);
-        static int sms = 0;
-        if (sms == 0) {
-            int dev = 0;
-            cudaGetDevice(&dev);
-            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-            cudaFuncSetAttribute(batch_scores_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        static std::mutex mu;
+        static std::unordered_map<int, int> sms_of;   // per device (a split prompt path runs this on two)
+        int dev = 0, sms = 0;
+        cudaGetDevice(&dev);
+        {
+            const std::lock_guard<std::mutex> lock(mu);
+            int& n = sms_of[dev];
+            if (n == 0) {
+                cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+                cudaFuncSetAttribute(batch_scores_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            }
+            sms = n;
         }
         const int64_t units = ((covered + BATCH_TILE - 1) / BATCH_TILE) * ((nq + BATCH_QC - 1) / BATCH_QC);
         const unsigned grid = (unsigned) (units < sms ? units : sms);

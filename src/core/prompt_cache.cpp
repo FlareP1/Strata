@@ -267,10 +267,13 @@ void PromptCache::checkpoint(int64_t pos) {
     void* h = take_buffer();
     if (h == nullptr) return;
     cudaDeviceSynchronize();
-    if (!session_ckpt_save(ss_, g_, pos, h, stream_)) {
+    const bool split = split_from > 0 && split_save;
+    if (!(split ? session_ckpt_save_layers(ss_, g_, pos, h, stream_, 0, split_from, 0)
+                : session_ckpt_save(ss_, g_, pos, h, stream_))) {
         free_.push_back(h);
         return;
     }
+    if (split) split_save(pos, h);
     live_.ckpts.push_back({pos, h, ++clock_});
 }
 

@@ -79,6 +79,8 @@ size_t up_bytes(int64_t chunk, int64_t n_expert) {
 struct ExpertRunner::Impl {
     int dev = -1, main = 0;
     bool remote = false, streams = false;
+    bool fast = false;            // its GPU's link to the arena is x16 (remote, or set_fast_link): pieces, the larger area
+    std::function<bool()> pace;   // set_pace
     double shift = 0.0;   // set_shift
     core::ExpertSource* src = nullptr;
     const core::ExpertCache* cache = nullptr;
@@ -197,7 +199,8 @@ bool ExpertRunner::init(int device, int main_device, void* stream, core::ExpertS
     m.main = main_device;
     m.remote = stream == nullptr;
     m.streams = streams;
-    m.piece_bytes = m.remote ? PIECE_REMOTE : PIECE_LOCAL;
+    m.fast = m.fast || m.remote;
+    m.piece_bytes = m.fast ? PIECE_REMOTE : PIECE_LOCAL;
     m.src = src;
     m.cache = cache;
     m.res = res;
@@ -211,7 +214,11 @@ bool ExpertRunner::init(int device, int main_device, void* stream, core::ExpertS
     for (int i = 0; ok && i < 2; ++i)
         ok = cudaEventCreateWithFlags(&m.up_done[i], cudaEventDisableTiming) == cudaSuccess &&
              cudaHostAlloc((void**) &m.h_up[i], up_bytes(max_chunk, n_expert), cudaHostAllocDefault) == cudaSuccess;
-    if (m.remote) ok = ok && cudaStreamCreateWithFlags(&m.s, cudaStreamNonBlocking) == cudaSuccess;
+    // a remote runner's work is on the main GPU's path: its kernels go first on a GPU that runs another stage too
+    // (prefill/split.hpp)
+    int least = 0, greatest = 0;
+    cudaDeviceGetStreamPriorityRange(&least, &greatest);
+    if (m.remote) ok = ok && cudaStreamCreateWithPriority(&m.s, cudaStreamNonBlocking, greatest) == cudaSuccess;
     else m.s = (cudaStream_t) stream;
     if (streams) {
         ok = ok && cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) == cudaSuccess;
@@ -283,14 +290,14 @@ uint64_t ExpertRunner::bytes_for(int64_t chunk, const int32_t* skip) const {
     return bytes_needed(chunk, m.n_expert, m.remote, m.streams) + prefetch_area(chunk, skip);
 }
 
-uint64_t ExpertRunner::area_cap(int64_t chunk, bool remote) {
-    return (uint64_t) chunk * (remote ? 300000ull : 30000ull);
+uint64_t ExpertRunner::area_cap(int64_t chunk, bool fast) {
+    return (uint64_t) chunk * (fast ? 300000ull : 30000ull);
 }
 
 uint64_t ExpertRunner::prefetch_area(int64_t chunk, const int32_t* skip) const {
     const Impl& m = *impl_;
     const double shift = chunk >= kShiftMinTokens ? m.shift : 0.0;
-    return std::min(prefetch_need(m.res, skip, m.n_expert, m.streams, shift), area_cap(chunk, m.remote));
+    return std::min(prefetch_need(m.res, skip, m.n_expert, m.streams, shift), area_cap(chunk, m.fast));
 }
 
 uint64_t ExpertRunner::prefetch_need(const int32_t* skip) const {
@@ -299,6 +306,8 @@ uint64_t ExpertRunner::prefetch_need(const int32_t* skip) const {
 }
 
 void ExpertRunner::set_shift(double fraction) { impl_->shift = std::min(1.0, std::max(0.0, fraction)); }
+void ExpertRunner::set_fast_link(bool on) { impl_->fast = on; }
+void ExpertRunner::set_pace(std::function<bool()> f) { impl_->pace = std::move(f); }
 
 uint64_t ExpertRunner::prefetch_need(const int32_t* res, const int32_t* skip, int64_t n_expert, bool streams,
                                      double shift) {
@@ -330,12 +339,12 @@ bool ExpertRunner::prefetch_begin(int64_t layer, int64_t chunk, const std::vecto
     if (m.pre_cap == 0) return true;
     std::fill(m.pre_off.begin(), m.pre_off.end(), -1);
     m.pre_layer = layer;
-    m.pre_end = std::min(m.pre_cap, area_cap(chunk, m.remote));
+    m.pre_end = std::min(m.pre_cap, area_cap(chunk, m.fast));
     const int32_t* res = m.res && m.cache ? m.res + (size_t) layer * (size_t) m.n_expert : nullptr;
     for (int32_t e : experts)
         if (!(res && res[e] >= 0)) m.pre_list.push_back(e);
     m.pre_gate = m.pre_live;
-    if (m.remote) return true;
+    if (m.fast) return true;   // in pieces while the prompt path waits for the GPU (prefetch_next)
     const auto& lay = strata::kernels::cpu::expert_layout();
     const uint64_t stride = ((uint64_t) lay.blob_bytes(layer) + 255) & ~255ull;
     m.pre_list.resize(std::min<size_t>(m.pre_list.size(), (size_t) (m.pre_end / stride)));
@@ -369,7 +378,15 @@ bool ExpertRunner::prefetch_next(std::string& err) {
     const size_t bb = (size_t) lay.blob_bytes(layer);
     const size_t stride = (bb + 255) & ~(size_t) 255;
     if (m.pre_gate) {   // the previous layer's batches have read the area
-        cudaStreamWaitEvent(m.copy, m.pre_used, 0);
+        // pieces go out once they have: a copy queued behind a wait holds up every copy queued after it on this GPU's
+        // copy engine (another stage's too, prefill/split.hpp); the main GPU's, all queued at once, wait there
+        if (m.fast) {
+            const cudaError_t q = cudaEventQuery(m.pre_used);
+            if (q == cudaErrorNotReady) return true;
+            if (q != cudaSuccess) { err = std::string("prompt experts: ") + cudaGetErrorString(q); return false; }
+        } else {
+            cudaStreamWaitEvent(m.copy, m.pre_used, 0);
+        }
         m.pre_gate = false;
     }
     std::vector<void*> dst;
@@ -578,6 +595,7 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, int64_t t_begin, int64_t 
     if (!batches.empty()) has_stream[0] = stage_batch(0);
     auto** dp = (const uint16_t**) m.ptrs;   // device arrays by index
     for (size_t b = 0; b < batches.size(); ++b) {
+        if (b > 0 && m.pace && !m.pace()) { err = "prompt experts: " + err; return false; }   // set_pace
         if (b + 1 < batches.size()) has_stream[b + 1] = stage_batch(b + 1);   // the next batch copies meanwhile
         const auto [j0, j1] = batches[b];
         const int n = (int) (j1 - j0);

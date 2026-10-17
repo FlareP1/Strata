@@ -49,6 +49,20 @@ struct PrefillStats {
     double ms_section[kPsCount] = {};   ///< GPU ms per section, with `Prefill::profile`
 };
 
+/// The first stage's side of a split prompt path (Prefill::set_layers, strata/prefill/split.hpp): where a chunk's
+/// residual after the stage's last layer goes.
+struct SplitOut {
+    virtual ~SplitOut() = default;
+    /// Before a chunk's residual goes out: pinned host memory for it ([T, hc * n_embd] floats), once the second
+    /// stage has read the previous chunk's out of it (waited for on the host; null: an error).
+    virtual float* out_begin(std::string& err) = 0;
+    /// The chunk's residual is on its way: piece k (the sub-chunk of `piece` tokens) lands at `landed[k]`.  `tokens`:
+    /// the chunk's and the one after it (the draft layer's), alive until the second stage is done; `run_end`: the
+    /// chunk ends the run() call (the prompt cache may checkpoint after it).
+    virtual bool out_end(const int64_t* tokens, int64_t T, int64_t pos0, const cudaEvent_t* landed, int64_t piece,
+                         bool run_end, std::string& err) = 0;
+};
+
 class Prefill {
 public:
     Prefill();
@@ -92,6 +106,26 @@ public:
     /// expert.
     const std::vector<uint32_t>& routed() const;
     void clear_routed();
+    /// Adds another instance's counts (the second stage's layers).
+    void add_routed(const std::vector<uint32_t>& counts);
+
+    /// Item bf, the prompt path in two stages on two GPUs (strata/prefill/split.hpp): this instance runs layers
+    /// [first, last) only.  first > 0: no embedding and no PLE block; a chunk's residual reaches the buffers' R
+    /// (`residual()`) a sub-chunk at a time, each piece before the event `set_in_events` names for it; the session
+    /// state holds the layers from `first` on (its QSA states and GDN states indexed from there).  last < n_layers:
+    /// the residual after layer last - 1 goes to `out`, and the draft layer's K/V are the last stage's.
+    void set_layers(int64_t first, int64_t last, SplitOut* out);
+    /// Its own GPU's link to the arena is x16 (the second stage): ExpertRunner::set_fast_link.  Before init.
+    void set_fast_link(bool on);
+    /// A stage on a GPU that runs another stage's work too: at each section of a layer (and each batch of its experts)
+    /// the host waits until the GPU has reached the section `sections` back, so that a GPU queue of this stage's
+    /// work never holds the other's up for long (0: off).  Before init.
+    void set_pacing(int sections);
+    float* residual() const;
+    /// The second stage, before each run() of one chunk: piece k of its residual is in `residual()` at ev[k].
+    void set_in_events(const cudaEvent_t* ev, int64_t n);
+    /// The draft layer's weights and cells in place of `draft->prompt_kv()` (the second stage's copies), or null.
+    const core::MtpPromptKv* draft_kv = nullptr;
 
     /// The MTP draft layer (or null): after every chunk, its K/V over the chunk's cells in the chunk's batched
     /// arithmetic (cell t pairs the chunk's final residual at t with the token at t + 1).

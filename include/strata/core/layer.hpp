@@ -273,6 +273,15 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
 /// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
 /// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
+/// Item bf: a state for the batched prompt path on another GPU (prefill/split.hpp), carved from `base`: the K/V pools
+/// for cells [first_page * page_size, max_cells) (the page table maps logical page p >= first_page to p - first_page,
+/// the pages before it to the first), with `indexer` the indexer's tail, spare key, pooled keys (for all max_cells)
+/// and block position.  Never elastic, no rotary tables, no per-token staging; the pools and the indexer zeroed on
+/// `stream`.
+uint64_t qsa_state_prompt_bytes(const ModelGeometry& g, int64_t max_cells, int64_t first_page, bool indexer,
+                                KvFormat kv);
+uint64_t qsa_state_prompt_init(const ModelGeometry& g, int64_t max_cells, int64_t first_page, bool indexer, KvFormat kv,
+                               void* base, QsaState& st, void* stream);
 /// The attention kernels' view of the state's K/V pools (qsa_decode_attn.hpp).
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 /// Appends n_tok cells in the state's format (graph-capturable): token t's step record at step + t * step_stride,
@@ -286,6 +295,8 @@ struct KvArray {
     uint64_t row_bytes;
 };
 std::vector<KvArray> qsa_kv_arrays(const QsaState& st, const ModelGeometry& g);
+/// A cell's bytes in the K/V pools of format `kv` (every array, every KV head).
+uint64_t qsa_kv_cell_bytes(const ModelGeometry& g, KvFormat kv);
 
 /// THE ELASTIC K/V (--kv-grow; vmm.hpp; after Niko1221/Strata 0.1.40).  A state's K/V pools and its indexer's pooled
 /// keys get addresses for every cell of the context but physical memory only for the first `init_cells`, and so do the

@@ -16,6 +16,7 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
 from __future__ import annotations
 
 import bisect
+import codecs
 import json
 import pathlib
 import sys
@@ -375,12 +376,21 @@ class PromptEncoder:
     entry), so a second client does not evict the first.  `encode(..., store=False)` reads the kept prompts without
     writing one (a token count is not a conversation's turn).  The tokenizer needs `encode_marked` and
     `max_special_len`.
+
+    THE REPLY'S OWN IDS (`remember_reply`).  After a request the engine holds the prompt and the ids it generated,
+    which are not always what their text encodes to: the model can write a piece BPE would merge with its neighbour
+    (`())` `);` where `()));` is one token).  The next turn renders the reply's text again, and a fresh encode left
+    the engine's ids at the first such piece: the engine read the rest of the reply again from its last checkpoint
+    before it.  So a reply is kept as an entry whose cuts are its token boundaries, which need no margin (the ids
+    before the cut are the engine's own, the text after it is encoded afresh) as long as no special literal crosses
+    the cut.  The prompt then holds the reply's ids up to where its text differs: the only place prompt ids may
+    differ from a full encode, and they always decode to the prompt's text.
     """
 
     def __init__(self, tok, keep: int = 4):
         self.tok, self.keep = tok, keep
-        # (text, plain spans, ids, mark ends, mark counts)
-        self.entries: list[tuple[str, tuple, list[int], list[int], list[int]]] = []
+        # (text, plain spans, ids, mark ends, mark counts[, where a remembered reply starts in the text])
+        self.entries: list[tuple] = []
         self.lock = threading.Lock()
         self.last_reused = 0                            # characters taken from an earlier prompt (for tests)
 
@@ -393,6 +403,12 @@ class PromptEncoder:
         for e in entries:
             same = plain_agree_until(e[1], plain, common_prefix_len(e[0], text))
             k = bisect.bisect_right(e[3], same - margin) - 1   # the last boundary c with c <= same - margin
+            if len(e) > 5 and same >= e[5]:     # a reply's token boundaries: no margin, no literal across the cut
+                r = bisect.bisect_right(e[3], same) - 1
+                while r > k and e[3][r] >= e[5] and self._straddles(text, e[3][r]):
+                    r -= 1
+                if r > k and e[3][r] >= e[5]:
+                    k = r
             if k >= 0 and (src is None or e[3][k] > src[3][cut_k]):
                 src, cut_k = e, k
         if src is None:
@@ -415,6 +431,42 @@ class PromptEncoder:
         with self.lock:
             self.entries = [(text, plain, ids, ends, counts)] + [e for e in self.entries if e is not old][:self.keep - 1]
         return list(ids)
+
+    def _straddles(self, text: str, c: int) -> bool:
+        """A special literal starts before `c` and ends after it: a cut there would split it."""
+        p = text.find("<", max(0, c - self.tok.max_special_len + 1), c)
+        while p >= 0:
+            if any(len(s) > c - p and text.startswith(s, p) for s in getattr(self.tok, "special_tokens", ())):
+                return True
+            p = text.find("<", p + 1, c)
+        return False
+
+    def remember_reply(self, prompt_ids, gen_ids) -> bool:
+        """The engine holds `prompt_ids` (a prompt this encoder gave) and then `gen_ids`, the ids it generated: the
+        entry of that prompt becomes one of both, its cuts the reply's token boundaries where no character is split
+        (the class's note).  False: the prompt is not kept (or no reply)."""
+        if not self.keep or not gen_ids or not hasattr(self.tok, "token_bytes"):
+            return False
+        prompt_ids = [int(t) for t in prompt_ids]
+        with self.lock:
+            entries = self.entries
+        base = next((e for e in entries if e[2] == prompt_ids), None)
+        if base is None:
+            return False
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        chars, ends, counts, pieces = len(base[0]), list(base[3]), list(base[4]), []
+        for j, t in enumerate(gen_ids):
+            s = dec.decode(self.tok.token_bytes(int(t)))
+            pieces.append(s)
+            chars += len(s)
+            if not dec.getstate()[0]:                   # no character split across this boundary
+                ends.append(chars)
+                counts.append(len(prompt_ids) + j + 1)
+        text = base[0] + "".join(pieces)
+        entry = (text, base[1], prompt_ids + [int(t) for t in gen_ids], ends, counts, len(base[0]))
+        with self.lock:
+            self.entries = [entry] + [e for e in self.entries if e is not base and e[0] != text][:self.keep - 1]
+        return True
 
     def forget(self, ids: list[int]) -> None:
         """The prompt with these ids was refused: it is not kept."""

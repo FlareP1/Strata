@@ -5,18 +5,20 @@ are those of a full encode, and a turn reuses the previous one's.
 """
 from __future__ import annotations
 
+import json
 import random
 import re
 import sys
 import unittest
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import ByteTokenizer, MockEngine, Service  # noqa: E402
-from strata_tokenizer import PromptEncoder, plain_agree_until  # noqa: E402
+from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
+from strata_tokenizer import BYTE_TO_UNICODE, PromptEncoder, Tokenizer, plain_agree_until  # noqa: E402
 
 
 class ThinkTokenizer(ByteTokenizer):
@@ -156,6 +158,110 @@ class Served(unittest.TestCase):
                 reused += svc.prompts.last_reused > 0
                 msgs.append({"role": "assistant", "content": text()})
         self.assertGreater(reused, 1000)
+
+
+def bpe_tokenizer():
+    """A small BPE vocabulary ('ab', 'abc' and ' a' merge) with the chat specials: a reply the model wrote in pieces BPE
+    would merge decodes to text whose fresh encoding differs from the engine's ids."""
+    sp = BYTE_TO_UNICODE[32]
+    tokens = list(BYTE_TO_UNICODE.values()) + ["ab", "abc", sp + "a"]
+    specials = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|image_pad|>", "<x>", "<x>tail", "tail>",
+                "<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>",
+                "<|vision_start|>", "<|vision_end|>"]
+    return Tokenizer(tokens + specials, ["a b", "ab c", sp + " a"],
+                     [1] * len(tokens) + [3] * 7 + [4] * (len(specials) - 7))
+
+
+def common(a, b):
+    n = 0
+    while n < min(len(a), len(b)) and a[n] == b[n]:
+        n += 1
+    return n
+
+
+class ReplyReuse(unittest.TestCase):
+    """The reply's own ids (what the engine holds) are taken by the next turn up to where its text differs - the one
+    place prompt ids may differ from a full encode, and they always decode to the prompt's text."""
+
+    def setUp(self):
+        self.tok = bpe_tokenizer()
+        self.enc = PromptEncoder(self.tok)
+        self.prompt = "<|im_start|>user\nabc<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        self.pids = self.enc.encode(self.prompt)
+        # 'abc' in pieces BPE would merge, then text the next turn does not have
+        self.gen = [t for s in ("a", "b", "c", " a", "ZZZ", "</think>") for t in self.tok.encode(s, parse_special=True)]
+
+    def test_the_next_turn_keeps_the_reply_ids_up_to_the_difference(self):
+        self.assertTrue(self.enc.remember_reply(self.pids, self.gen))
+        text = self.prompt + "abc a" + "\n</think>\n\nabc<|im_end|>"
+        ids = self.enc.encode(text)
+        self.assertEqual(self.tok.decode(ids), text)
+        self.assertEqual(ids[:len(self.pids) + 4], list(self.pids) + self.gen[:4])   # 'a' 'b' 'c' ' a', as written
+        self.assertLess(common(self.tok.encode(text, parse_special=True), list(self.pids) + self.gen),
+                        len(self.pids) + 4)   # a full encode merges 'abc' and leaves the engine's ids there
+
+    def test_without_its_prompt_nothing_is_kept(self):
+        self.assertFalse(self.enc.remember_reply([1, 2, 3], self.gen))
+        text = self.prompt + "abc"
+        self.assertEqual(self.enc.encode(text), self.tok.encode(text, parse_special=True))
+
+    def test_a_literal_across_the_cut_is_encoded_whole(self):
+        gen = [t for s in ("ab", "<", "x") for t in self.tok.encode(s)]   # '<x' as text
+        self.assertTrue(self.enc.remember_reply(self.pids, gen))
+        text = self.prompt + "ab<x>tail" + "<|im_end|>"
+        ids = self.enc.encode(text)
+        self.assertEqual(self.tok.decode(ids), text)
+        self.assertIn(self.tok.encode("<x>tail", parse_special=True)[0], ids)   # the literal, not '<' 'x' '>' ...
+        self.assertEqual(ids[:len(self.pids) + 1], list(self.pids) + gen[:1])     # the reply's 'ab' before it
+
+    def test_a_split_character_is_never_a_cut(self):
+        gen = [self.tok.ids[BYTE_TO_UNICODE[b]] for b in "中".encode()] + self.tok.encode("abc")
+        self.assertTrue(self.enc.remember_reply(self.pids, gen))
+        for text in (self.prompt + "中abc", self.prompt + "中ab!", self.prompt + "文"):
+            self.assertEqual(self.tok.decode(self.enc.encode(text)), text)
+
+
+class PieceEngine(MockEngine):
+    """Writes its reply in pieces BPE would merge, then holds the prompt and every token it sent (StrataEngine.held)."""
+
+    def __init__(self, tok, pieces):
+        super().__init__(tok, "x", max_context=1 << 20)
+        self.pieces = [t for s in pieces for t in tok.encode(s, parse_special=True)]
+        self.held, self.prompts = None, []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        try:
+            for t in self.pieces[:max_new]:
+                yield t
+        finally:
+            self.held = (len(ids), list(ids) + self.pieces[:max_new])
+
+
+class ServedReply(unittest.TestCase):
+    def test_the_next_request_continues_the_engine_s_ids(self):
+        tok = bpe_tokenizer()
+        engine = PieceEngine(tok, ["a", "b", "c", " a", "\n", "</think>", "\n", "\n", "a", "b", "c", "<|im_end|>"])
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            def ask(messages):
+                req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                             data=json.dumps({"model": "m", "messages": messages, "max_tokens": 64,
+                                                              "temperature": 0}).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return json.loads(r.read())["choices"][0]["message"]
+            msgs = [{"role": "user", "content": "q"}]
+            reply = ask(msgs)
+            self.assertEqual((reply["reasoning_content"].strip(), reply["content"]), ("abc a", "abc"))
+            ask(msgs + [{"role": "assistant", "content": reply["content"],
+                         "reasoning_content": reply["reasoning_content"]}, {"role": "user", "content": "next"}])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        first, second = engine.prompts
+        self.assertEqual(second[:len(first) + len(engine.pieces)], first + engine.pieces)
 
 
 if __name__ == "__main__":

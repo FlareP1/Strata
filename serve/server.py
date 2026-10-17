@@ -807,6 +807,9 @@ class StrataEngine:
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         self.progress_ms = 0             # PP's own milliseconds since the prompt started (its third field)
         self.reused = 0                  # RESUME: prompt tokens not read again (a client takes them out of the work)
+        # what the session holds after the last text request: (its prompt's length, the prompt and every token the
+        # engine sent); None after an image request, a batch or a failure
+        self.held = None
         self.silent_note = None
         self.last_err = None
         try:                            # a ready-made engine's BUILD.json says its version
@@ -1954,6 +1957,8 @@ class StrataEngine:
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
+        self.held, sent = None, []                       # sent: every token of this request, the drained ones too
+        self.drained = []                                # the tokens the engine sent after a STOP (it holds them)
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
@@ -2012,9 +2017,10 @@ class StrataEngine:
                     stall_state.clear()
                 if line.startswith("T "):
                     allow = silence
+                    sent.append(int(line[2:]))
                     if cancel.is_set():
                         return
-                    yield int(line[2:])
+                    yield sent[-1]
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
@@ -2040,6 +2046,8 @@ class StrataEngine:
                     done = True
                     if self.last.get("finish") == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                    if not embeddings:
+                        self.held = (len(ids), list(ids) + sent)
                     return
                 elif line.startswith("ERR"):
                     done = True
@@ -2068,8 +2076,13 @@ class StrataEngine:
                     if line is None or line.startswith("ERR"):
                         break
                     self._note_line(line)
+                    if line.startswith("T "):
+                        sent.append(int(line[2:]))
+                        self.drained.append(sent[-1])
                     if line.startswith("DONE"):
                         self._parse_done(line)
+                        if not embeddings and self.last.get("finish") != "nonfinite":
+                            self.held = (len(ids), list(ids) + sent)
                         break
                     if not self.can_stop:
                         heard = time.monotonic()
@@ -4426,6 +4439,7 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    held_before = None if par or emb else getattr(self.engine, "held", None)   # the last request's
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -4538,6 +4552,11 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                            if held_before is not None and segments:
+                                note = held_departure(self.tok, held_before, prompt, segments[0].get("reused") or 0)
+                                held_before = None
+                                if note:
+                                    print(note, flush=True)
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
@@ -4609,6 +4628,27 @@ class Service:
                         # was generated plus the wrap-up, so the engine continues from the prefix it already holds.
                         # A forced call (tool_choice) is opened the same way: after the wrap-up, or where the
                         # thinking ended, after the blank line the template puts before a call.
+                        spill = list(self.engine.drained) if wrap and getattr(self.engine, "drained", None) else []
+                        spill_text = self.tok.decode(spill) if spill else ""
+                        if spill and not any(t in self.stop_ids for t in spill) and "<" not in spill_text \
+                                and "�" not in spill_text and max_new - n - len(spill) > 1:
+                            # The engine generated these past the budget's stop before the STOP reached it, and its
+                            # session holds them: they join the thinking (plain text: no stop token, tag or split
+                            # character), so the wrap-up continuation extends the engine's state instead of leaving
+                            # it there and reading the whole thinking again (a reply has no checkpoint inside it)
+                            for t in spill:
+                                n += 1
+                                raw_ids.append(t)
+                                seg.append(t)
+                                thinking_n += parser.state in ("reasoning", "rcall")
+                                piece = detok.push(t)
+                                tail = (tail + piece)[-2:]
+                                evs = cut(parser.feed(piece))
+                                self._note(n, evs, st, rate)
+                                for ev in evs:
+                                    if self.reasoning_loop_recovery and ev.kind == "reasoning":
+                                        reasoning_text += ev.text or ""
+                                    yield "event", ev
                         if wrap:
                             budget = st["thinking_budget"] = None
                             text = REASONING_WRAP_UP + (force or "")
@@ -4633,6 +4673,13 @@ class Service:
                             finish = "stop"
                             break
                         prompt = prompt + seg + extra
+                    # The engine holds this prompt and every token it sent (StrataEngine.held): the next turn's prompt
+                    # takes those ids up to where its text differs, not only up to the first piece of the reply BPE
+                    # would have merged otherwise (PromptEncoder.remember_reply)
+                    held = getattr(self.engine, "held", None)
+                    if self.prompts is not None and held is not None and not par and not emb and \
+                            held[1][:len(ids)] == list(ids):
+                        self.prompts.remember_reply(ids, held[1][len(ids):])
                     if cancel.is_set():
                         finish = "cancel"
                     elif looped:
@@ -4744,6 +4791,30 @@ class Service:
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
         yield "done", done
+
+
+HELD_REREAD_MIN = 256    # a prompt that makes the engine read this many of the tokens it held again is logged
+
+
+def held_departure(tok, held, ids, reused: int) -> str | None:
+    """The log line for a prompt that leaves what the engine held after the previous request (`held`: that prompt's
+    length, and the prompt with every token the engine sent) at least HELD_REREAD_MIN tokens after where the engine
+    resumed: those tokens were read again, there being no checkpoint nearer.  Where it leaves (inside the previous
+    prompt or inside its reply), and both sides' next tokens there as text."""
+    plen, h = held
+    lim = min(len(h), len(ids))
+    m = 0
+    while m + 4096 <= lim and h[m:m + 4096] == ids[m:m + 4096]:
+        m += 4096
+    while m < lim and h[m] == ids[m]:
+        m += 1
+    if m >= len(h) - 1 or m - reused < HELD_REREAD_MIN:
+        return None
+    where = f"{m - plen} tokens into its reply of {len(h) - plen}" if m >= plen else f"{plen - m} before its end"
+    pieces = lambda part: [tok.decode([t]) for t in part]
+    return (f"[strata] prompt cache: this prompt leaves the engine's last request at token {m} ({where}); it "
+            f"resumed at {reused}, so {m - reused} tokens were read again. Before: {tok.decode(h[max(0, m - 24):m])!r}; "
+            f"held {pieces(h[m:m + 8])}; prompt {pieces(ids[m:m + 8])}")
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:

@@ -10,12 +10,13 @@ This branch's engine leaves out some of upstream's options, which [DETAILS.md](.
 may write into its own configs: the layer split and the helper GPUs' caches (`--peer-device`; the second GPU here is
 `--second-gpu`), KV streaming (`--kv-resident`: the KV cache stays in VRAM), the VRAM resize (`--vram-elastic`), the
 low-RAM modes, the file tier and the RAM budget (`--resident-budget-gib`), the experimental speed projection (control
-vectors), upstream's conversation cache (`--conversation-cache-mib`; the prompt cache here keeps replaced conversations
-in RAM), session files, parallel requests (`--batch`), token biases, prompt lookup chained after the drafts
-(`--lookup-chain`), upstream's routing approximations (the route tail skip, on by default in upstream's CUDA server),
-the adaptive tier's overlapped copies
-(`STRATA_ADAPT_OVERLAP`), the engine's own watchdog and stall report, the PLE read probe, 0.1.44's NVFP4 experts,
-Qwen3.6-35B-A3B engine and batched commit graph, and the AMD, Intel, Metal (Mac), Turing, Volta and Pascal builds. A
+vectors), upstream's conversation cache (`--conversation-cache-mib`, `--conversation-cache-park-gain`; the prompt cache
+here keeps replaced conversations in RAM) and its checkpoint spread (`--prompt-cache-spread`), session files, parallel
+requests (`--batch`), token biases, prompt lookup chained after the drafts (`--lookup-chain`), upstream's routing
+approximations (the route tail skip, on by default in upstream's CUDA server), the adaptive tier's overlapped copies
+(`STRATA_ADAPT_OVERLAP`), the CPU pool's `--host-core` and `--pool-affinity`, the engine's own watchdog and stall
+report, the PLE read probe, 0.1.44's NVFP4 experts, Qwen3.6-35B-A3B engine and batched commit graph, 0.1.45's CUDA
+opt-in switches but `STRATA_DEQUANT_WIDE`, and the AMD, Intel, Metal (Mac), Turing, Volta and Pascal builds. A
 server config with `parallel` or `vram_elastic` passes the engine a flag it refuses; with `slot_save_path`, a save
 request ends the engine.
 
@@ -28,8 +29,10 @@ thinking and edits, 0 to +2.0% after a 16K-token prompt. Remove the two keys to 
 time.
 
 A request that sends no sampling fields is sampled with the configs' `sampling` block: temperature 0.7, top_p 0.95,
-top_k 20, min_p 0, with thinking on or off (the model card's thinking settings, with its temperature of 1.0 lowered to
-0.7). A request's own fields win, and `"temperature": 0` decodes greedy. Sampled generation's speed against greedy:
+top_k 20, min_p 0, presence_penalty 0, with thinking on or off (the model card's thinking settings, with its temperature
+of 1.0 lowered to 0.7). The server fills what a config leaves out from the model card's set for the request's thinking
+state, so the block's presence_penalty 0 keeps the card's 1.5 off the answers without thinking. A request's own fields
+win, and `"temperature": 0` decodes greedy. Sampled generation's speed against greedy:
 [COMPARISON.md](../docs/COMPARISON.md).
 
 Their paths are relative to the Strata folder, where the server starts: the engine in `build/`; the model files, the

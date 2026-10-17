@@ -126,6 +126,10 @@ public:
     void set_in_events(const cudaEvent_t* ev, int64_t n);
     /// The draft layer's weights and cells in place of `draft->prompt_kv()` (the second stage's copies), or null.
     const core::MtpPromptKv* draft_kv = nullptr;
+    /// Called after each chunk's last layer (with every layer here) with its final residual rows on the device
+    /// ([T, hc * n_embd] floats from position pos0), queued on `stream` and read before the draft layer's K/V pass
+    /// overwrites them (--dump-draft-data).  Null: none.
+    std::function<void(const float* R, int64_t T, int64_t pos0, void* stream)> on_final;
 
     /// The MTP draft layer (or null): after every chunk, its K/V over the chunk's cells in the chunk's batched
     /// arithmetic (cell t pairs the chunk's final residual at t with the token at t + 1).

@@ -950,6 +950,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             m.out_live = true;
             if (!m.out->out_end(tokens + c0, T, p0, m.ev_out.data(), SUB, c0 + T >= n, err)) return false;
         }
+        if (on_final && L1 == g.n_layers) on_final(b.R, T, p0, m.cs);
         if (drafter != nullptr && !draft_pass(tokens + c0, T, p0)) return false;
         if (profile) {
             mark(kPsPle);

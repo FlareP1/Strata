@@ -1645,6 +1645,11 @@ thinking / after a 16K prompt / an edit quoting its prompt):
   of the first GPU's layers return FP16) round otherwise: after a 131K-token prompt, along llama.cpp's text, KL
   against llama.cpp 3.0e-3 split and 4.1e-3 not (5 of 300 argmaxes moved, all near-ties); the same prompt read in
   two requests gives the same logits as in one. This fork's configs leave it off.
+- **`--dump-draft-data DIR` (`--serve`): training data for the draft layer.** Per request, in `DIR/req<k>.*`: every
+  position's final residual row (FP16; the prompt's from the batched path, which then reads every prompt part whatever
+  `--feed-max`, without `--prompt-split`), a record a position (its token, the next one, and from a verify window the
+  verifier's 64 likeliest next tokens with their log-probabilities), and a record a verify window (its size, the drafts
+  accepted, the next drafts with their probabilities). About 20 KiB a position.
 - **`STRATA_POOL_FUSED=1`: a native layer's gate/up and down rows in one CPU pool phase** (an expert's down rows start
   once its own hidden row is quantized, no barrier between the halves; the same bytes). IQ3_S -0.8 / -0.5 / -0.3 / -0.7%,
   UD-Q4_K_XL +2.2 / -0.2 / +0.6 / 0.0%.

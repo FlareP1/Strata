@@ -51,6 +51,7 @@
 #include "strata/prefill/experts.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/split.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
@@ -325,6 +326,7 @@ struct Options {
     bool window_profile = false;   ///< GPU timestamps between the verify window's stages, printed by --stats
     std::string window_hashes;     ///< per verify window: a hash of its final residual rows and its argmaxes
     std::string window_logits;     ///< per emitted position: the 64 likeliest tokens and their log-probabilities
+    std::string dump_draft_data;   ///< --serve: each request's positions for the draft layer's training (DraftDump)
     bool prefill_profile = false;  ///< GPU time per section of the batched prompt path
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
@@ -511,6 +513,9 @@ void usage() {
                  "  --window-logits PATH per token the verify windows emit, a line with its index among the generated\n"
                  "                       tokens, the token and the 64 likeliest as id:log-probability, from the\n"
                  "                       head's logits (comparisons with llama.cpp, bench/parity.py; not --serve)\n"
+                 "  --dump-draft-data DIR  with --serve: each request's positions for the draft layer's training: the\n"
+                 "                       final residual rows, and the verify windows' 64 likeliest next tokens and\n"
+                 "                       drafts (scratch/bg; the prompt read in batches whatever --feed-max)\n"
                  "  --window-profile     with --stats: the GPU time of each stage of the verify window (timestamps\n"
                  "                       inside the graph; each costs ~2 us)\n"
                  "  --prefill-profile    the GPU time of each section of the batched prompt path (not --serve)\n"
@@ -971,6 +976,75 @@ static std::vector<std::array<int32_t, 3>> refill_plan(const SlotLoan& loan, con
     return out;
 }
 
+/// --dump-draft-data DIR: a request's positions for the draft layer's training (scratch/bg), in three files, req<k>.*:
+/// .r16 every position's final residual row (hc * n_embd FP16, the prompt's from the batched path), in order; .meta a
+/// record a position (position, token, the next token or -1 for the prompt's, and from a verify window the 64
+/// likeliest next tokens: ids, then log-probabilities); .rounds a record a window (its first position, T, the drafts
+/// accepted, the next window's first three drafts and their probabilities under the draft layer).
+struct DraftDump {
+    static constexpr int TOP = 64;
+    std::string dir;
+    int k = 0;
+    std::FILE *r16 = nullptr, *meta = nullptr, *rounds = nullptr;
+    std::vector<float> rows, logits;
+    std::vector<uint16_t> h16;
+    std::vector<int32_t> idx;
+    int64_t positions = 0, overflow = 0;
+    bool on() const { return r16 != nullptr; }
+    bool open(std::string& err) {
+        close();
+        const std::string base = dir + "/req" + std::to_string(k++);
+        r16 = std::fopen((base + ".r16").c_str(), "wb");
+        meta = std::fopen((base + ".meta").c_str(), "wb");
+        rounds = std::fopen((base + ".rounds").c_str(), "wb");
+        if (!r16 || !meta || !rounds) { err = "--dump-draft-data: cannot write " + base + ".*"; close(); return false; }
+        return true;
+    }
+    void close() {
+        for (std::FILE** f : {&r16, &meta, &rounds}) if (*f) { std::fclose(*f); *f = nullptr; }
+    }
+    /// `n` rows of `D` floats from the device.
+    void put_rows(const float* dev, int64_t n, int64_t D) {
+        rows.resize((size_t) (n * D));
+        h16.resize(rows.size());
+        cudaMemcpy(rows.data(), dev, rows.size() * 4, cudaMemcpyDeviceToHost);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (std::fabs(rows[i]) > 65000.0f) ++overflow;
+            h16[i] = strata::kernels::f16_from_f32(rows[i]);
+        }
+        std::fwrite(h16.data(), 2, h16.size(), r16);
+        positions += n;
+    }
+    /// A position's record; `row` (n_vocab logits) or null for none.
+    void put_meta(int32_t pos, int32_t tok, int32_t next, const float* row, int64_t n_vocab) {
+        int32_t head[4] = {pos, tok, next, row ? TOP : 0};
+        int32_t ids[TOP] = {};
+        float lp[TOP] = {};
+        if (row != nullptr) {
+            idx.resize((size_t) n_vocab);
+            for (int64_t i = 0; i < n_vocab; ++i) idx[(size_t) i] = (int32_t) i;
+            std::partial_sort(idx.begin(), idx.begin() + TOP, idx.end(),
+                              [&](int32_t a, int32_t b) { return row[a] > row[b]; });
+            double mx = row[idx[0]], s = 0;
+            for (int64_t i = 0; i < n_vocab; ++i) s += std::exp((double) row[i] - mx);
+            const double lse = mx + std::log(s);
+            for (int j = 0; j < TOP; ++j) {
+                ids[j] = idx[(size_t) j];
+                lp[j] = (float) ((double) row[idx[(size_t) j]] - lse);
+            }
+        }
+        std::fwrite(head, 4, 4, meta);
+        std::fwrite(ids, 4, TOP, meta);
+        std::fwrite(lp, 4, TOP, meta);
+    }
+    void put_round(int32_t p, int32_t T, int32_t a, const int32_t* d, const float* dp) {
+        const int32_t h[3] = {p, T, a};
+        std::fwrite(h, 4, 3, rounds);
+        std::fwrite(d, 4, 3, rounds);
+        std::fwrite(dp, 4, 3, rounds);
+    }
+};
+
 /// The batched prompt path's device buffers on each GPU: expert-cache slots lent for every prompt, as many as its
 /// chunk needs, else allocated once for the longest chunk.
 struct PromptBuffers {
@@ -1082,9 +1156,12 @@ int main(int argc, char** argv) {
                 continue;
             }
         }
-        {   // the rope scaling knobs, --prompt-shift and the learned profile, outside the chain below as well
-            if (a == "--expert-profile-save") {
-                o.expert_profile_save = next("--expert-profile-save");
+        {   // the knobs and the texts below outside the chain as well
+            std::string* text = a == "--expert-profile-save" ? &o.expert_profile_save
+                              : a == "--dump-draft-data" ? &o.dump_draft_data
+                              : a == "--rope-scaling" ? &o.rope_scaling : nullptr;
+            if (text != nullptr) {
+                *text = next(a.c_str());
                 continue;
             }
             double* knob = a == "--prompt-shift" ? &o.prompt_shift : a == "--prompt-split" ? &o.prompt_split
@@ -1096,10 +1173,6 @@ int main(int argc, char** argv) {
                          : nullptr;
             if (knob != nullptr) {
                 *knob = std::atof(next(a.c_str()));
-                continue;
-            }
-            if (a == "--rope-scaling") {
-                o.rope_scaling = next("--rope-scaling");
                 continue;
             }
         }
@@ -3281,6 +3354,12 @@ int main(int argc, char** argv) {
         strata::prefill::ExpertRunner offload;
         strata::prefill::PromptSplit psplit;   // (its second stage refers to the first: destroyed before it)
         PromptBuffers pbuf;
+        DraftDump ddump;   // --dump-draft-data: every prompt position from the batched path, its final rows there
+        ddump.dir = o.dump_draft_data;
+        if (!ddump.dir.empty()) {
+            o.feed_max = 0;
+            o.prompt_split = 0;
+        }
         if (!setup_prompt_path(prefill, offload, pbuf, psplit, err)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
@@ -4038,6 +4117,15 @@ int main(int argc, char** argv) {
             }
             const int64_t reuse = pcache.begin(ids, req_imgs);
             tr("request", n, reuse);
+            if (!ddump.dir.empty()) {
+                if (!ddump.open(err)) { report(err); return 1; }
+                const int64_t HCN = g.hc * g.n_embd;
+                prefill.on_final = [&ddump, &ids, HCN](const float* R, int64_t T, int64_t p0, void* s) {
+                    cudaStreamSynchronize((cudaStream_t) s);
+                    ddump.put_rows(R, T, HCN);
+                    for (int64_t t = 0; t < T; ++t) ddump.put_meta((int32_t) (p0 + t), (int32_t) ids[(size_t) (p0 + t)], -1, nullptr, 0);
+                };
+            }
             mtp.set_prompt_len(n);
             std::vector<int32_t> drafts((size_t) W, 0), window((size_t) W), outv((size_t) W);
             std::vector<float> dprob((size_t) W, 0.0f);
@@ -4239,7 +4327,8 @@ int main(int argc, char** argv) {
             mtp.on_draft = [&](int j, int32_t tok, float prob) {   // the drafts the next window will verify
                 if (lk == 0 && prob >= (float) req_spec_min_p) ver.ple_ahead(j + 1, tok);
             };
-            ver.set_logits_wanted(!req_score.empty());   // score=: a split head's first row whole
+            ver.set_logits_wanted(!req_score.empty() || ddump.on());   // score=: a split head's first row whole
+            std::vector<float> dd_logits(ddump.on() ? (size_t) W * (size_t) n_vocab : 0);
             while (poison_at < 0 && produced_n < max_new) {
                 if (stop_req.load()) { finish = "cancel"; break; }   // the client went away
                 int T = S;
@@ -4350,12 +4439,30 @@ int main(int argc, char** argv) {
                     report(err);
                     return 1;
                 }
+                if (ddump.on()) {   // the window's committed positions: rows, logits, and the drafts made after them
+                    if (!ver.copy_logits(a + 1, dd_logits.data(), err)) { report(err); return 1; }
+                    ddump.put_rows(ver.final_R_all(), a + 1, g.hc * g.n_embd);
+                    for (int i = 0; i <= a; ++i)
+                        ddump.put_meta((int32_t) (p + i), window[(size_t) i], outv[(size_t) i],
+                                       dd_logits.data() + (size_t) i * (size_t) n_vocab, n_vocab);
+                    const bool none = eos || produced_n >= max_new;
+                    const int32_t d3[3] = {none ? -1 : drafts[0], none || W < 3 ? -1 : drafts[1], none || W < 4 ? -1 : drafts[2]};
+                    const float p3[3] = {none ? 0.0f : dprob[0], none || W < 3 ? 0.0f : dprob[1], none || W < 4 ? 0.0f : dprob[2]};
+                    ddump.put_round((int32_t) p, T, a, d3, p3);
+                }
                 if (eos) { finish = "stop"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
             }
             mtp.on_draft = nullptr;
             ver.set_logits_wanted(false);
+            if (ddump.on()) {
+                prefill.on_final = nullptr;
+                ddump.close();
+                if (ddump.overflow > 0)
+                    std::fprintf(stderr, "strata serve: --dump-draft-data: %lld values past FP16's range so far\n",
+                                 (long long) ddump.overflow);
+            }
             if (poison_at >= 0) {
                 std::fprintf(stderr, "strata serve: non-finite logits at position %lld: the request ends, and the next "
                                      "one reads its prompt from the start\n", (long long) poison_at);

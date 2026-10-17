@@ -1655,6 +1655,21 @@ int main(int argc, char** argv) {
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     int32_t* d_mrope = nullptr;
     std::vector<int32_t> mrope_host;
+    // --prompt-split's second stage runs rope kernels on the second GPU: a copy of the table there (setup_prompt_path)
+    int32_t* d_mrope2 = nullptr;
+    int mrope2_dev = -1;
+    auto mrope_upload = [&]() -> bool {   // the host table to each GPU's copy
+        const size_t bytes = mrope_host.size() * sizeof(int32_t);
+        bool ok = cudaMemcpy(d_mrope, mrope_host.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+        if (ok && d_mrope2 != nullptr) {
+            int cur = 0;
+            cudaGetDevice(&cur);
+            cudaSetDevice(mrope2_dev);
+            ok = cudaMemcpy(d_mrope2, mrope_host.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+            cudaSetDevice(cur);
+        }
+        return ok;
+    };
     if (o.vision) {
         const int64_t cells = o.max_context + 64;
         mrope_host.resize((size_t) cells * 3);
@@ -3234,9 +3249,27 @@ int main(int argc, char** argv) {
         if (off && o.prompt_split > 0) {
             const auto ts = Clock::now();
             std::string se;
-            if (split.init(prefill, wt, g, ss, o.mtp.empty() ? nullptr : &mtp, (int64_t) o.prompt_split, o.second_gpu,
-                           o.main_gpu, srcp, &gpu2.cache(), host_res2.empty() ? nullptr : host_res2.data(),
-                           o.prefill_chunk, se)) {
+            // the vision path: the second stage's rope kernels read the image positions from their GPU's copy of the
+            // table, set before any graph there captures one
+            if (d_mrope != nullptr && d_mrope2 == nullptr) {
+                const size_t bytes = mrope_host.size() * sizeof(int32_t);
+                cudaSetDevice(o.second_gpu);
+                int32_t* t = nullptr;
+                const bool got = cudaMalloc(&t, bytes) == cudaSuccess;
+                if (got && cudaMemcpy(t, mrope_host.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+                    strata::kernels::mrope_table_set(t);
+                    d_mrope2 = t;
+                    mrope2_dev = o.second_gpu;
+                } else {
+                    if (got) cudaFree(t);
+                    (void) cudaGetLastError();
+                    se = "no VRAM for the image position table on the second GPU";
+                }
+                cudaSetDevice(o.main_gpu);
+            }
+            if (se.empty() && split.init(prefill, wt, g, ss, o.mtp.empty() ? nullptr : &mtp, (int64_t) o.prompt_split,
+                                         o.second_gpu, o.main_gpu, srcp, &gpu2.cache(),
+                                         host_res2.empty() ? nullptr : host_res2.data(), o.prefill_chunk, se)) {
                 pbuf.split = &split;
                 std::fprintf(stderr, "strata generate: --prompt-split: the second GPU runs layers %lld-%lld of a prompt's "
                                      "chunks, their %.0f MiB of weights copied from this GPU at each prompt (%.0f ms)\n",
@@ -4039,13 +4072,11 @@ int main(int argc, char** argv) {
                 tr("positions built", (long long) img_rows.size());
                 cudaDeviceSynchronize();
                 tr("device idle");
-                if (ve.empty() && cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
-                                             cudaMemcpyHostToDevice) != cudaSuccess)
-                    ve = "the image position upload failed";
+                if (ve.empty() && !mrope_upload()) ve = "the image position upload failed";
                 if (!ve.empty()) {
                     // leave the table as the identity so the next text request is untouched
                     for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
-                    cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                    mrope_upload();
                     mrope_identity = true;
                     std::printf("ERR %s\n", ve.c_str());
                     std::fflush(stdout);

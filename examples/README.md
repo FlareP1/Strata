@@ -62,10 +62,21 @@ quantized tensors, the experts and most projections, from the GGUF files at star
        .venv\Scripts\python.exe tools\iq_pack.py --out ../Strata-data/packs/ud-q4_k_xl ^
          --gguf ../Strata-data/models/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 
-4. Set the GPU numbers, as `nvidia-smi` numbers the cards (here the 5070 Ti is 0 and the 3090 is 1). `--main-gpu`
+4. Images: the configs' `vision` section starts the image encoder (`strata-vision`, llama.cpp's mtmd library with the
+   model's projector) beside the engine. Build it with code for both cards:
+
+       cmake -G Ninja -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release -DSTRATA_VISION_CUDA=ON ^
+         -DSTRATA_PORTABLE=OFF "-DCMAKE_CUDA_ARCHITECTURES=86;120"
+       cmake --build build-vision --target strata-vision
+
+   and put ISTA-DASLab's `mmproj-Qwen3.8-Flash-Next-BF16.gguf` (0.9 GB; the projector of both models) in each model's
+   folder (setup's `--vision gpu` downloads it into IQ3_S's). The encoder holds ~1.3 GB of the second GPU, whose expert
+   tier gives that up (IQ3_S ~700 experts, UD-Q4_K_XL ~490). Without images, remove the section and `--vision`.
+5. Set the GPU numbers, as `nvidia-smi` numbers the cards (here the 5070 Ti is 0 and the 3090 is 1). `--main-gpu`
    runs the model, and nothing else may use that card: a display or another program on it slows generation to a few
-   tokens per second. `--second-gpu` holds more experts and may drive the display.
-5. Start a config with its launcher, `run-iq3_s.bat` (port 8081) or `run-ud-q4_k_xl.bat` (8082), or from the Strata
+   tokens per second. `--second-gpu` holds more experts and may drive the display; the `vision` section's
+   `cuda_device` runs the image encoder (the second GPU).
+6. Start a config with its launcher, `run-iq3_s.bat` (port 8081) or `run-ud-q4_k_xl.bat` (8082), or from the Strata
    folder:
 
        .venv\Scripts\python.exe serve\server.py --engine strata --config examples\iq3_s.json --port 8081

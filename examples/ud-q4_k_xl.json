@@ -29,6 +29,7 @@
     "int8",
     "--kv-grow",
     "--hc-q8",
+    "--vision",
     "--pcie-mode",
     "kernel",
     "--pcie-frac",
@@ -51,6 +52,14 @@
   },
   "log": "./strata-ud-q4_k_xl.log",
   "lib_dirs": [],
+  "vision": {
+    "exe": "./build-vision/bin/strata-vision.exe",
+    "mmproj": "../Strata-data/models/UD-Q4_K_XL/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+    "model": "../Strata-data/models/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+    "gpu": true,
+    "cuda_device": 0,
+    "max_tokens": 1024
+  },
   "expert_profile_save": "./ud-q4_k_xl-learned.bin",
   "expert_profile_save_every": 1
 }

@@ -24,8 +24,10 @@ size_t q8_bytes(int64_t rows, int64_t cols);
 /// ids is null); `x` has `ld` floats per row.
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
               void* stream);
-/// The same from FP16 rows (`ld` halves apart, cols a multiple of 4), without ids: llama.cpp's quantizer reading FP16.
-void quantize_f16(const uint16_t* x, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows, void* stream);
+/// The same from FP16 rows (`ld` halves apart, cols a multiple of 4): llama.cpp's quantizer reading FP16, the bytes
+/// of quantize() over those rows in FP32.
+void quantize_f16(const uint16_t* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
+                  void* stream);
 
 /// One launch over n experts whose weights lie `expert_bytes` apart from `w`: for expert e, the activation rows
 /// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into
@@ -79,6 +81,10 @@ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stre
 /// h[r, k] = silu(gate) * up of GU rows [2 n_ff wide]: interleaved (gate 2k, up 2k+1: the Strata pack) or split
 /// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);
+
+/// swiglu() and quantize() of its h (n_ff a multiple of 4) in one kernel, their bytes: H's q8_1 rows for the down
+/// product without the FP32 rows between.
+void swiglu_quantize(const float* gu, void* xq, int ggml_type, int64_t rows, int64_t n_ff, bool interleaved, void* stream);
 
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);

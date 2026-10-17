@@ -101,11 +101,11 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
 
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
-// llama.cpp's quantize_mmq_q8_1 (quantize.cu, MIT) for FP16 rows: one channel, no ids, the same arithmetic on the
-// values the FP16 rows hold
+// llama.cpp's quantize_mmq_q8_1 (quantize.cu, MIT) for FP16 rows: one channel, row i of the output from row ids[i]
+// (or i), the same arithmetic on the values the FP16 rows hold
 template <mmq_q8_1_ds_layout ds_layout>
-__global__ void quantize_mmq_q8_1_f16(const half* __restrict__ x, void* __restrict__ vy, const int64_t ne00,
-                                      const int64_t s01, const int64_t ne0, const int ne1) {
+__global__ void quantize_mmq_q8_1_f16(const half* __restrict__ x, const int32_t* __restrict__ ids, void* __restrict__ vy,
+                                      const int64_t ne00, const int64_t s01, const int64_t ne0, const int ne1) {
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
     const int64_t i0 = ((int64_t) blockDim.x * blockIdx.y + threadIdx.x) * 4;
@@ -114,9 +114,68 @@ __global__ void quantize_mmq_q8_1_f16(const half* __restrict__ x, void* __restri
     const int64_t k_block = i0 / QK8_1_MMQ, iqs = i0 % QK8_1_MMQ;
     float4 xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (i0 < ne00) {
-        const half2* h = (const half2*) (x + (int64_t) blockIdx.x * s01 + i0);
+        const half2* h = (const half2*) (x + (int64_t) (ids ? ids[blockIdx.x] : (int32_t) blockIdx.x) * s01 + i0);
         const float2 a = __half22float2(h[0]), b = __half22float2(h[1]);
         xi = make_float4(a.x, a.y, b.x, b.y);
+    }
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+    for (int offset = vals_per_scale / 8; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    float sum = 0.0f;
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+        for (int offset = vals_per_sum / 8; offset > 0; offset >>= 1)
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+    }
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = roundf(xi.x * d_inv);
+    q.y = roundf(xi.y * d_inv);
+    q.z = roundf(xi.z * d_inv);
+    q.w = roundf(xi.w * d_inv);
+    const float d = 1.0f / d_inv;
+    const int64_t ib = k_block * ne1 + blockIdx.x;
+    ((char4*) y[ib].qs)[iqs / 4] = q;
+    if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+        if (iqs % 16 == 0 && iqs < 96) {
+            y[ib].d2s6[2 + iqs / 16] = sum;
+            if (iqs % 64 == 0) y[ib].d2s6[iqs / 64] = d;
+        }
+    } else if (iqs % 32 == 0) {
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) y[ib].ds4[iqs / 32] = make_half2(d, sum);
+        else y[ib].d4[iqs / 32] = d;
+    }
+}
+
+// SwiGLU's h (swiglu_kernel's arithmetic) as the values of quantize_mmq_q8_1: H's q8_1 rows without its FP32 rows
+template <mmq_q8_1_ds_layout ds_layout, bool interleaved>
+__global__ void swiglu_quantize_mmq_q8_1(const float* __restrict__ gu, void* __restrict__ vy, const int64_t n_ff,
+                                         const int64_t ne0, const int ne1) {
+    constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+    constexpr int vals_per_sum = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
+    const int64_t i0 = ((int64_t) blockDim.x * blockIdx.y + threadIdx.x) * 4;
+    if (i0 >= ne0) return;
+    block_q8_1_mmq* y = (block_q8_1_mmq*) vy;
+    const int64_t k_block = i0 / QK8_1_MMQ, iqs = i0 % QK8_1_MMQ;
+    float4 xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (i0 < n_ff) {
+        const float* row = gu + (int64_t) blockIdx.x * 2 * n_ff;
+        float g[4], u[4], h[4];
+        if (interleaved) {
+            const float4 a = *(const float4*) (row + 2 * i0), b = *(const float4*) (row + 2 * i0 + 4);
+            g[0] = a.x; u[0] = a.y; g[1] = a.z; u[1] = a.w; g[2] = b.x; u[2] = b.y; g[3] = b.z; u[3] = b.w;
+        } else {
+            const float4 a = *(const float4*) (row + i0), b = *(const float4*) (row + n_ff + i0);
+            g[0] = a.x; g[1] = a.y; g[2] = a.z; g[3] = a.w; u[0] = b.x; u[1] = b.y; u[2] = b.z; u[3] = b.w;
+        }
+#pragma unroll
+        for (int k = 0; k < 4; ++k) h[k] = g[k] / (1.0f + __expf(-g[k])) * u[k];
+        xi = make_float4(h[0], h[1], h[2], h[3]);
     }
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
@@ -184,7 +243,8 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
     ck(cudaGetLastError(), "quantize");
 }
 
-void quantize_f16(const uint16_t* x, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
+void quantize_f16(const uint16_t* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows,
+                  void* stream) {
     if (rows <= 0) return;
     const int64_t ne0 = pad512(cols);
     constexpr int B = CUDA_QUANTIZE_BLOCK_SIZE_MMQ;
@@ -193,13 +253,13 @@ void quantize_f16(const uint16_t* x, void* xq, int t, int64_t cols, int64_t ld, 
     const half* h = (const half*) x;
     switch (mmq_get_q8_1_ds_layout((ggml_type) t)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_D4><<<grid, B, 0, s>>>(h, xq, cols, ld, ne0, (int) rows);
+            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_D4><<<grid, B, 0, s>>>(h, ids, xq, cols, ld, ne0, (int) rows);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_DS4><<<grid, B, 0, s>>>(h, xq, cols, ld, ne0, (int) rows);
+            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_DS4><<<grid, B, 0, s>>>(h, ids, xq, cols, ld, ne0, (int) rows);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
-            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_D2S6><<<grid, B, 0, s>>>(h, xq, cols, ld, ne0, (int) rows);
+            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_D2S6><<<grid, B, 0, s>>>(h, ids, xq, cols, ld, ne0, (int) rows);
             break;
         default:
             std::fprintf(stderr, "prefill mmq: no q8_1 layout for type %d\n", t);
@@ -331,6 +391,30 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
     if (rows <= 0) return;
     swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved);
     ck(cudaGetLastError(), "swiglu");
+}
+
+void swiglu_quantize(const float* gu, void* xq, int t, int64_t rows, int64_t n_ff, bool interleaved, void* stream) {
+    if (rows <= 0) return;
+    if (n_ff % 4 != 0) {
+        std::fprintf(stderr, "prefill mmq: swiglu_quantize needs a multiple of 4 values a row (%lld)\n", (long long) n_ff);
+        std::exit(1);
+    }
+    const int64_t ne0 = pad512(n_ff);
+    constexpr int B = CUDA_QUANTIZE_BLOCK_SIZE_MMQ;
+    const dim3 grid((unsigned) rows, (unsigned) ((ne0 + 4 * B - 1) / (4 * B)));
+    const cudaStream_t s = (cudaStream_t) stream;
+#define STRATA_SWQ(L) (interleaved ? swiglu_quantize_mmq_q8_1<L, true><<<grid, B, 0, s>>>(gu, xq, n_ff, ne0, (int) rows) \
+                                   : swiglu_quantize_mmq_q8_1<L, false><<<grid, B, 0, s>>>(gu, xq, n_ff, ne0, (int) rows))
+    switch (mmq_get_q8_1_ds_layout((ggml_type) t)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4: STRATA_SWQ(MMQ_Q8_1_DS_LAYOUT_D4); break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4: STRATA_SWQ(MMQ_Q8_1_DS_LAYOUT_DS4); break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6: STRATA_SWQ(MMQ_Q8_1_DS_LAYOUT_D2S6); break;
+        default:
+            std::fprintf(stderr, "prefill mmq: no q8_1 layout for type %d\n", t);
+            std::exit(1);
+    }
+#undef STRATA_SWQ
+    ck(cudaGetLastError(), "swiglu_quantize");
 }
 
 void iota(int32_t* dst, int64_t n, void* stream) {

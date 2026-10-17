@@ -644,9 +644,8 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, int64_t t_begin, int64_t 
             continue;
         }
         if (q) {
-            // the rows in FP32 in down's output place, as q8_1 for the gate/up product; h in the FP16 rows' place
-            gather_rows16_f32(in, m.rows_src + r0, m.d, rows, N, m.s);
-            mmq::quantize(m.d, nullptr, m.xq, f.gu_type, N, N, rows, m.s);
+            // the rows as q8_1 for the gate/up product, from the FP16 input by row id
+            mmq::quantize_f16(in, m.rows_src + r0, m.xq, f.gu_type, N, N, rows, m.s);
             int64_t maxr = 0;
             for (size_t j = j0; j < j1; ++j) maxr = std::max<int64_t>(maxr, off[j + 1] - off[j]);
             mmq::Product p;
@@ -654,9 +653,7 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, int64_t t_begin, int64_t 
             p.xq = m.xq; p.bounds = m.adds + bounds_at[b]; p.ids = m.ident; p.total_rows = rows; p.max_rows = maxr;
             p.dst = m.gu; p.ld_dst = FF2;
             m.mmq_ctx->run(p, m.s);
-            float* h = (float*) m.xs;
-            mmq::swiglu(m.gu, h, rows, FF, false, m.s);
-            mmq::quantize(h, nullptr, m.xq, f.d_type, FF, FF, rows, m.s);
+            mmq::swiglu_quantize(m.gu, m.xq, f.d_type, rows, FF, false, m.s);   // H's q8_1 rows
             p.w = m.dq_d; p.type = f.d_type; p.w_rows = N; p.w_cols = FF; p.expert_bytes = db;
             p.dst = m.d; p.ld_dst = N;
             m.mmq_ctx->run(p, m.s);

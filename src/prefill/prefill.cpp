@@ -411,7 +411,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // a matrix of 2048+ rows: its GGUF blocks on the int8 tensor cores (MMQ, the input rounded to q8_1), faster
         // than cuBLAS on its FP16 copy (1.06-1.67x by format at 2048 tokens: scratch/aq_bench.cu); smaller ones lose
         if (m.mmq && w->native_data && w->ne1 >= 2048 && w->ne0 <= ZV && mmq::supported(w->native_type)) {
-            mmq::quantize_f16(X, b.xq, w->native_type, w->ne0, w->ne0, T, m.cs);
+            mmq::quantize_f16(X, nullptr, b.xq, w->native_type, w->ne0, w->ne0, T, m.cs);
             m.mmq->run_dense(w->native_data, w->native_type, w->ne1, w->ne0, b.xq, T, Y, w->ne1, m.cs);
             return true;
         }

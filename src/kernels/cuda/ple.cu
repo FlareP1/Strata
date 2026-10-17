@@ -14,6 +14,7 @@
 // The opt-in native BF16 path replaces only ple_value with the pinned CUDA single-token BF16/F32 MMVF.
 // A separate opt-in native postops path follows the pinned CUDA arithmetic after both projections.
 #include "strata/kernels/ple.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/ngram.hpp"
@@ -49,13 +50,6 @@ __global__ void history_advance_kernel(float* __restrict__ history, const float*
     float* column = history + (size_t) channel * NG_HIST;
     for (int row = 0; row + 1 < NG_HIST; ++row) column[row] = column[row + 1];
     column[NG_HIST - 1] = normalized[channel];
-}
-
-__device__ __forceinline__ uint16_t bf16_bits(float f) {
-    uint32_t i;
-    memcpy(&i, &f, 4);
-    i = (i + ((i >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u;
-    return (uint16_t) (i >> 16);
 }
 
 __device__ __forceinline__ float bf16_float(uint16_t h) {
@@ -184,7 +178,7 @@ __global__ void bf16_gemv_kernel(const uint16_t* __restrict__ x, const uint16_t*
 
 __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = bf16_bits(x[i]);
+    if (i < n) y[i] = bf16_from_f32(x[i]);
 }
 
 void ck(cudaError_t e, const char* what) {

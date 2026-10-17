@@ -39,9 +39,7 @@
     "--main-gpu",
     "1",
     "--head-split",
-    "0",
-    "--prompt-split",
-    "26"
+    "0"
   ],
   "cwd": ".",
   "tokenizer": "../Strata-data/packs/ud-q4_k_xl/tokenizer",

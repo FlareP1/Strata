@@ -64,7 +64,7 @@ PromptCache::Ckpt* PromptCache::find(Seq& seq, int64_t pos) {
     return nullptr;
 }
 
-void* PromptCache::take_buffer() {
+void* PromptCache::take_buffer(int64_t pos) {
     if (!free_.empty()) {
         void* h = free_.back();
         free_.pop_back();
@@ -83,20 +83,38 @@ void* PromptCache::take_buffer() {
         }
         return h;
     }
-    // the pool is full: the least recently used checkpoint of any sequence goes
+    // the pool is full: each sequence offers the checkpoint it can spare best (the live one's chain with the new
+    // checkpoint at its end), and the least recently used offer goes
     Seq* owner = nullptr;
     size_t at = 0;
     uint64_t oldest = UINT64_MAX;
-    auto scan = [&](Seq& s) {
-        for (size_t i = 0; i < s.ckpts.size(); ++i)
-            if (s.ckpts[i].stamp < oldest) {
-                oldest = s.ckpts[i].stamp;
-                owner = &s;
-                at = i;
-            }
+    std::vector<size_t> order;
+    std::vector<int64_t> chain;
+    auto offer = [&](Seq& s, bool live) {
+        order.resize(s.ckpts.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return s.ckpts[a].pos < s.ckpts[b].pos; });
+        chain.clear();
+        size_t keep = SIZE_MAX;
+        for (size_t k = 0; k < order.size(); ++k) {
+            chain.push_back(s.ckpts[order[k]].pos);
+            if (live && chain.back() == pin_) keep = k;
+        }
+        if (live) chain.push_back(pos);
+        const size_t k = spread_victim(chain.data(), chain.size(), keep);
+        size_t pick = k < order.size() ? order[k] : SIZE_MAX;
+        if (pick == SIZE_MAX)   // too few to spread: the least recently used
+            for (size_t i = 0; i < s.ckpts.size(); ++i)
+                if (!(live && s.ckpts[i].pos == pin_) && (pick == SIZE_MAX || s.ckpts[i].stamp < s.ckpts[pick].stamp))
+                    pick = i;
+        if (pick != SIZE_MAX && s.ckpts[pick].stamp < oldest) {
+            oldest = s.ckpts[pick].stamp;
+            owner = &s;
+            at = pick;
+        }
     };
-    scan(live_);
-    for (Seq& s : stash_) scan(s);
+    offer(live_, true);
+    for (Seq& s : stash_) offer(s, false);
     if (owner == nullptr) return nullptr;
     void* h = owner->ckpts[at].host;
     owner->ckpts.erase(owner->ckpts.begin() + (ptrdiff_t) at);
@@ -222,8 +240,9 @@ int64_t PromptCache::begin(const std::vector<int64_t>& ids, const std::vector<Im
         // prefix), the rest goes to the stash; an edit near the end just overwrites it.
         const int64_t dropped = L - best;
         if (dropped >= kStashMin && dropped > best) {
-            if (Ckpt* c = find(live_, best)) c->stamp = ++clock_;   // keeps it through the stash's evictions
+            pin_ = best;   // kept through the stash's evictions
             stash_live(best);
+            pin_ = -1;
         }
         if (best < L && !restore(live_, best)) return zero();
         release(live_, best);
@@ -264,7 +283,7 @@ void PromptCache::set(int64_t pos, const int32_t* tokens, int64_t n) {
 
 void PromptCache::checkpoint(int64_t pos) {
     if (!enabled() || pos <= 0 || pos != (int64_t) live_.tokens.size() || find(live_, pos) != nullptr) return;
-    void* h = take_buffer();
+    void* h = take_buffer(pos);
     if (h == nullptr) return;
     cudaDeviceSynchronize();
     const bool split = split_from > 0 && split_save;

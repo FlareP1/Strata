@@ -11,12 +11,15 @@
 //     checkpoints, so a client that alternates between conversations (a chat and its title request, an agent
 //     and its subagents) does not start over on every switch.
 //
-// Checkpoint buffers are a shared pool of `max_ckpts`; the least recently used one goes when it is full.  The
-// stash's K/V copies share a byte budget in the same way.
+// Checkpoint buffers are a shared pool of `max_ckpts`.  When it is full, each sequence offers the checkpoint it can
+// spare best (spread_victim over its own; with fewer than three, its least recently used), and the least recently
+// used offer goes: a conversation's checkpoints thin out geometrically back from its newest instead of all ending up
+// in its last few turns.  The stash's K/V copies share a byte budget, the least recently used sequence going first.
 #pragma once
 
 #include "strata/core/session.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -24,6 +27,25 @@
 #include <vector>
 
 namespace strata::core {
+
+/// The checkpoint of a sequence's chain that leaves when one must: `pos` ascending, its first (the chain's root, the
+/// deepest point later prompts share), its last and `keep` (another index; none: any value >= n) kept.  Of the
+/// others, the one whose removal leaves the smallest gap for its distance from the last (upstream's
+/// --prompt-cache-spread rule), so the kept points thin out geometrically back from the newest: a prompt that leaves
+/// the chain d cells before its end reads about d to 2d of them again.  n: none (fewer than three points).
+inline size_t spread_victim(const int64_t* pos, size_t n, size_t keep) {
+    size_t v = n;
+    double best = 0;
+    for (size_t i = 1; i + 1 < n; ++i) {
+        if (i == keep) continue;
+        const double gap = double(pos[i + 1] - pos[i - 1]) / double(pos[n - 1] - pos[i - 1]);
+        if (v == n || gap < best) {
+            v = i;
+            best = gap;
+        }
+    }
+    return v;
+}
 
 /// Identity of an image embedded in a GENI request.  Token IDs alone only
 /// describe the image-pad run; the embedding bytes and grid describe what the
@@ -97,7 +119,8 @@ private:
     int64_t reusable(const Seq& seq, const std::vector<int64_t>& ids, const std::vector<ImgKey>& imgs,
                      bool live) const;
     static Ckpt* find(Seq& seq, int64_t pos);
-    void* take_buffer();
+    /// A buffer for the live sequence's checkpoint at `pos`; a full pool gives up one (the header's policy).
+    void* take_buffer(int64_t pos);
     void release(Seq& seq, int64_t keep_upto);   // frees the checkpoints after `keep_upto`
     /// Moves a copy of the live sequence to the stash: its K/V cells, a checkpoint of its end, and its
     /// checkpoints after `keep_upto` (the ones before stay with the live sequence, which continues from there).
@@ -115,6 +138,7 @@ private:
     uint64_t ckpt_bytes_;
     int allocated_ = 0;
     uint64_t clock_ = 0;
+    int64_t pin_ = -1;   // begin(): the live checkpoint the request resumes from, kept while the rest is stashed
     Seq live_;
     std::vector<Seq> stash_;
     std::vector<void*> free_;

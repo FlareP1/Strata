@@ -39,7 +39,9 @@
     "--second-gpu",
     "0",
     "--main-gpu",
-    "1"
+    "1",
+    "--prompt-split",
+    "26"
   ],
   "cwd": ".",
   "tokenizer": "../Strata-data/packs/iq3_s/tokenizer",

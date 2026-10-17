@@ -1782,7 +1782,7 @@ thinking / after a 16K prompt / an edit quoting its prompt):
   6-8 GiB of its cache lent (64K-128K tokens: IQ3_S 6.0-6.3 GiB, UD-Q4_K_XL 7.7-8.1). The second GPU's kernels and its FP32 expert sums (its shares
   of the first GPU's layers return FP16) round otherwise: after a 131K-token prompt, along llama.cpp's text, KL
   against llama.cpp 3.0e-3 split and 4.1e-3 not (5 of 300 argmaxes moved, all near-ties); the same prompt read in
-  two requests gives the same logits as in one. This fork's configs leave it off.
+  two requests gives the same logits as in one. This fork's configs set 26.
 - **`--dump-draft-data DIR` (`--serve`): training data for the draft layer.** Per request, in `DIR/req<k>.*`: every
   position's final residual row (FP16; the prompt's from the batched path, which then reads every prompt part whatever
   `--feed-max`, without `--prompt-split`), a record a position (its token, the next one, and from a verify window the

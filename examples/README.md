@@ -63,19 +63,24 @@ quantized tensors, the experts and most projections, from the GGUF files at star
          --gguf ../Strata-data/models/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 
 4. Images: the configs' `vision` section starts the image encoder (`strata-vision`, llama.cpp's mtmd library with the
-   model's projector) beside the engine. Build it with code for both cards:
+   model's projector) on the CPU beside the engine, so both GPUs' expert caches keep all of their VRAM. Build it
+   without CUDA, for any AVX2 CPU (the default):
 
-       cmake -G Ninja -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release -DSTRATA_VISION_CUDA=ON ^
-         -DSTRATA_PORTABLE=OFF "-DCMAKE_CUDA_ARCHITECTURES=86;120"
+       cmake -G Ninja -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release
        cmake --build build-vision --target strata-vision
 
-   and put ISTA-DASLab's `mmproj-Qwen3.8-Flash-Next-BF16.gguf` (0.9 GB; the projector of both models) in each model's
-   folder (setup's `--vision gpu` downloads it into IQ3_S's). The encoder holds ~1.3 GB of the second GPU, whose expert
-   tier gives that up (IQ3_S ~700 experts, UD-Q4_K_XL ~490). Without images, remove the section and `--vision`.
+   (a native build on an AVX-512 CPU, `-DSTRATA_PORTABLE=OFF`, runs without flash attention, about twice as slow on
+   this PC's Ryzen 7 9700X). Its projector, the same for both models: ISTA-DASLab's
+   `mmproj-Qwen3.8-Flash-Next-BF16.gguf` (0.9 GB; setup's `--vision` downloads it into IQ3_S's folder) in Q8_0, which
+   encodes ~20% faster on the CPU, made by llama.cpp's `llama-quantize`:
+
+       llama-quantize mmproj-Qwen3.8-Flash-Next-BF16.gguf ../Strata-data/packs/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf Q8_0
+
+   A picture of ~1,000 tokens (`max_tokens`: up to 1,024) takes ~9 s to encode on the 9700X (`threads`: its 16 logical
+   cores), once per picture, and the encoder ~1 GB of RAM. Without images, remove the section and `--vision`.
 5. Set the GPU numbers, as `nvidia-smi` numbers the cards (here the 5070 Ti is 0 and the 3090 is 1). `--main-gpu`
    runs the model, and nothing else may use that card: a display or another program on it slows generation to a few
-   tokens per second. `--second-gpu` holds more experts and may drive the display; the `vision` section's
-   `cuda_device` runs the image encoder (the second GPU).
+   tokens per second. `--second-gpu` holds more experts and may drive the display.
 6. Start a config with its launcher, `run-iq3_s.bat` (port 8081) or `run-ud-q4_k_xl.bat` (8082), or from the Strata
    folder:
 

@@ -54,10 +54,10 @@
   "lib_dirs": [],
   "vision": {
     "exe": "./build-vision/bin/strata-vision.exe",
-    "mmproj": "../Strata-data/models/IQ3_S/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+    "mmproj": "../Strata-data/packs/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf",
     "model": "../Strata-data/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
-    "gpu": true,
-    "cuda_device": 0,
+    "gpu": false,
+    "threads": 16,
     "max_tokens": 1024
   },
   "expert_profile_save": "./iq3_s-learned.bin",

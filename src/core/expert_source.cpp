@@ -174,7 +174,7 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     const uint64_t off = lay.blob_offset(layer, expert);
     if (off > bytes_ || lay.blob_bytes(layer) > bytes_ - off) return nullptr;
-    ++reads_;
+    reads_.fetch_add(1, std::memory_order_relaxed);
     return base_ + (size_t) off;
 }
 
@@ -1188,7 +1188,7 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     const size_t i = (size_t) (layer * n_expert_ + expert);
     const int64_t at = idx_.empty() ? expert : idx_[i];
     if (at < 0) return nullptr;   // only in VRAM
-    ++reads_;
+    reads_.fetch_add(1, std::memory_order_relaxed);
     // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of
     // this class over `FileExpertSource`.
     return layer_base_[blk_.empty() ? (size_t) layer : (size_t) blk_[i]] +

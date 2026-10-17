@@ -25,6 +25,7 @@
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -328,7 +329,7 @@ public:
 
     /// Blobs touched, for the driver to report.  With `h = 0` this is `48 * k` per token and the number is only
     /// interesting once Phase 3 makes it not so.
-    int64_t reads() const override { return reads_; }
+    int64_t reads() const override { return reads_.load(std::memory_order_relaxed); }
 
 private:
     const uint8_t* base_ = nullptr;
@@ -336,7 +337,7 @@ private:
     int64_t n_layers_ = 0;
     int64_t n_expert_ = 0;
     uint64_t bytes_ = 0;   ///< the mapped length (`expert_layout().total`), for munmap and the bounds check
-    int64_t reads_ = 0;
+    std::atomic<int64_t> reads_{0};   ///< (a counter only; two threads can read blobs at once)
 #if defined(_WIN32)
     void* file_ = nullptr;
     void* mapping_ = nullptr;
@@ -386,7 +387,7 @@ public:
     bool mapped() const { return !layer_base_.empty(); }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
-    int64_t reads() const { return reads_; }
+    int64_t reads() const { return reads_.load(std::memory_order_relaxed); }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     bool layer_mapped(int64_t layer) const override {
@@ -435,7 +436,7 @@ private:
     int64_t pinned_layers_ = 0;              ///< layers [0, pinned_layers_) are page-locked and mapped
     int64_t blobs_ = 0;
     int64_t n_expert_ = 0;
-    int64_t reads_ = 0;
+    std::atomic<int64_t> reads_{0};   ///< (a counter only; two threads can read blobs at once)
     std::string note_;
     double gib_per_s_ = 0.0;
     std::vector<std::string> gguf_;

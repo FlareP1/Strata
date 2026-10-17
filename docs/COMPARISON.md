@@ -2,20 +2,20 @@
 
 Qwen3.8-Flash-Next in two quantizations, IQ3_S and UD-Q4_K_XL, through three engines on an RTX 3090 + RTX 5070 Ti PC,
 measured on 2026-10-13/14: llama.cpp's mainline build 11606, upstream Strata a0116b27 (engine 0.1.43.1) and this fork
-at e1ccfcbb (UD-Q4_K_XL's agreement with llama.cpp at 2ae47d0f, whose arithmetic there is the same); this fork's speeds
-through the API measured again on 2026-10-16 at 78652d23, and all of this fork's IQ3_S numbers and the sampled runs
-at 83190f5a.
+at e1ccfcbb (UD-Q4_K_XL's agreement with llama.cpp at 2ae47d0f, whose arithmetic there is the same); this fork's
+IQ3_S memory and agreement with llama.cpp at 83190f5a; this fork's speeds (through the API, on fixed text and sampled)
+measured again on 2026-10-17 at 039e8a27, with its configs' draft layer trained on both models' own output.
 
 **In short**, with both GPUs:
 
-- **IQ3_S:** this fork reads prompts 3.5-4.0x as fast as llama.cpp and writes answers 4.9-9.6x as fast. Against
-  upstream Strata's layer split: prompts 1.32x / 1.12x / 1.02x as fast at 16K / 32K / 64K tokens, 4% slower at 128K;
-  answers 1.3-2.0x (the most on answers that quote the prompt). On the 3090 alone, against upstream there:
+- **IQ3_S:** this fork reads prompts 3.3-4.1x as fast as llama.cpp and writes answers 4.7-9.8x as fast. Against
+  upstream Strata's layer split: prompts 1.27x / 1.14x / 1.03x as fast at 16K / 32K / 64K tokens, 3% slower at 128K;
+  answers 1.2-2.1x (the most on answers that quote the prompt). On the 3090 alone, against upstream there:
   prompts 1.7-1.8x, answers 1.4-1.9x.
-- **UD-Q4_K_XL:** prompts 11.6-13.4x and answers 4.9-7.0x as fast as llama.cpp; against upstream's layer split prompts
-  2.2-3.6x and answers 1.9-2.5x, on the 3090 alone prompts 1.9-2.6x and answers 1.5-2.1x.
-- Sampled with the configs' settings (temperature 0.7), this fork thinks 11-15% slower than greedy (fewer drafts
-  pass), writes code 3-11% slower and edits as fast; llama.cpp's speed does not change, so this fork thinks 4.2x as
+- **UD-Q4_K_XL:** prompts 12.0-13.5x and answers 5.1-7.2x as fast as llama.cpp; against upstream's layer split prompts
+  2.2-3.7x and answers 2.0-2.4x, on the 3090 alone prompts 1.9-2.6x and answers 1.7-2.2x.
+- Sampled with the configs' settings (temperature 0.7), this fork thinks 10-11% slower than greedy (fewer drafts
+  pass), writes code 4-7% slower and edits as fast; llama.cpp's speed does not change, so this fork thinks 4.2-4.4x as
   fast as llama.cpp (greedy 4.7-5.0x).
 - A follow-up turn after a 16K-token prompt starts in 0.17-0.23 s (llama.cpp 0.61-0.72 s; upstream 0.26-0.42 s on
   the 3090, 0.45-1.06 s on both GPUs).
@@ -45,7 +45,9 @@ at 83190f5a.
 - **This fork** with its configs ([examples](../examples/README.md)): the 3090 runs the model and the 5070 Ti is a
   second expert tier (12.2-12.4 GiB of experts; its share of each layer's experts, the next layer's likely experts
   copied ahead, the prompt path's experts the 3090 lacks, and with IQ3_S part of the output head). MTP drafts and
-  prompt lookup, KV in VRAM (IQ3_S 8-bit keys and 4-bit values, k8v4; UD-Q4_K_XL 8-bit), 16K-token prompt chunks.
+  prompt lookup (the draft layer's dense part trained here on both models' own output, `mtp/rt-distilled`; the
+  examples keep basalt's `rt-tuned`, which thinks 1.3% (IQ3_S) / 4.5% (UD-Q4_K_XL) slower on the fixed text below),
+  KV in VRAM (IQ3_S 8-bit keys and 4-bit values, k8v4; UD-Q4_K_XL 8-bit), 16K-token prompt chunks.
   For UD-Q4_K_XL the experts the CPU reads are kept out of the RAM's slower region (`--arena-place`: the unpaired
   DIMMs leave 32 GB on one channel; timed at the start, placed again between requests); for IQ3_S the 5070 Ti also
   computes a fifth of the experts the 3090 holds in long prompts (`--prompt-shift 0.2`). And on the 3090 alone.
@@ -54,8 +56,8 @@ at 83190f5a.
 
 The same requests to each server's OpenAI API: greedy, one at a time, the prompt caches off except for the follow-up
 turn; this fork's UD-Q4_K_XL server got them 4 s apart, the time it uses to place its RAM arena again. Where that
-arena lands varies from start to start, and its generation with it by 5-10% (these runs: 6.4 GiB of the 72 in the
-RAM's slower region on both GPUs, 20.7 GiB on the 3090 alone; other starts here 20-27 GiB). Prompts: 16K-128K tokens of llama.cpp's sources with a question (400 tokens of answer), a 28-token coding request
+arena lands varies from start to start, and its generation with it by 5-10% (these runs: 3.6 GiB of the 72 in the
+RAM's slower region on both GPUs, 4.0 GiB on the 3090 alone; other starts here 6-27 GiB). Prompts: 16K-128K tokens of llama.cpp's sources with a question (400 tokens of answer), a 28-token coding request
 (up to 300), a coding task with thinking on (3,000), and a Python module to return with a class renamed (the edit, up
 to 3,000 tokens that mostly quote the prompt). The follow-up turn sends the 16K prompt, its answer and a new question:
 its prompt time is the processing of what the engine did not keep. Each engine writes its own text and the texts part
@@ -69,18 +71,18 @@ the GPUs' memory taken, and the RAM taken as the drop in the system's available 
 <!-- matrix:api-iq3_s -->
 | | llama.cpp, both GPUs | upstream Strata, 3090 | upstream Strata, both GPUs | this fork, both GPUs | this fork, 3090 |
 |---|---|---|---|---|---|
-| Prompt, 16K tokens (t/s) | 885 | 1172 | 2308 | 3057 | 2058 |
-| Prompt, 32K tokens (t/s) | 851 | 1236 | 2927 | 3279 | 2235 |
-| Prompt, 64K tokens (t/s) | 837 | 1232 | 3250 | 3307 | 2144 |
-| Prompt, 128K tokens (t/s) | 805 | 1203 | 3371 | 3237 | 2134 |
-| Generation: code, 28-token prompt (t/s) | 29.6 | 93.0 | 117.1 | 197.3 | 127.1 |
-| Generation: thinking, 3,000 tokens | 31.2 | 82.0 | 117.8 | 151.9 | 130.6 |
-| Generation: edit, the prompt's file returned (2.4K tokens) | 31.1 | 115.8 | 148.3 | 299.4 | 215.1 |
-| Generation after the 16K prompt | 30.8 | 84.3 | 117.6 | 185.1 | 134.6 |
-| Generation after the 32K prompt | 28.9 | 91.6 | 125.6 | 184.4 | 146.6 |
-| Generation after the 64K prompt | 25.7 | 80.5 | 122.3 | 157.7 | 121.7 |
-| Generation after the 128K prompt | 21.4 | 84.4 | 113.9 | 143.4 | 114.3 |
-| Follow-up turn after the 16K prompt: new tokens, prompt time | 34 in 0.61 s | 33 in 0.26 s | 440 in 1.06 s | 34 in 0.17 s | 34 in 0.26 s |
+| Prompt, 16K tokens (t/s) | 885 | 1172 | 2308 | 2930 | 2014 |
+| Prompt, 32K tokens (t/s) | 851 | 1236 | 2927 | 3330 | 2229 |
+| Prompt, 64K tokens (t/s) | 837 | 1232 | 3250 | 3346 | 2143 |
+| Prompt, 128K tokens (t/s) | 805 | 1203 | 3371 | 3259 | 2128 |
+| Generation: code, 28-token prompt (t/s) | 29.6 | 93.0 | 117.1 | 201.0 | 126.5 |
+| Generation: thinking, 3,000 tokens | 31.2 | 82.0 | 117.8 | 146.3 | 134.4 |
+| Generation: edit, the prompt's file returned (2.4K tokens) | 31.1 | 115.8 | 148.3 | 305.2 | 214.2 |
+| Generation after the 16K prompt | 30.8 | 84.3 | 117.6 | 184.2 | 141.8 |
+| Generation after the 32K prompt | 28.9 | 91.6 | 125.6 | 183.2 | 164.0 |
+| Generation after the 64K prompt | 25.7 | 80.5 | 122.3 | 163.2 | 133.1 |
+| Generation after the 128K prompt | 21.4 | 84.4 | 113.9 | 149.7 | 117.2 |
+| Follow-up turn after the 16K prompt: new tokens, prompt time | 34 in 0.61 s | 33 in 0.26 s | 440 in 1.06 s | 34 in 0.16 s | 34 in 0.27 s |
 | Start to the API, the model file cached (s) | 20 | 21 | 25 | 21 | 20 |
 | VRAM taken: 3090 / 5070 Ti (GiB) | 22.5 / 12.4 | 22.7 / 0.0 | 22.5 / 14.6 | 22.6 / 12.8 | 22.6 / 0.0 |
 | RAM taken (GB) | 57 | 56 | 58 | 53 | 53 |
@@ -91,18 +93,18 @@ the GPUs' memory taken, and the RAM taken as the drop in the system's available 
 <!-- matrix:api-ud-q4_k_xl -->
 | | llama.cpp, both GPUs | upstream Strata, 3090 | upstream Strata, both GPUs | this fork, both GPUs | this fork, 3090 |
 |---|---|---|---|---|---|
-| Prompt, 16K tokens (t/s) | 258 | 558 | 828 | 2999 | 1426 |
-| Prompt, 32K tokens (t/s) | 258 | 746 | 1416 | 3354 | 1531 |
-| Prompt, 64K tokens (t/s) | 253 | 750 | 1484 | 3402 | 1432 |
-| Prompt, 128K tokens (t/s) | 248 | 743 | 1519 | 3326 | 1434 |
-| Generation: code, 28-token prompt (t/s) | 23.4 | 49.3 | 65.5 | 131.6 | 79.2 |
-| Generation: thinking, 3,000 tokens | 24.2 | 39.5 | 54.4 | 118.0 | 81.8 |
-| Generation: edit, the prompt's file returned (2.4K tokens) | 24.1 | 68.1 | 85.3 | 167.7 | 117.4 |
-| Generation after the 16K prompt | 23.6 | 44.1 | 58.6 | 146.3 | 77.7 |
-| Generation after the 32K prompt | 22.6 | 44.3 | 64.0 | 142.8 | 85.0 |
-| Generation after the 64K prompt | 21.6 | 42.4 | 63.7 | 122.5 | 67.0 |
-| Generation after the 128K prompt | 18.5 | 41.8 | 59.2 | 116.1 | 64.3 |
-| Follow-up turn after the 16K prompt: new tokens, prompt time | 34 in 0.72 s | 33 in 0.42 s | 33 in 0.45 s | 34 in 0.23 s | 34 in 0.45 s |
+| Prompt, 16K tokens (t/s) | 258 | 558 | 828 | 3091 | 1436 |
+| Prompt, 32K tokens (t/s) | 258 | 746 | 1416 | 3384 | 1532 |
+| Prompt, 64K tokens (t/s) | 253 | 750 | 1484 | 3425 | 1433 |
+| Prompt, 128K tokens (t/s) | 248 | 743 | 1519 | 3340 | 1435 |
+| Generation: code, 28-token prompt (t/s) | 23.4 | 49.3 | 65.5 | 134.3 | 87.3 |
+| Generation: thinking, 3,000 tokens | 24.2 | 39.5 | 54.4 | 123.9 | 85.9 |
+| Generation: edit, the prompt's file returned (2.4K tokens) | 24.1 | 68.1 | 85.3 | 174.4 | 127.0 |
+| Generation after the 16K prompt | 23.6 | 44.1 | 58.6 | 138.3 | 82.7 |
+| Generation after the 32K prompt | 22.6 | 44.3 | 64.0 | 151.8 | 89.3 |
+| Generation after the 64K prompt | 21.6 | 42.4 | 63.7 | 125.7 | 72.9 |
+| Generation after the 128K prompt | 18.5 | 41.8 | 59.2 | 123.7 | 70.8 |
+| Follow-up turn after the 16K prompt: new tokens, prompt time | 34 in 0.72 s | 33 in 0.42 s | 33 in 0.45 s | 34 in 0.24 s | 34 in 0.46 s |
 | Start to the API, the model file cached (s) | 53 | 51 | 61 | 41 | 36 |
 | VRAM taken: 3090 / 5070 Ti (GiB) | 22.3 / 12.9 | 22.7 / 0.0 | 22.8 / 14.6 | 22.7 / 13.1 | 22.7 / 0.0 |
 | RAM taken (GB) | 84 | 69 | 69 | 81 | 80 |
@@ -116,19 +118,19 @@ same seed to both engines; this fork got per seed the three greedy requests, the
 adaptive tiers keep the last request's experts): generation t/s as the median (range) of the five, the sampled median
 against the greedy one, and this fork's tokens a verify pass (median). A sampled token is drawn by its probability, and
 this fork keeps a draft only when it is the token drawn, so fewer drafts pass than when greedy takes the likeliest
-token: on thinking text 1.8 instead of 2.1 tokens a pass. The sampled code answers run 133-300 tokens (greedy's
+token: on thinking text 1.9-2.0 instead of 2.1-2.2 tokens a pass. The sampled code answers run 133-300 tokens (greedy's
 168-300); the edit quotes its prompt, where both pick the same tokens. llama.cpp runs no drafts, and sampling leaves
 its speed as it is. The sampled runs spread about as widely as the greedy ones.
 
 <!-- matrix:sampled -->
 | | IQ3_S: llama.cpp | IQ3_S: this fork | tokens a pass | UD-Q4_K_XL: llama.cpp | UD-Q4_K_XL: this fork | tokens a pass |
 |---|---|---|---|---|---|---|
-| Thinking, 3,000 tokens, greedy | 31.1 (29.2-31.8) | 154.9 (147.7-159.6) | 2.14 | 25.4 (25.3-25.6) | 119.6 (119.1-120.1) | 2.14 |
-| Thinking, 3,000 tokens, sampled | 31.3 (29.4-31.9; 1.01x) | 132.3 (132.2-141.9; 0.85x) | 1.79 | 25.5 (25.3-25.7; 1.00x) | 106.9 (104.8-109.8; 0.89x) | 1.81 |
-| Code, 28-token prompt, greedy | 30.7 (29.3-32.4) | 208.2 (190.5-211.2) | 3.47 | 25.1 (24.8-25.2) | 148.0 (139.3-154.1) | 3.45 |
-| Code, 28-token prompt, sampled | 30.7 (26.8-32.6; 1.00x) | 202.7 (183.4-211.9; 0.97x) | 3.41 | 25.3 (24.9-25.9; 1.01x) | 131.5 (124.6-152.8; 0.89x) | 3.21 |
-| Edit, the prompt's file returned, greedy | 31.4 (29.5-31.7) | 309.0 (306.1-310.3) | 7.51 | 25.2 (25.2-25.4) | 186.7 (185.6-190.5) | 7.51 |
-| Edit, the prompt's file returned, sampled | 31.2 (29.6-31.6; 0.99x) | 302.7 (302.5-303.9; 0.98x) | 7.49 | 25.2 (25.2-25.5; 1.00x) | 188.1 (186.7-193.7; 1.01x) | 7.51 |
+| Thinking, 3,000 tokens, greedy | 31.1 (29.2-31.8) | 154.9 (151.6-160.8) | 2.20 | 25.4 (25.3-25.6) | 119.6 (115.7-122.8) | 2.12 |
+| Thinking, 3,000 tokens, sampled | 31.3 (29.4-31.9; 1.01x) | 138.3 (133.9-144.4; 0.89x) | 1.96 | 25.5 (25.3-25.7; 1.00x) | 107.5 (104.9-114.6; 0.90x) | 1.89 |
+| Code, 28-token prompt, greedy | 30.7 (29.3-32.4) | 206.5 (180.4-209.7) | 3.47 | 25.1 (24.8-25.2) | 147.7 (137.3-158.7) | 3.41 |
+| Code, 28-token prompt, sampled | 30.7 (26.8-32.6; 1.00x) | 197.6 (181.0-210.1; 0.96x) | 3.30 | 25.3 (24.9-25.9; 1.01x) | 137.4 (125.4-139.3; 0.93x) | 3.12 |
+| Edit, the prompt's file returned, greedy | 31.4 (29.5-31.7) | 311.7 (310.4-312.8) | 7.54 | 25.2 (25.2-25.4) | 184.2 (181.5-189.6) | 7.54 |
+| Edit, the prompt's file returned, sampled | 31.2 (29.6-31.6; 0.99x) | 304.9 (304.4-305.8; 0.98x) | 7.54 | 25.2 (25.2-25.5; 1.00x) | 185.6 (184.6-187.0; 1.01x) | 7.54 |
 <!-- /matrix:sampled -->
 
 ## Generation on fixed text (this fork)
@@ -140,10 +142,10 @@ the end of the turn, which prompt lookup drafts and a server never generates.
 <!-- matrix:fixed -->
 | Text | IQ3_S t/s (tokens a pass) | UD-Q4_K_XL t/s (tokens a pass) |
 |---|---|---|
-| code (400 tokens) | 207.2 (4.06) | 121.7 (3.69) |
-| thinking (1,200) | 164.5 (2.29) | 116.2 (1.90) |
-| after the 16K prompt (400) | 176.0 (2.86) | 131.9 (2.82) |
-| edit (2,397) | 302.1 (7.49) | 173.1 (7.51) |
+| code (400 tokens) | 211.7 (4.17) | 126.6 (3.80) |
+| thinking (1,200) | 166.6 (2.41) | 121.4 (2.05) |
+| after the 16K prompt (400) | 176.6 (2.87) | 132.4 (2.83) |
+| edit (2,397) | 305.3 (7.54) | 173.1 (7.51) |
 <!-- /matrix:fixed -->
 
 ## Agreement with llama.cpp
